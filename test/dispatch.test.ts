@@ -9,7 +9,9 @@ import {
   type DispatcherConfig,
   type Rail,
   type RailState,
+  type RailWindow,
   DEFAULT_CONFIG,
+  budgetUsed,
   createDispatcher,
   decide,
   parseClaudeUsage,
@@ -19,7 +21,7 @@ import {
 
 // ---------------------------------------------------------------- parsing
 
-test("parseClaudeUsage extracts windows and ignores absent ones", () => {
+test("parseClaudeUsage classifies the session budget apart from the week", () => {
   const windows = parseClaudeUsage({
     five_hour: { utilization: 0 },
     seven_day: { utilization: 27 },
@@ -27,10 +29,19 @@ test("parseClaudeUsage extracts windows and ignores absent ones", () => {
     seven_day_sonnet: { utilization: 12 },
   });
   assert.deepEqual(windows, [
-    { label: "5h", used: 0 },
-    { label: "7d", used: 27 },
-    { label: "7d Sonnet", used: 12 },
+    { label: "5h", used: 0, budget: "session" },
+    { label: "7d", used: 27, budget: "weekly" },
+    { label: "7d Sonnet", used: 12, budget: "weekly" },
   ]);
+});
+
+test("parseClaudeUsage gives every window a distinct label", () => {
+  const windows = parseClaudeUsage({
+    seven_day_opus: { utilization: 1 },
+    seven_day_omelette: { utilization: 2 },
+  });
+  const labels = windows.map((w) => w.label);
+  assert.equal(new Set(labels).size, labels.length, `duplicate label among ${labels.join(", ")}`);
 });
 
 test("parseClaudeUsage returns nothing when no window carries a number", () => {
@@ -38,7 +49,7 @@ test("parseClaudeUsage returns nothing when no window carries a number", () => {
   assert.deepEqual(parseClaudeUsage(undefined), []);
 });
 
-test("parseCodexUsage maps both windows and surfaces limit_reached", () => {
+test("parseCodexUsage classifies both windows and surfaces limit_reached", () => {
   const { windows, limited } = parseCodexUsage({
     rate_limit: {
       limit_reached: false,
@@ -47,10 +58,23 @@ test("parseCodexUsage maps both windows and surfaces limit_reached", () => {
     },
   });
   assert.deepEqual(windows, [
-    { label: "5h", used: 0 },
-    { label: "7d", used: 64 },
+    { label: "5h", used: 0, budget: "session" },
+    { label: "7d", used: 64, budget: "weekly" },
   ]);
   assert.equal(limited, false);
+});
+
+test("parseCodexUsage labels each window from its advertised length", () => {
+  const { windows } = parseCodexUsage({
+    rate_limit: {
+      primary_window: { used_percent: 9, limit_window_seconds: 18000, reset_after_seconds: 17135 },
+      secondary_window: { used_percent: 65, limit_window_seconds: 604800, reset_after_seconds: 408848 },
+    },
+  });
+  assert.deepEqual(windows, [
+    { label: "5h", used: 9, budget: "session", resetsInSeconds: 17135 },
+    { label: "7d", used: 65, budget: "weekly", resetsInSeconds: 408848 },
+  ]);
 });
 
 test("parseCodexUsage reports limit_reached=true", () => {
@@ -115,18 +139,30 @@ test("upsertModel returns null without usable frontmatter", () => {
 
 // ---------------------------------------------------------------- policy
 
-function rails(claude: Partial<RailState>, codex: Partial<RailState>): Map<Rail, RailState> {
-  const make = (rail: Rail, p: Partial<RailState>): RailState => ({
-    rail,
-    ok: true,
-    pressure: 0,
-    windows: [],
-    ...p,
-  });
+/** One rail's readings, as a policy test wants to describe them. */
+interface Readings {
+  session?: number;
+  weekly?: number;
+  ok?: boolean;
+  metered?: boolean;
+  note?: string;
+}
+
+function railState(rail: Rail, r: Readings = {}): RailState {
+  if (r.metered) return { rail, ok: true, windows: [], metered: true, note: r.note ?? "metered" };
+  if (r.ok === false) return { rail, ok: false, windows: [], note: r.note };
+  const windows: RailWindow[] = [];
+  if (r.session !== undefined) windows.push({ label: "5h", used: r.session, budget: "session" });
+  if (r.weekly !== undefined) windows.push({ label: "7d", used: r.weekly, budget: "weekly" });
+  return { rail, ok: true, windows, ...(r.note ? { note: r.note } : {}) };
+}
+
+function rails(claude: Readings, codex: Readings): Map<Rail, RailState> {
   return new Map<Rail, RailState>([
-    ["claude", make("claude", claude)],
-    ["codex", make("codex", codex)],
-    ["deepseek", make("deepseek", { pressure: 0, note: "metered" })],
+    ["claude", railState("claude", claude)],
+    ["codex", railState("codex", codex)],
+    // Metered, so it reports no budgets rather than unreported ones.
+    ["deepseek", railState("deepseek", { metered: true })],
   ]);
 }
 
@@ -142,56 +178,204 @@ function assignedModel(d: Decision): string {
   return d.kind === "assign" ? d.model : "";
 }
 
+function plannerDecision(claude: Readings, codex: Readings): Decision {
+  return decide("planner", DEFAULT_CONFIG.routes.planner, rails(claude, codex), cfg);
+}
+
+test("budgetUsed takes the worst window within a budget, not across budgets", () => {
+  const state: RailState = {
+    rail: "claude",
+    ok: true,
+    windows: [
+      { label: "5h", used: 0, budget: "session" },
+      { label: "7d", used: 27, budget: "weekly" },
+      { label: "7d Sonnet", used: 91, budget: "weekly" },
+    ],
+  };
+  assert.equal(budgetUsed(state, "session"), 0);
+  assert.equal(budgetUsed(state, "weekly"), 91);
+});
+
 test("decide assigns the primary while both rails have headroom", () => {
-  const d = decide("planner", DEFAULT_CONFIG.routes.planner, rails({ pressure: 27 }, { pressure: 64 }), cfg);
+  const d = plannerDecision({ session: 0, weekly: 27 }, { session: 0, weekly: 64 });
   assert.equal(d.kind, "assign");
   assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
 });
 
-test("decide moves planner off claude when claude is tight", () => {
-  const d = decide("planner", DEFAULT_CONFIG.routes.planner, rails({ pressure: 90 }, { pressure: 10 }), cfg);
+test("decide moves planner off claude when the session budget is tight", () => {
+  const d = plannerDecision({ session: 90, weekly: 0 }, { session: 10, weekly: 0 });
   assert.equal(assignedModel(d), "openai-codex/gpt-6-sol");
+  assert.match(d.why, /session 90% >= 75%/);
 });
 
-test("decide moves reviewer off codex when codex is tight", () => {
-  const d = decide("reviewer", DEFAULT_CONFIG.routes.reviewer, rails({ pressure: 10 }, { pressure: 90 }), cfg);
+test("decide moves reviewer off codex when the session budget is tight", () => {
+  const d = decide(
+    "reviewer",
+    DEFAULT_CONFIG.routes.reviewer,
+    rails({ session: 10, weekly: 0 }, { session: 90, weekly: 0 }),
+    cfg,
+  );
   assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
+});
+
+// The defect this replaces: pressure was the worst window across *both*
+// budgets, so a weekly figure above sessionSwitchAt moved a rail with a
+// completely full session budget — and the weekly does not recover for days.
+test("a weekly reading alone does not move a rail with session headroom", () => {
+  const d = plannerDecision({ session: 0, weekly: 80 }, { session: 0, weekly: 5 });
+  assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
+});
+
+test("the weekly budget only fires at its own, higher threshold", () => {
+  const below = plannerDecision({ session: 0, weekly: 89 }, { session: 0, weekly: 5 });
+  assert.equal(assignedModel(below), "claude-bridge/claude-opus-5-5");
+
+  const above = plannerDecision({ session: 0, weekly: 92 }, { session: 0, weekly: 5 });
+  assert.equal(assignedModel(above), "openai-codex/gpt-6-sol");
+  assert.match(above.why, /weekly 92% >= 90%/);
+});
+
+test("a tight weekly is compared against the alternate's weekly, not its session", () => {
+  // Claude's week is nearly spent. Codex has a full session budget but a busier
+  // week than Claude, so weekly-to-weekly it is not healthier and we stay put.
+  const d = plannerDecision({ session: 0, weekly: 95 }, { session: 0, weekly: 88 });
+  assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
+  assert.match(d.why, /within margin/);
 });
 
 test("decide does not switch when the margin is not met", () => {
-  // codex 85 is >= switchAt but only 5 points below claude's 90, so < margin.
-  const reviewer = decide("reviewer", DEFAULT_CONFIG.routes.reviewer, rails({ pressure: 90 }, { pressure: 85 }), cfg);
+  // codex 85 is >= sessionSwitchAt but only 5 points below claude's 90.
+  const reviewer = decide(
+    "reviewer",
+    DEFAULT_CONFIG.routes.reviewer,
+    rails({ session: 90, weekly: 0 }, { session: 85, weekly: 0 }),
+    cfg,
+  );
   assert.equal(assignedModel(reviewer), "openai-codex/gpt-6-astra");
-  const planner = decide("planner", DEFAULT_CONFIG.routes.planner, rails({ pressure: 90 }, { pressure: 85 }), cfg);
+  assert.match(reviewer.why, /within margin/);
+
+  const planner = plannerDecision({ session: 90, weekly: 0 }, { session: 85, weekly: 0 });
   assert.equal(assignedModel(planner), "claude-bridge/claude-opus-5-5");
 });
 
-test("decide switches on limit_reached pressure of 100", () => {
-  const d = decide("reviewer", DEFAULT_CONFIG.routes.reviewer, rails({ pressure: 10 }, { pressure: 100 }), cfg);
+// The README used to call this "at least margin" points healthier. The
+// comparator is strict, so exactly `margin` is not enough.
+test("exactly margin points healthier is not enough to switch", () => {
+  const exactly = decide(
+    "reviewer",
+    DEFAULT_CONFIG.routes.reviewer,
+    rails({ session: 85, weekly: 0 }, { session: 95, weekly: 0 }),
+    cfg,
+  );
+  assert.equal(assignedModel(exactly), "openai-codex/gpt-6-astra");
+  assert.match(exactly.why, /within margin/);
+
+  const beyond = decide(
+    "reviewer",
+    DEFAULT_CONFIG.routes.reviewer,
+    rails({ session: 84, weekly: 0 }, { session: 95, weekly: 0 }),
+    cfg,
+  );
+  assert.equal(assignedModel(beyond), "claude-bridge/claude-opus-5-5");
+});
+
+test("decide switches on a session budget of 100", () => {
+  const d = decide(
+    "reviewer",
+    DEFAULT_CONFIG.routes.reviewer,
+    rails({ session: 10, weekly: 0 }, { session: 100, weekly: 0 }),
+    cfg,
+  );
   assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
+});
+
+test("the session budget is the one reported when both are tight", () => {
+  const d = plannerDecision({ session: 80, weekly: 99 }, { session: 1, weekly: 1 });
+  assert.equal(assignedModel(d), "openai-codex/gpt-6-sol");
+  assert.match(d.why, /session 80% >= 75%/);
+});
+
+test("a metered primary is never tight, so it is left where it is", () => {
+  const d = decide(
+    "implementer",
+    DEFAULT_CONFIG.routes.implementer,
+    rails({ session: 99, weekly: 99 }, { session: 99, weekly: 99 }),
+    cfg,
+  );
+  assert.equal(assignedModel(d), "deepseek/deepseek-flash");
+});
+
+// ------------------------------------------------- destination eligibility
+
+// The run that exposed this moved the planner *onto* codex on the session rule
+// while moving the reviewer *off* codex on the weekly rule, in the same pass.
+test("an alternate that is tight on its other budget is not a destination", () => {
+  const d = plannerDecision({ session: 80, weekly: 0 }, { session: 10, weekly: 100 });
+  assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
+  assert.match(d.why, /codex weekly 100% is itself tight/);
+});
+
+test("one pass never moves an agent onto a rail it moves another agent off", () => {
+  // Codex's week is nearly spent and claude's session is nearly spent, so
+  // neither rail is a clear improvement. Swapping the two agents would leave
+  // both rails exactly as constrained as they were, minus the churn.
+  const claude = { session: 80, weekly: 0 };
+  const codex = { session: 10, weekly: 95 };
+
+  const planner = plannerDecision(claude, codex);
+  assert.equal(assignedModel(planner), "claude-bridge/claude-opus-5-5");
+
+  const reviewer = decide("reviewer", DEFAULT_CONFIG.routes.reviewer, rails(claude, codex), cfg);
+  assert.equal(assignedModel(reviewer), "openai-codex/gpt-6-astra");
+});
+
+test("a destination may be tight on the compared budget, as long as it is better", () => {
+  // Both session budgets are over the threshold, but codex is 14 points better,
+  // which is a real improvement, so the switch still happens.
+  const d = plannerDecision({ session: 90, weekly: 0 }, { session: 76, weekly: 5 });
+  assert.equal(assignedModel(d), "openai-codex/gpt-6-sol");
+});
+
+test("a tight weekly is still acted on when the session rule cannot fire", () => {
+  // Session is tight but codex is not margin better, so the session rule falls
+  // through; the weekly rule then finds codex far healthier on the week, and its
+  // session is healthy enough to be used.
+  const d = plannerDecision({ session: 80, weekly: 95 }, { session: 70, weekly: 10 });
+  assert.equal(assignedModel(d), "openai-codex/gpt-6-sol");
+  assert.match(d.why, /weekly 95% >= 90%/);
+});
+
+// ------------------------------------- unreadable and unreported readings
+
+test("an unreported budget is held, not read as idle", () => {
+  // The bug: a rail that omitted its 5-hour window read as 0% session, so a
+  // blocked rail looked like the roomiest place to send work.
+  const d = plannerDecision({ session: 80, weekly: 0 }, { weekly: 100 });
+  assert.equal(d.kind, "hold");
+  assert.match(d.why, /codex did not report its session budget/);
+});
+
+test("a metered rail reports no budgets rather than unreported ones", () => {
+  const metered = railState("deepseek", { metered: true });
+  assert.equal(budgetUsed(metered, "session"), 0);
+  assert.equal(budgetUsed(metered, "weekly"), 0);
+
+  const partial = railState("codex", { weekly: 10 });
+  assert.equal(budgetUsed(partial, "session"), undefined);
+  assert.equal(budgetUsed(partial, "weekly"), 10);
 });
 
 // A hold is not "assign the primary". These decisions carry no model at all,
 // because naming one is what let an unreadable quota drag agents back onto the
 // rail that was under pressure.
 test("decide makes no assignment when the primary rail is unreadable", () => {
-  const d = decide(
-    "planner",
-    DEFAULT_CONFIG.routes.planner,
-    rails({ ok: false, pressure: Infinity, note: "HTTP 401" }, { pressure: 1 }),
-    cfg,
-  );
+  const d = plannerDecision({ ok: false, note: "HTTP 401" }, { session: 1, weekly: 0 });
   assert.equal(d.kind, "hold");
   assert.match(d.why, /unreadable/);
 });
 
 test("decide makes no assignment when the alternate rail is unreadable", () => {
-  const d = decide(
-    "planner",
-    DEFAULT_CONFIG.routes.planner,
-    rails({ pressure: 99 }, { ok: false, pressure: Infinity, note: "HTTP 500" }),
-    cfg,
-  );
+  const d = plannerDecision({ session: 99, weekly: 0 }, { ok: false, note: "HTTP 500" });
   assert.equal(d.kind, "hold");
 });
 
@@ -243,14 +427,26 @@ async function fixture(models: Record<string, string>): Promise<Fixture> {
   return { agentDir, claudeCredsPath, piAuthPath };
 }
 
-function stubFetch(claudeUsed: number, codexUsed: number, codexLimited = false) {
+/** Readings the stub endpoints should report, per rail. */
+interface StubReadings {
+  claude?: { session?: number; weekly?: number };
+  codex?: { session?: number; weekly?: number };
+  codexLimited?: boolean;
+  /** Omit the 5-hour window entirely, reproducing a partial reading. */
+  codexOmitSession?: boolean;
+}
+
+function stubFetch(opts: StubReadings = {}) {
   return (async (url: string | URL) => {
     const u = String(url);
     if (u.includes("anthropic.com")) {
       return {
         ok: true,
         status: 200,
-        json: async () => ({ five_hour: { utilization: 0 }, seven_day: { utilization: claudeUsed } }),
+        json: async () => ({
+          five_hour: { utilization: opts.claude?.session ?? 0 },
+          seven_day: { utilization: opts.claude?.weekly ?? 0 },
+        }),
       };
     }
     if (u.includes("chatgpt.com")) {
@@ -259,9 +455,21 @@ function stubFetch(claudeUsed: number, codexUsed: number, codexLimited = false) 
         status: 200,
         json: async () => ({
           rate_limit: {
-            limit_reached: codexLimited,
-            primary_window: { used_percent: 0 },
-            secondary_window: { used_percent: codexUsed },
+            limit_reached: opts.codexLimited ?? false,
+            ...(opts.codexOmitSession
+              ? {}
+              : {
+                  primary_window: {
+                    used_percent: opts.codex?.session ?? 0,
+                    limit_window_seconds: 18000,
+                    reset_after_seconds: 3600,
+                  },
+                }),
+            secondary_window: {
+              used_percent: opts.codex?.weekly ?? 0,
+              limit_window_seconds: 604800,
+              reset_after_seconds: 400000,
+            },
           },
         }),
       };
@@ -270,11 +478,8 @@ function stubFetch(claudeUsed: number, codexUsed: number, codexLimited = false) 
   }) as unknown as typeof fetch;
 }
 
-function dispatcherFor(fx: Fixture, claudeUsed: number, codexUsed: number, codexLimited = false) {
-  return createDispatcher(
-    { ...DEFAULT_CONFIG, ...fx },
-    { fetchImpl: stubFetch(claudeUsed, codexUsed, codexLimited) },
-  );
+function dispatcherFor(fx: Fixture, opts: StubReadings = {}) {
+  return createDispatcher({ ...DEFAULT_CONFIG, ...fx }, { fetchImpl: stubFetch(opts) });
 }
 
 test("a dry run reports would-write and leaves files alone", async () => {
@@ -283,7 +488,7 @@ test("a dry run reports would-write and leaves files alone", async () => {
     reviewer: "openai-codex/gpt-6-astra",
     implementer: "deepseek/deepseek-flash",
   });
-  const d = dispatcherFor(fx, 90, 10);
+  const d = dispatcherFor(fx, { claude: { session: 90 }, codex: { session: 10 } });
 
   const results = await d.evaluate({ force: true, dry: true });
   const byAgent = Object.fromEntries(results.map((r) => [r.decision.agent, r.outcome]));
@@ -302,7 +507,7 @@ test("a real run rewrites the frontmatter and nothing else", async () => {
     reviewer: "openai-codex/gpt-6-astra",
     implementer: "deepseek/deepseek-flash",
   });
-  const d = dispatcherFor(fx, 90, 10);
+  const d = dispatcherFor(fx, { claude: { session: 90 }, codex: { session: 10 } });
 
   const results = await d.evaluate({ force: true });
   const planner = results.find((r) => r.decision.agent === "planner")!;
@@ -320,14 +525,14 @@ test("a real run rewrites the frontmatter and nothing else", async () => {
 
 test("re-evaluation is idempotent and reports unchanged", async () => {
   const fx = await fixture({ planner: "openai-codex/gpt-6-sol" });
-  const d = dispatcherFor(fx, 90, 10);
+  const d = dispatcherFor(fx, { claude: { session: 90 }, codex: { session: 10 } });
   const results = await d.evaluate({ force: true });
   assert.equal(results.find((r) => r.decision.agent === "planner")!.outcome, "unchanged");
 });
 
 test("a missing agent file is skipped, not created", async () => {
   const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
-  const d = dispatcherFor(fx, 10, 10);
+  const d = dispatcherFor(fx);
   const results = await d.evaluate({ force: true });
   const impl = results.find((r) => r.decision.agent === "implementer")!;
   assert.equal(impl.outcome, "skipped (no file)");
@@ -351,11 +556,32 @@ test("an unreadable api holds every agent in place", async () => {
 
 test("limit_reached on codex moves the reviewer onto claude", async () => {
   const fx = await fixture({ reviewer: "openai-codex/gpt-6-astra" });
-  const d = dispatcherFor(fx, 10, 20, true);
+  const d = dispatcherFor(fx, { codex: { session: 20 }, codexLimited: true });
   const results = await d.evaluate({ force: true });
   const reviewer = results.find((r) => r.decision.agent === "reviewer")!;
   assert.equal(assignedModel(reviewer.decision), "claude-bridge/claude-opus-5-5");
   assert.equal(reviewer.outcome, "written");
+});
+
+/**
+ * Regression: a partial reading used to read as headroom. Codex omitting its
+ * 5-hour window made `budgetUsed(codex, "session")` return 0, so a rail that
+ * was blocked outright looked like the roomiest place to send work — and the
+ * planner was duly moved onto it, reporting "codex session 0%".
+ */
+test("a partial reading is held rather than read as headroom", async () => {
+  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+  const d = dispatcherFor(fx, {
+    claude: { session: 80 },
+    codex: { weekly: 100 },
+    codexOmitSession: true,
+  });
+  const results = await d.evaluate({ force: true });
+  const planner = results.find((r) => r.decision.agent === "planner")!;
+
+  assert.equal(planner.decision.kind, "hold");
+  assert.match(planner.decision.why, /codex did not report its session budget/);
+  assert.equal(planner.outcome, "held");
 });
 
 /**
@@ -368,7 +594,7 @@ test("a missing credential file holds every agent, even when a switch looks due"
   const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeCredsPath: join(fx.agentDir, "absent.json") },
-    { fetchImpl: stubFetch(95, 1) },
+    { fetchImpl: stubFetch({ claude: { session: 95 } }) },
   );
   const results = await d.evaluate({ force: true });
   const planner = results.find((r) => r.decision.agent === "planner")!;
@@ -387,7 +613,7 @@ test("an unreadable quota leaves an agent on the alternate untouched", async () 
   const fx = await fixture({ planner: "openai-codex/gpt-6-sol" });
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeCredsPath: join(fx.agentDir, "absent.json") },
-    { fetchImpl: stubFetch(95, 1) },
+    { fetchImpl: stubFetch({ claude: { session: 95 } }) },
   );
 
   const path = join(fx.agentDir, "planner.md");
@@ -407,7 +633,7 @@ test("an unreadable quota leaves an agent on the alternate untouched", async () 
  */
 test("report never writes, even when a switch is due", async () => {
   const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
-  const d = dispatcherFor(fx, 90, 10); // claude tight: a switch to codex is due
+  const d = dispatcherFor(fx, { claude: { session: 90 }, codex: { session: 10 } }); // claude tight: a switch to codex is due
 
   const path = join(fx.agentDir, "planner.md");
   const before = await readFile(path, "utf8");
@@ -423,7 +649,7 @@ test("report never writes, even when a switch is due", async () => {
 test("a forced report fetches each rail exactly once", async () => {
   const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
   let calls = 0;
-  const inner = stubFetch(10, 10) as unknown as (u: unknown) => Promise<unknown>;
+  const inner = stubFetch({}) as unknown as (u: unknown) => Promise<unknown>;
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx },
     {
@@ -445,7 +671,7 @@ test("an expired claude token counts as unreadable rather than switching", async
     JSON.stringify({ claudeAiOauth: { accessToken: "stale", expiresAt: Date.now() - 1000 } }),
     "utf8",
   );
-  const d = dispatcherFor(fx, 95, 1);
+  const d = dispatcherFor(fx, { claude: { session: 95 } });
   const results = await d.evaluate({ force: true });
   const planner = results.find((r) => r.decision.agent === "planner")!;
 
