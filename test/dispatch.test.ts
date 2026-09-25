@@ -144,10 +144,12 @@ interface Readings {
   session?: number;
   weekly?: number;
   ok?: boolean;
+  metered?: boolean;
   note?: string;
 }
 
 function railState(rail: Rail, r: Readings = {}): RailState {
+  if (r.metered) return { rail, ok: true, windows: [], metered: true, note: r.note ?? "metered" };
   if (r.ok === false) return { rail, ok: false, windows: [], note: r.note };
   const windows: RailWindow[] = [];
   if (r.session !== undefined) windows.push({ label: "5h", used: r.session, budget: "session" });
@@ -159,8 +161,8 @@ function rails(claude: Readings, codex: Readings): Map<Rail, RailState> {
   return new Map<Rail, RailState>([
     ["claude", railState("claude", claude)],
     ["codex", railState("codex", codex)],
-    // No windows at all: metered, hence uncapped.
-    ["deepseek", railState("deepseek", { note: "metered" })],
+    // Metered, so it reports no budgets rather than unreported ones.
+    ["deepseek", railState("deepseek", { metered: true })],
   ]);
 }
 
@@ -201,13 +203,18 @@ test("decide assigns the primary while both rails have headroom", () => {
 });
 
 test("decide moves planner off claude when the session budget is tight", () => {
-  const d = plannerDecision({ session: 90 }, { session: 10 });
+  const d = plannerDecision({ session: 90, weekly: 0 }, { session: 10, weekly: 0 });
   assert.equal(assignedModel(d), "openai-codex/gpt-6-sol");
   assert.match(d.why, /session 90% >= 75%/);
 });
 
 test("decide moves reviewer off codex when the session budget is tight", () => {
-  const d = decide("reviewer", DEFAULT_CONFIG.routes.reviewer, rails({ session: 10 }, { session: 90 }), cfg);
+  const d = decide(
+    "reviewer",
+    DEFAULT_CONFIG.routes.reviewer,
+    rails({ session: 10, weekly: 0 }, { session: 90, weekly: 0 }),
+    cfg,
+  );
   assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
 });
 
@@ -238,16 +245,47 @@ test("a tight weekly is compared against the alternate's weekly, not its session
 
 test("decide does not switch when the margin is not met", () => {
   // codex 85 is >= sessionSwitchAt but only 5 points below claude's 90.
-  const reviewer = decide("reviewer", DEFAULT_CONFIG.routes.reviewer, rails({ session: 90 }, { session: 85 }), cfg);
+  const reviewer = decide(
+    "reviewer",
+    DEFAULT_CONFIG.routes.reviewer,
+    rails({ session: 90, weekly: 0 }, { session: 85, weekly: 0 }),
+    cfg,
+  );
   assert.equal(assignedModel(reviewer), "openai-codex/gpt-6-astra");
   assert.match(reviewer.why, /within margin/);
 
-  const planner = plannerDecision({ session: 90 }, { session: 85 });
+  const planner = plannerDecision({ session: 90, weekly: 0 }, { session: 85, weekly: 0 });
   assert.equal(assignedModel(planner), "claude-bridge/claude-opus-5-5");
 });
 
+// The README used to call this "at least margin" points healthier. The
+// comparator is strict, so exactly `margin` is not enough.
+test("exactly margin points healthier is not enough to switch", () => {
+  const exactly = decide(
+    "reviewer",
+    DEFAULT_CONFIG.routes.reviewer,
+    rails({ session: 85, weekly: 0 }, { session: 95, weekly: 0 }),
+    cfg,
+  );
+  assert.equal(assignedModel(exactly), "openai-codex/gpt-6-astra");
+  assert.match(exactly.why, /within margin/);
+
+  const beyond = decide(
+    "reviewer",
+    DEFAULT_CONFIG.routes.reviewer,
+    rails({ session: 84, weekly: 0 }, { session: 95, weekly: 0 }),
+    cfg,
+  );
+  assert.equal(assignedModel(beyond), "claude-bridge/claude-opus-5-5");
+});
+
 test("decide switches on a session budget of 100", () => {
-  const d = decide("reviewer", DEFAULT_CONFIG.routes.reviewer, rails({ session: 10 }, { session: 100 }), cfg);
+  const d = decide(
+    "reviewer",
+    DEFAULT_CONFIG.routes.reviewer,
+    rails({ session: 10, weekly: 0 }, { session: 100, weekly: 0 }),
+    cfg,
+  );
   assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
 });
 
@@ -258,21 +296,86 @@ test("the session budget is the one reported when both are tight", () => {
 });
 
 test("a metered primary is never tight, so it is left where it is", () => {
-  const d = decide("implementer", DEFAULT_CONFIG.routes.implementer, rails({ session: 99 }, { session: 99 }), cfg);
+  const d = decide(
+    "implementer",
+    DEFAULT_CONFIG.routes.implementer,
+    rails({ session: 99, weekly: 99 }, { session: 99, weekly: 99 }),
+    cfg,
+  );
   assert.equal(assignedModel(d), "deepseek/deepseek-flash");
+});
+
+// ------------------------------------------------- destination eligibility
+
+// The run that exposed this moved the planner *onto* codex on the session rule
+// while moving the reviewer *off* codex on the weekly rule, in the same pass.
+test("an alternate that is tight on its other budget is not a destination", () => {
+  const d = plannerDecision({ session: 80, weekly: 0 }, { session: 10, weekly: 100 });
+  assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
+  assert.match(d.why, /codex weekly 100% is itself tight/);
+});
+
+test("one pass never moves an agent onto a rail it moves another agent off", () => {
+  // Codex's week is nearly spent and claude's session is nearly spent, so
+  // neither rail is a clear improvement. Swapping the two agents would leave
+  // both rails exactly as constrained as they were, minus the churn.
+  const claude = { session: 80, weekly: 0 };
+  const codex = { session: 10, weekly: 95 };
+
+  const planner = plannerDecision(claude, codex);
+  assert.equal(assignedModel(planner), "claude-bridge/claude-opus-5-5");
+
+  const reviewer = decide("reviewer", DEFAULT_CONFIG.routes.reviewer, rails(claude, codex), cfg);
+  assert.equal(assignedModel(reviewer), "openai-codex/gpt-6-astra");
+});
+
+test("a destination may be tight on the compared budget, as long as it is better", () => {
+  // Both session budgets are over the threshold, but codex is 14 points better,
+  // which is a real improvement, so the switch still happens.
+  const d = plannerDecision({ session: 90, weekly: 0 }, { session: 76, weekly: 5 });
+  assert.equal(assignedModel(d), "openai-codex/gpt-6-sol");
+});
+
+test("a tight weekly is still acted on when the session rule cannot fire", () => {
+  // Session is tight but codex is not margin better, so the session rule falls
+  // through; the weekly rule then finds codex far healthier on the week, and its
+  // session is healthy enough to be used.
+  const d = plannerDecision({ session: 80, weekly: 95 }, { session: 70, weekly: 10 });
+  assert.equal(assignedModel(d), "openai-codex/gpt-6-sol");
+  assert.match(d.why, /weekly 95% >= 90%/);
+});
+
+// ------------------------------------- unreadable and unreported readings
+
+test("an unreported budget is held, not read as idle", () => {
+  // The bug: a rail that omitted its 5-hour window read as 0% session, so a
+  // blocked rail looked like the roomiest place to send work.
+  const d = plannerDecision({ session: 80, weekly: 0 }, { weekly: 100 });
+  assert.equal(d.kind, "hold");
+  assert.match(d.why, /codex did not report its session budget/);
+});
+
+test("a metered rail reports no budgets rather than unreported ones", () => {
+  const metered = railState("deepseek", { metered: true });
+  assert.equal(budgetUsed(metered, "session"), 0);
+  assert.equal(budgetUsed(metered, "weekly"), 0);
+
+  const partial = railState("codex", { weekly: 10 });
+  assert.equal(budgetUsed(partial, "session"), undefined);
+  assert.equal(budgetUsed(partial, "weekly"), 10);
 });
 
 // A hold is not "assign the primary". These decisions carry no model at all,
 // because naming one is what let an unreadable quota drag agents back onto the
 // rail that was under pressure.
 test("decide makes no assignment when the primary rail is unreadable", () => {
-  const d = plannerDecision({ ok: false, note: "HTTP 401" }, { session: 1 });
+  const d = plannerDecision({ ok: false, note: "HTTP 401" }, { session: 1, weekly: 0 });
   assert.equal(d.kind, "hold");
   assert.match(d.why, /unreadable/);
 });
 
 test("decide makes no assignment when the alternate rail is unreadable", () => {
-  const d = plannerDecision({ session: 99 }, { ok: false, note: "HTTP 500" });
+  const d = plannerDecision({ session: 99, weekly: 0 }, { ok: false, note: "HTTP 500" });
   assert.equal(d.kind, "hold");
 });
 
@@ -329,6 +432,8 @@ interface StubReadings {
   claude?: { session?: number; weekly?: number };
   codex?: { session?: number; weekly?: number };
   codexLimited?: boolean;
+  /** Omit the 5-hour window entirely, reproducing a partial reading. */
+  codexOmitSession?: boolean;
 }
 
 function stubFetch(opts: StubReadings = {}) {
@@ -351,11 +456,15 @@ function stubFetch(opts: StubReadings = {}) {
         json: async () => ({
           rate_limit: {
             limit_reached: opts.codexLimited ?? false,
-            primary_window: {
-              used_percent: opts.codex?.session ?? 0,
-              limit_window_seconds: 18000,
-              reset_after_seconds: 3600,
-            },
+            ...(opts.codexOmitSession
+              ? {}
+              : {
+                  primary_window: {
+                    used_percent: opts.codex?.session ?? 0,
+                    limit_window_seconds: 18000,
+                    reset_after_seconds: 3600,
+                  },
+                }),
             secondary_window: {
               used_percent: opts.codex?.weekly ?? 0,
               limit_window_seconds: 604800,
@@ -452,6 +561,27 @@ test("limit_reached on codex moves the reviewer onto claude", async () => {
   const reviewer = results.find((r) => r.decision.agent === "reviewer")!;
   assert.equal(assignedModel(reviewer.decision), "claude-bridge/claude-opus-5-5");
   assert.equal(reviewer.outcome, "written");
+});
+
+/**
+ * Regression: a partial reading used to read as headroom. Codex omitting its
+ * 5-hour window made `budgetUsed(codex, "session")` return 0, so a rail that
+ * was blocked outright looked like the roomiest place to send work — and the
+ * planner was duly moved onto it, reporting "codex session 0%".
+ */
+test("a partial reading is held rather than read as headroom", async () => {
+  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+  const d = dispatcherFor(fx, {
+    claude: { session: 80 },
+    codex: { weekly: 100 },
+    codexOmitSession: true,
+  });
+  const results = await d.evaluate({ force: true });
+  const planner = results.find((r) => r.decision.agent === "planner")!;
+
+  assert.equal(planner.decision.kind, "hold");
+  assert.match(planner.decision.why, /codex did not report its session budget/);
+  assert.equal(planner.outcome, "held");
 });
 
 /**

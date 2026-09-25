@@ -73,7 +73,7 @@ routes: {
 | `routes` | planner / reviewer / implementer | Which agents are managed, and where each moves. Agents not listed are never touched. |
 | `sessionSwitchAt` | `75` | Used-percent at which the primary's **session** budget is considered tight |
 | `weeklySwitchAt` | `90` | The same for its **weekly** budget, deliberately higher — see [the policy](#the-policy) |
-| `margin` | `10` | The alternate must be at least this many points healthier, on the *same* budget |
+| `margin` | `10` | The alternate must be **more than** this many points healthier, on the *same* budget |
 | `ttlMs` | `180000` | How long a quota reading is reused |
 | `pollMs` | `300000` | How often to re-evaluate while a session is open |
 
@@ -95,18 +95,32 @@ are weighed separately:
   so for *days*, so a switch made on it is close to one-way.
 
 1. **Session first.** If the primary's session budget is at or above
-   `sessionSwitchAt`, and the alternate's **session** budget is at least `margin`
-   points healthier, move to the alternate.
-2. **Weekly is a backstop.** If the session budget is fine but the weekly budget
-   is at or above `weeklySwitchAt`, and the alternate's **weekly** budget is at
-   least `margin` points healthier, move. Each rule compares like with like.
-3. Otherwise stay on the primary.
-4. **Unreadable quota is not evidence of pressure.** If either rail cannot be
-   read, the dispatcher makes no assignment at all: `Decision` is either an
-   assign or an explicit hold, and a hold carries no model, so there is nothing
-   to write. Every agent file is left exactly as you left it. A failed HTTP call
-   must never move work onto the other plan — least of all back onto the rail
-   that was under pressure.
+   `sessionSwitchAt`, and the alternate's **session** budget is more than
+   `margin` points healthier, move to the alternate.
+2. **Weekly is a backstop.** The same rule on the weekly budget, with its own
+   `weeklySwitchAt`. Each compares like with like: session against the
+   alternate's session, weekly against its weekly. It runs whether or not the
+   session budget is tight, so a spent week is not masked by a merely tight
+   session.
+3. **The destination has to be somewhere worth going.** A rail is only a valid
+   target if — besides being better on the budget that triggered the move — it
+   is **not itself tight on the other budget**. A rail tight on its *other* cap
+   would block the work just as surely, so switching there trades one cap for
+   another rather than relieving anything. Without this, one pass can move an
+   agent *onto* the very rail it moves another agent *off*.
+4. Otherwise stay on the primary.
+5. **Unreadable is not the same as idle.** If either rail cannot be read, or a
+   capped rail fails to report a budget, the dispatcher makes no assignment at
+   all: `Decision` is either an assign or an explicit hold, and a hold carries
+   no model, so there is nothing to write. Every agent file is left exactly as
+   you left it. A failed HTTP call must never move work onto the other plan —
+   least of all back onto the rail that was under pressure. Reading a missing
+   5-hour window as "0% used" is how a rail that was blocked outright once came
+   to look like the roomiest place to send work.
+
+A rail is *metered* when it is billed per token rather than quota-capped. That
+is a real reading of zero pressure, not a gap, so unlike everything else in
+rule 5 it never holds — which is what makes DeepSeek a usable resting place.
 
 Weighing the two budgets as a single number is the obvious simplification, and
 it is wrong: the weekly figure is almost always the larger of the two, so it
@@ -117,6 +131,11 @@ Rails are per-provider: `claude-bridge/*` and `anthropic/*` consume the Claude
 subscription, and `openai-codex/*` consumes the Codex subscription. `deepseek/*`
 is metered per token rather than capped, so it reports no windows at all and is
 never tight — it is the resting place.
+
+One thing this deliberately does *not* do is predict exhaustion. A weekly budget
+at 65% with a third of the week gone is burning at roughly twice its sustainable
+rate, and a flat threshold cannot see that. Switching on pace is [issue
+#4](https://github.com/gregwebs/pi-quota-dispatcher/issues/4).
 
 ## Design decisions
 
@@ -181,7 +200,7 @@ provider that issued them.
 Zero runtime dependencies. Tests use the Node built-in runner:
 
 ```bash
-npm test        # 36 tests, no install required
+npm test        # 44 tests, no install required
 npm install && npm run typecheck
 ```
 

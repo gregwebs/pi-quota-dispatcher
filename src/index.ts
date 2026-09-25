@@ -74,6 +74,13 @@ export interface RailState {
   ok: boolean;
   /** Every window the endpoint reported, for display. Only some carry a budget. */
   windows: RailWindow[];
+  /**
+   * Billed per token rather than quota-capped, so there is no budget to read:
+   * `budgetUsed` reports 0 on both and the rail can never block a switch.
+   * Distinct from reporting no windows, which for a capped rail is a partial
+   * reading the policy must not guess at.
+   */
+  metered?: boolean;
   note?: string;
 }
 
@@ -225,48 +232,58 @@ export function parseCodexUsage(data: any): {
 
 // ---------------------------------------------------------------- policy
 
+/** Budgets in the order the policy weighs them: the acute cap first. */
+const BUDGET_ORDER: readonly Budget[] = ["session", "weekly"];
+
+/** The budget a destination would still have to survive. */
+const OTHER_BUDGET: Record<Budget, Budget> = { session: "weekly", weekly: "session" };
+
+function thresholdFor(budget: Budget, cfg: DispatcherConfig): number {
+  return budget === "session" ? cfg.sessionSwitchAt : cfg.weeklySwitchAt;
+}
+
+/** Percentages arrive fractional and are only ever read to the point. */
+function pct(n: number): string {
+  return `${n.toFixed(0)}%`;
+}
+
 /**
- * Used-percent for one budget on a rail.
+ * Used-percent for one budget, or `undefined` when the rail did not report it.
  *
- * Several windows can share a budget — Claude reports an account-wide week plus
- * per-model weeks — so this takes the worst of them. A rail that reports no
- * windows at all is metered rather than capped (the DeepSeek case), which is why
- * the fallback is 0 and not "unknown": `deepseekState()` is the only rail that
- * can be `ok` with no windows, and being uncapped is a reading, not a gap.
+ * `undefined` rather than 0 is the point. A missing 5-hour window is not
+ * evidence that the 5-hour budget is free, and reading it as free is exactly how
+ * a rail that was blocked outright came to look like the roomiest place to send
+ * work. Several windows can share a budget — Claude reports an account-wide week
+ * plus per-model weeks — so this takes the worst of them.
+ *
+ * A metered rail is billed per token rather than capped, so it has no budget to
+ * report and honestly reads 0 on both.
  */
-export function budgetUsed(state: RailState, budget: Budget): number {
+export function budgetUsed(state: RailState, budget: Budget): number | undefined {
+  if (state.metered) return 0;
   const used = state.windows.filter((w) => w.budget === budget).map((w) => w.used);
-  return used.length ? Math.max(...used) : 0;
-}
-
-/** A budget at or over its threshold, with the threshold that caught it. */
-interface TightBudget {
-  budget: Budget;
-  used: number;
-  threshold: number;
+  return used.length ? Math.max(...used) : undefined;
 }
 
 /**
- * The budget that makes a rail tight, if any.
+ * Budgets a capped rail failed to report.
  *
- * Session is tested first: it is the acute cap and the one that recovers within
- * hours, so when both are tight it is the more actionable thing to report.
+ * A metered rail reads 0 through `budgetUsed`, and unreadable rails are rejected
+ * before this is consulted, so anything returned here is a partial reading. The
+ * policy holds rather than guessing: an unreported budget is not an idle one.
  */
-function tightBudget(state: RailState, cfg: DispatcherConfig): TightBudget | null {
-  for (const budget of ["session", "weekly"] as const) {
-    const threshold = budget === "session" ? cfg.sessionSwitchAt : cfg.weeklySwitchAt;
-    const used = budgetUsed(state, budget);
-    if (used >= threshold) return { budget, used, threshold };
-  }
-  return null;
+function absentBudgets(state: RailState): Budget[] {
+  return BUDGET_ORDER.filter((b) => budgetUsed(state, b) === undefined);
 }
 
 /** Both budgets, for the decision's `why`. */
 function budgetSummary(state: RailState): string {
+  if (state.metered) return state.note ?? "metered";
   if (!state.windows.length) return state.note ?? "no windows";
-  return (["session", "weekly"] as const)
-    .map((b) => `${b} ${budgetUsed(state, b).toFixed(0)}%`)
-    .join(", ");
+  return BUDGET_ORDER.map((b) => {
+    const used = budgetUsed(state, b);
+    return `${b} ${used === undefined ? "unreported" : pct(used)}`;
+  }).join(", ");
 }
 
 /**
@@ -284,6 +301,12 @@ function budgetSummary(state: RailState): string {
  * cannot be read we make no assignment at all, leaving the file exactly as the
  * user left it. Substituting the primary here would move agents back onto a
  * constrained rail on the strength of a failed HTTP call.
+ *
+ * A destination is held to the same standard as a source. It must be strictly
+ * healthier on the budget that triggered the move *and* not tight on its other
+ * budget, because a rail that is tight there would block the work just as
+ * surely. Without that, one agent can be moved onto the very rail another was
+ * moved off in the same pass.
  */
 export function decide(
   agent: string,
@@ -321,33 +344,60 @@ export function decide(
     };
   }
 
-  const tight = tightBudget(primary, cfg);
-  if (!tight) {
-    return {
-      agent,
-      file,
-      kind: "assign",
-      model: route.primary.model,
-      why: `${primary.rail} ok (${budgetSummary(primary)})`,
-    };
+  // An unreported budget is unknown, not idle. Guessing here is what let a rail
+  // that was blocked outright read as the roomiest place to send work.
+  for (const state of [primary, alt]) {
+    const absent = absentBudgets(state);
+    if (absent.length) {
+      return {
+        agent,
+        file,
+        kind: "hold",
+        why: `${state.rail} did not report its ${absent.join(" and ")} budget (${budgetSummary(state)}) — holding`,
+      };
+    }
   }
 
-  const altUsed = budgetUsed(alt, tight.budget);
-  if (altUsed < tight.used - cfg.margin) {
-    return {
-      agent,
-      file,
-      kind: "assign",
-      model: route.alternate.model,
-      why: `${primary.rail} ${tight.budget} ${tight.used.toFixed(0)}% >= ${tight.threshold}%, ${alt.rail} ${tight.budget} ${altUsed.toFixed(0)}%`,
-    };
+  const reasons: string[] = [];
+  for (const budget of BUDGET_ORDER) {
+    const used = budgetUsed(primary, budget)!;
+    const threshold = thresholdFor(budget, cfg);
+    if (used < threshold) continue;
+
+    const spare = OTHER_BUDGET[budget];
+    const altUsed = budgetUsed(alt, budget)!;
+    const altSpare = budgetUsed(alt, spare)!;
+
+    // A destination that is tight on its *other* budget would block this work
+    // just as surely, so switching there trades one cap for another rather than
+    // relieving anything. This is what stops an agent being moved onto the very
+    // rail another agent was moved off in the same pass.
+    if (altSpare >= thresholdFor(spare, cfg)) {
+      reasons.push(
+        `${primary.rail} ${budget} ${pct(used)} >= ${pct(threshold)} but ${alt.rail} ${spare} ${pct(altSpare)} is itself tight`,
+      );
+      continue;
+    }
+    if (altUsed < used - cfg.margin) {
+      return {
+        agent,
+        file,
+        kind: "assign",
+        model: route.alternate.model,
+        why: `${primary.rail} ${budget} ${pct(used)} >= ${pct(threshold)}, ${alt.rail} ${budget} ${pct(altUsed)}`,
+      };
+    }
+    reasons.push(
+      `${primary.rail} ${budget} ${pct(used)} >= ${pct(threshold)} but ${alt.rail} ${budget} ${pct(altUsed)} is within margin`,
+    );
   }
+
   return {
     agent,
     file,
     kind: "assign",
     model: route.primary.model,
-    why: `${primary.rail} ${tight.budget} ${tight.used.toFixed(0)}% >= ${tight.threshold}% but ${alt.rail} ${tight.budget} ${altUsed.toFixed(0)}% is within margin`,
+    why: reasons.length ? reasons.join("; ") : `${primary.rail} ok (${budgetSummary(primary)})`,
   };
 }
 
@@ -413,7 +463,7 @@ function unavailable(rail: Rail, note: string): RailState {
  * that as 0.
  */
 function deepseekState(): RailState {
-  return { rail: "deepseek", ok: true, windows: [], note: "metered" };
+  return { rail: "deepseek", ok: true, windows: [], metered: true, note: "metered" };
 }
 
 async function readClaudeToken(path: string): Promise<{ token: string } | { error: string }> {
