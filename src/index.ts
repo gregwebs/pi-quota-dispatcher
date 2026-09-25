@@ -20,7 +20,7 @@
  *      the session model is worse than a stale-but-sane one.
  *
  * The policy is stateless: the target model is a pure function of current rail
- * pressure, so re-evaluating is idempotent and cannot drift.
+ * headroom, so re-evaluating is idempotent and cannot drift.
  *
  * Quota is read from two undocumented-but-stable endpoints the vendors' own
  * clients use. No credentials are ever logged.
@@ -45,16 +45,34 @@ export interface Route {
   alternate?: Candidate;
 }
 
+/**
+ * The two budgets a rail imposes, which move on very different clocks.
+ *
+ * They have to be weighed separately. Collapsing them into one "worst window"
+ * number let the weekly figure dominate every decision, because it is almost
+ * always the larger of the two: a rail with a full session budget and a
+ * comfortable week would be treated as tight purely on the week, and moving off
+ * a weekly figure is close to one-way — it does not recover for days.
+ */
+export type Budget = "session" | "weekly";
+
 export interface RailWindow {
   label: string;
   used: number;
+  /**
+   * Set when this window belongs to a budget the policy weighs. Windows left
+   * unclassified are display-only: model-specific sub-caps and vendor windows
+   * we do not recognise.
+   */
+  budget?: Budget;
+  /** Seconds until this window resets, when the endpoint reports it. */
+  resetsInSeconds?: number;
 }
 
 export interface RailState {
   rail: Rail;
   ok: boolean;
-  /** Worst-window used-percent, 0-100. `Infinity` when unavailable. */
-  pressure: number;
+  /** Every window the endpoint reported, for display. Only some carry a budget. */
   windows: RailWindow[];
   note?: string;
 }
@@ -67,8 +85,20 @@ export interface DispatcherConfig {
   ttlMs: number;
   /** Re-evaluate on this cadence while a session is open. */
   pollMs: number;
-  /** Consider the alternate once the primary rail reaches this used-percent. */
-  switchAt: number;
+  /**
+   * Consider the alternate once the primary's *session* budget reaches this.
+   * This is the acute cap: the one that blocks you mid-task, and the only one
+   * that recovers within hours, so a switch made on it is reversible.
+   */
+  sessionSwitchAt: number;
+  /**
+   * ...or once its *weekly* budget reaches this.
+   *
+   * Deliberately higher than `sessionSwitchAt`. The weekly window does not
+   * recover for days, so a switch made on it is close to one-way and should be
+   * a last resort rather than the routine signal.
+   */
+  weeklySwitchAt: number;
   /** ...and only when the alternate is at least this many points healthier. */
   margin: number;
   /** Agents absent from this table are never touched. */
@@ -104,7 +134,8 @@ export const DEFAULT_CONFIG: DispatcherConfig = {
   piAuthPath: join(homedir(), ".pi", "agent", "auth.json"),
   ttlMs: 3 * 60 * 1000,
   pollMs: 5 * 60 * 1000,
-  switchAt: 75,
+  sessionSwitchAt: 75,
+  weeklySwitchAt: 90,
   margin: 10,
   routes: {
     planner: {
@@ -130,42 +161,124 @@ function num(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
+/**
+ * Claude reports an account-wide session cap (`five_hour`) alongside weekly
+ * caps: one account-wide plus per-model ones. Every weekly figure is classified
+ * as the same budget, so the worst of them is what the weekly guard sees — a
+ * Sonnet cap at 95% does block you, even when the account-wide week is
+ * comfortable.
+ */
 export function parseClaudeUsage(data: any): RailWindow[] {
-  const keys: Array<[string, string]> = [
-    ["five_hour", "5h"],
-    ["seven_day", "7d"],
-    ["seven_day_sonnet", "7d Sonnet"],
-    ["seven_day_opus", "7d Opus"],
-    ["seven_day_omelette", "7d Opus"],
+  const keys: Array<[string, string, Budget | undefined]> = [
+    ["five_hour", "5h", "session"],
+    ["seven_day", "7d", "weekly"],
+    ["seven_day_sonnet", "7d Sonnet", "weekly"],
+    ["seven_day_opus", "7d Opus", "weekly"],
+    ["seven_day_omelette", "7d omelette", "weekly"],
   ];
   const windows: RailWindow[] = [];
-  for (const [key, label] of keys) {
+  for (const [key, label, budget] of keys) {
     const used = num(data?.[key]?.utilization);
-    if (used !== undefined) windows.push({ label, used });
+    if (used !== undefined) windows.push(budget ? { label, used, budget } : { label, used });
   }
   return windows;
 }
 
+/**
+ * Label a window from its advertised length rather than assuming it, so the
+ * display cannot quietly drift if the vendor changes a window.
+ */
+function durationLabel(seconds: number | undefined, fallback: string): string {
+  if (seconds === undefined) return fallback;
+  if (seconds % 86400 === 0) return `${seconds / 86400}d`;
+  if (seconds % 3600 === 0) return `${seconds / 3600}h`;
+  return `${Math.round(seconds / 60)}m`;
+}
+
+/**
+ * Codex reports a short "primary" window and a long "secondary" one. The
+ * positions are the vendor's stable meaning; the labels come from the advertised
+ * window length, and `reset_after_seconds` tells us when each recovers.
+ */
 export function parseCodexUsage(data: any): {
   windows: RailWindow[];
   limited: boolean;
 } {
-  const windows: RailWindow[] = [];
   const rl = data?.rate_limit;
-  for (const [key, label] of [
-    ["primary_window", "5h"],
-    ["secondary_window", "7d"],
-  ] as Array<[string, string]>) {
-    const used = num(rl?.[key]?.used_percent);
-    if (used !== undefined) windows.push({ label, used });
-  }
+  const windows: RailWindow[] = [];
+  const push = (key: string, budget: Budget, fallback: string) => {
+    const w = rl?.[key];
+    const used = num(w?.used_percent);
+    if (used === undefined) return;
+    const resetsInSeconds = num(w?.reset_after_seconds);
+    windows.push({
+      label: durationLabel(num(w?.limit_window_seconds), fallback),
+      used,
+      budget,
+      ...(resetsInSeconds !== undefined ? { resetsInSeconds } : {}),
+    });
+  };
+  push("primary_window", "session", "5h");
+  push("secondary_window", "weekly", "7d");
   return { windows, limited: rl?.limit_reached === true };
 }
 
 // ---------------------------------------------------------------- policy
 
 /**
- * Pick the model for one agent from current rail pressure.
+ * Used-percent for one budget on a rail.
+ *
+ * Several windows can share a budget — Claude reports an account-wide week plus
+ * per-model weeks — so this takes the worst of them. A rail that reports no
+ * windows at all is metered rather than capped (the DeepSeek case), which is why
+ * the fallback is 0 and not "unknown": `deepseekState()` is the only rail that
+ * can be `ok` with no windows, and being uncapped is a reading, not a gap.
+ */
+export function budgetUsed(state: RailState, budget: Budget): number {
+  const used = state.windows.filter((w) => w.budget === budget).map((w) => w.used);
+  return used.length ? Math.max(...used) : 0;
+}
+
+/** A budget at or over its threshold, with the threshold that caught it. */
+interface TightBudget {
+  budget: Budget;
+  used: number;
+  threshold: number;
+}
+
+/**
+ * The budget that makes a rail tight, if any.
+ *
+ * Session is tested first: it is the acute cap and the one that recovers within
+ * hours, so when both are tight it is the more actionable thing to report.
+ */
+function tightBudget(state: RailState, cfg: DispatcherConfig): TightBudget | null {
+  for (const budget of ["session", "weekly"] as const) {
+    const threshold = budget === "session" ? cfg.sessionSwitchAt : cfg.weeklySwitchAt;
+    const used = budgetUsed(state, budget);
+    if (used >= threshold) return { budget, used, threshold };
+  }
+  return null;
+}
+
+/** Both budgets, for the decision's `why`. */
+function budgetSummary(state: RailState): string {
+  if (!state.windows.length) return state.note ?? "no windows";
+  return (["session", "weekly"] as const)
+    .map((b) => `${b} ${budgetUsed(state, b).toFixed(0)}%`)
+    .join(", ");
+}
+
+/**
+ * Pick the model for one agent from current rail headroom.
+ *
+ * The session and weekly budgets are weighed *separately*, session first. They
+ * mean opposite things. Session is the acute cap: it blocks you mid-task but
+ * clears within hours, so acting on it is reversible. Weekly rarely blocks you,
+ * but when it does it does so for days, so it earns a vote only at a much higher
+ * threshold. Folding the two into one "worst window" number let the weekly
+ * figure set the policy on its own, because it is almost always the larger of
+ * the two.
  *
  * Deliberate rule: unreadable quota is *not* evidence of pressure. When a rail
  * cannot be read we make no assignment at all, leaving the file exactly as the
@@ -207,13 +320,26 @@ export function decide(
       why: `${route.alternate.rail} unreadable (${alt.note}) — holding`,
     };
   }
-  if (primary.pressure >= cfg.switchAt && alt.pressure < primary.pressure - cfg.margin) {
+
+  const tight = tightBudget(primary, cfg);
+  if (!tight) {
+    return {
+      agent,
+      file,
+      kind: "assign",
+      model: route.primary.model,
+      why: `${primary.rail} ok (${budgetSummary(primary)})`,
+    };
+  }
+
+  const altUsed = budgetUsed(alt, tight.budget);
+  if (altUsed < tight.used - cfg.margin) {
     return {
       agent,
       file,
       kind: "assign",
       model: route.alternate.model,
-      why: `${primary.rail} ${primary.pressure.toFixed(0)}% >= ${cfg.switchAt}%, ${alt.rail} ${alt.pressure.toFixed(0)}%`,
+      why: `${primary.rail} ${tight.budget} ${tight.used.toFixed(0)}% >= ${tight.threshold}%, ${alt.rail} ${tight.budget} ${altUsed.toFixed(0)}%`,
     };
   }
   return {
@@ -221,7 +347,7 @@ export function decide(
     file,
     kind: "assign",
     model: route.primary.model,
-    why: `${primary.rail} ${primary.pressure.toFixed(0)}% ok`,
+    why: `${primary.rail} ${tight.budget} ${tight.used.toFixed(0)}% >= ${tight.threshold}% but ${alt.rail} ${tight.budget} ${altUsed.toFixed(0)}% is within margin`,
   };
 }
 
@@ -277,16 +403,17 @@ export function describeDecision(decision: Decision): string {
 // ---------------------------------------------------------------- rails
 
 function unavailable(rail: Rail, note: string): RailState {
-  return { rail, ok: false, pressure: Infinity, windows: [], note };
+  return { rail, ok: false, windows: [], note };
 }
 
 /**
  * DeepSeek is metered per token rather than quota-capped, so it never blocks a
- * switch. Modelled as zero pressure rather than "unknown" so the policy can
- * rest there without evidence to the contrary.
+ * switch. Reported with no windows — "uncapped" rather than "unknown" — so the
+ * policy can rest there without evidence to the contrary. `budgetUsed` reads
+ * that as 0.
  */
 function deepseekState(): RailState {
-  return { rail: "deepseek", ok: true, pressure: 0, windows: [], note: "metered" };
+  return { rail: "deepseek", ok: true, windows: [], note: "metered" };
 }
 
 async function readClaudeToken(path: string): Promise<{ token: string } | { error: string }> {
@@ -339,12 +466,7 @@ export function createDispatcher(
 
     const windows = parseClaudeUsage(await res.json());
     if (!windows.length) return unavailable("claude", "no usage windows returned");
-    return {
-      rail: "claude",
-      ok: true,
-      pressure: Math.max(...windows.map((w) => w.used)),
-      windows,
-    };
+    return { rail: "claude", ok: true, windows };
   }
 
   async function fetchCodex(): Promise<RailState> {
@@ -372,13 +494,15 @@ export function createDispatcher(
 
     const { windows, limited } = parseCodexUsage(await res.json());
     if (!windows.length) return unavailable("codex", "no rate_limit windows returned");
-    const state: RailState = {
+    if (!limited) return { rail: "codex", ok: true, windows };
+    // `limit_reached` means blocked outright, not merely close, so every budget
+    // reads full rather than leaving a comfortable-looking percentage behind.
+    return {
       rail: "codex",
       ok: true,
-      pressure: Math.max(...windows.map((w) => w.used)),
-      windows,
+      windows: windows.map((w) => ({ ...w, used: 100 })),
+      note: "limit_reached=true",
     };
-    return limited ? { ...state, pressure: 100, note: "limit_reached=true" } : state;
   }
 
   async function railState(rail: Rail, force = false): Promise<RailState> {
