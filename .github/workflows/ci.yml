@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 and 24 are the current LTS lines. 23 is EOL.
+        node: ["22", "24"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+
+      # Deliberately no `npm ci`. The suite must run against a bare checkout:
+      # the package has zero runtime dependencies and the tests import nothing
+      # outside node: builtins plus a type-only import that Node erases. If
+      # that ever stops being true, this job should fail rather than paper
+      # over it with an install.
+      - name: Run tests
+        run: npm test
+
+  checks:
+    name: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Guards the classic packaging bug: a source file that exists in the repo
+      # but is missing from package.json "files", so the published tarball
+      # ships a manifest pointing at a file that is not there.
+      - name: Verify the pi manifest and files list resolve
+        run: |
+          set -euo pipefail
+          npm pack --dry-run --json > /tmp/pack.json
+          node -e '
+            const fs = require("node:fs");
+            const [pack] = JSON.parse(fs.readFileSync("/tmp/pack.json", "utf8"));
+            const shipped = new Set(pack.files.map((f) => f.path));
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+
+            const missing = [];
+            for (const entry of pkg.pi?.extensions ?? []) {
+              const rel = entry.replace(/^\.\//, "");
+              if (!shipped.has(rel)) missing.push(`pi.extensions entry not shipped: ${rel}`);
+            }
+            if (!shipped.has("README.md")) missing.push("README.md not shipped");
+            if (!shipped.has("LICENSE")) missing.push("LICENSE not shipped");
+
+            if (missing.length) {
+              console.error(missing.join("\n"));
+              process.exit(1);
+            }
+            console.log("packaged files:", [...shipped].sort().join(", "));
+          '
