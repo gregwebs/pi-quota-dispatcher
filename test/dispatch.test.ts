@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -185,12 +185,47 @@ test("decide holds when the alternate rail is unreadable", () => {
 const TEMPLATE = (name: string, model: string) =>
   `---\nname: ${name}\ndescription: x\nmodel: "${model}"\nthinking: high\n---\n\nBody.\n`;
 
-async function fixture(models: Record<string, string>) {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-"));
+interface Fixture {
+  agentDir: string;
+  claudeCredsPath: string;
+  piAuthPath: string;
+}
+
+/**
+ * A fixture has to stand alone: it provides agent files *and* fake credential
+ * files.
+ *
+ * The dispatcher reads credentials before it ever touches the network, so a
+ * fixture that only stubbed `fetch` would silently fall through to the
+ * developer's real `~/.claude/.credentials.json` and `~/.pi/agent/auth.json`.
+ * That passes on a developer machine and fails on CI, where those files do not
+ * exist and the rail is correctly reported unreadable.
+ */
+async function fixture(models: Record<string, string>): Promise<Fixture> {
+  const root = await mkdtemp(join(tmpdir(), "pqd-"));
+  const agentDir = join(root, "agents");
+  await mkdir(agentDir, { recursive: true });
   for (const [name, model] of Object.entries(models)) {
-    await writeFile(join(dir, `${name}.md`), TEMPLATE(name, model), "utf8");
+    await writeFile(join(agentDir, `${name}.md`), TEMPLATE(name, model), "utf8");
   }
-  return dir;
+
+  const claudeCredsPath = join(root, "claude-credentials.json");
+  await writeFile(
+    claudeCredsPath,
+    JSON.stringify({
+      claudeAiOauth: { accessToken: "test-token", expiresAt: Date.now() + 3_600_000 },
+    }),
+    "utf8",
+  );
+
+  const piAuthPath = join(root, "pi-auth.json");
+  await writeFile(
+    piAuthPath,
+    JSON.stringify({ "openai-codex": { access: "test-token", accountId: "acct-test" } }),
+    "utf8",
+  );
+
+  return { agentDir, claudeCredsPath, piAuthPath };
 }
 
 function stubFetch(claudeUsed: number, codexUsed: number, codexLimited = false) {
@@ -220,20 +255,20 @@ function stubFetch(claudeUsed: number, codexUsed: number, codexLimited = false) 
   }) as unknown as typeof fetch;
 }
 
-function dispatcherFor(dir: string, claudeUsed: number, codexUsed: number, codexLimited = false) {
+function dispatcherFor(fx: Fixture, claudeUsed: number, codexUsed: number, codexLimited = false) {
   return createDispatcher(
-    { ...DEFAULT_CONFIG, agentDir: dir },
+    { ...DEFAULT_CONFIG, ...fx },
     { fetchImpl: stubFetch(claudeUsed, codexUsed, codexLimited) },
   );
 }
 
 test("a dry run reports would-write and leaves files alone", async () => {
-  const dir = await fixture({
+  const fx = await fixture({
     planner: "claude-bridge/claude-opus-5-5",
     reviewer: "openai-codex/gpt-6-astra",
     implementer: "deepseek/deepseek-flash",
   });
-  const d = dispatcherFor(dir, 90, 10);
+  const d = dispatcherFor(fx, 90, 10);
 
   const results = await d.evaluate({ force: true, dry: true });
   const byAgent = Object.fromEntries(results.map((r) => [r.decision.agent, r.outcome]));
@@ -242,51 +277,51 @@ test("a dry run reports would-write and leaves files alone", async () => {
   assert.equal(byAgent.reviewer, "unchanged");
   assert.equal(byAgent.implementer, "unchanged");
 
-  const planner = await readFile(join(dir, "planner.md"), "utf8");
+  const planner = await readFile(join(fx.agentDir, "planner.md"), "utf8");
   assert.match(planner, /^model: "claude-bridge\/claude-opus-5-5"$/m);
 });
 
 test("a real run rewrites the frontmatter and nothing else", async () => {
-  const dir = await fixture({
+  const fx = await fixture({
     planner: "claude-bridge/claude-opus-5-5",
     reviewer: "openai-codex/gpt-6-astra",
     implementer: "deepseek/deepseek-flash",
   });
-  const d = dispatcherFor(dir, 90, 10);
+  const d = dispatcherFor(fx, 90, 10);
 
   const results = await d.evaluate({ force: true });
   const planner = results.find((r) => r.decision.agent === "planner")!;
   assert.equal(planner.outcome, "written");
 
-  const after = await readFile(join(dir, "planner.md"), "utf8");
+  const after = await readFile(join(fx.agentDir, "planner.md"), "utf8");
   assert.match(after, /^model: "openai-codex\/gpt-6-sol"$/m);
   assert.match(after, /^thinking: high$/m);
   assert.match(after, /^Body\.$/m);
 
   // Untouched agents are byte-identical.
-  const reviewer = await readFile(join(dir, "reviewer.md"), "utf8");
+  const reviewer = await readFile(join(fx.agentDir, "reviewer.md"), "utf8");
   assert.equal(reviewer, TEMPLATE("reviewer", "openai-codex/gpt-6-astra"));
 });
 
 test("re-evaluation is idempotent and reports unchanged", async () => {
-  const dir = await fixture({ planner: "openai-codex/gpt-6-sol" });
-  const d = dispatcherFor(dir, 90, 10);
+  const fx = await fixture({ planner: "openai-codex/gpt-6-sol" });
+  const d = dispatcherFor(fx, 90, 10);
   const results = await d.evaluate({ force: true });
   assert.equal(results.find((r) => r.decision.agent === "planner")!.outcome, "unchanged");
 });
 
 test("a missing agent file is skipped, not created", async () => {
-  const dir = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
-  const d = dispatcherFor(dir, 10, 10);
+  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+  const d = dispatcherFor(fx, 10, 10);
   const results = await d.evaluate({ force: true });
   const impl = results.find((r) => r.decision.agent === "implementer")!;
   assert.equal(impl.outcome, "skipped (no file)");
 });
 
 test("an unreadable api holds every agent in place", async () => {
-  const dir = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
   const failing = createDispatcher(
-    { ...DEFAULT_CONFIG, agentDir: dir },
+    { ...DEFAULT_CONFIG, ...fx },
     {
       fetchImpl: (async () => {
         throw new Error("ECONNREFUSED");
@@ -299,12 +334,47 @@ test("an unreadable api holds every agent in place", async () => {
 });
 
 test("limit_reached on codex moves the reviewer onto claude", async () => {
-  const dir = await fixture({ reviewer: "openai-codex/gpt-6-astra" });
-  const d = dispatcherFor(dir, 10, 20, true);
+  const fx = await fixture({ reviewer: "openai-codex/gpt-6-astra" });
+  const d = dispatcherFor(fx, 10, 20, true);
   const results = await d.evaluate({ force: true });
   const reviewer = results.find((r) => r.decision.agent === "reviewer")!;
   assert.equal(reviewer.decision.model, "claude-bridge/claude-opus-5-5");
   assert.equal(reviewer.outcome, "written");
+});
+
+/**
+ * Regression guard for a fixture that leaked: these tests used to read the
+ * developer's real ~/.claude/.credentials.json, so the switch cases passed
+ * locally by accident and failed on CI, where no such file exists and the rail
+ * is correctly reported unreadable.
+ */
+test("a missing credential file holds every agent, even when a switch looks due", async () => {
+  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+  const d = createDispatcher(
+    { ...DEFAULT_CONFIG, ...fx, claudeCredsPath: join(fx.agentDir, "absent.json") },
+    { fetchImpl: stubFetch(95, 1) },
+  );
+  const results = await d.evaluate({ force: true });
+  const planner = results.find((r) => r.decision.agent === "planner")!;
+
+  assert.equal(planner.decision.model, "claude-bridge/claude-opus-5-5");
+  assert.equal(planner.outcome, "unchanged");
+  assert.match(planner.decision.why, /unreadable/);
+});
+
+test("an expired claude token counts as unreadable rather than switching", async () => {
+  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+  await writeFile(
+    fx.claudeCredsPath,
+    JSON.stringify({ claudeAiOauth: { accessToken: "stale", expiresAt: Date.now() - 1000 } }),
+    "utf8",
+  );
+  const d = dispatcherFor(fx, 95, 1);
+  const results = await d.evaluate({ force: true });
+  const planner = results.find((r) => r.decision.agent === "planner")!;
+
+  assert.equal(planner.decision.model, "claude-bridge/claude-opus-5-5");
+  assert.match(planner.decision.why, /unreadable/);
 });
 
 // ---------------------------------------------------------------- real config
