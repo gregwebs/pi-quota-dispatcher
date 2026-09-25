@@ -28,11 +28,16 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      # Deliberately no `npm ci`. The suite must run against a bare checkout:
-      # the package has zero runtime dependencies and the tests import nothing
-      # outside node: builtins plus a type-only import that Node erases. If
-      # that ever stops being true, this job should fail rather than paper
-      # over it with an install.
+      # The suite loads the extension's own `src/`, and `src/config.ts` reads
+      # pi's public config helpers (`getAgentDir`, `CONFIG_DIR_NAME`) at run
+      # time — the pattern pi's docs and shipped examples use instead of
+      # hardcoding `.pi` or `~/.pi/agent`. Those resolve from the dev
+      # dependency, so this job installs. The property the old no-install
+      # version of this job was protecting still holds and is guarded in the
+      # `checks` job: the published package has no runtime dependencies of its
+      # own, only an optional peer the host provides.
+      - run: npm ci
+
       - name: Run tests
         run: npm test
 
@@ -78,3 +83,12 @@ jobs:
             }
             console.log("packaged files:", [...shipped].sort().join(", "));
           '
+
+      # Guards the published package's runtime dependency list: nothing may
+      # creep into `dependencies` or `optionalDependencies`, and every declared
+      # peer must be optional in `peerDependenciesMeta` (pi is the peer the
+      # host provides). The detector is a committed script, not a string buried
+      # in this file, so it is reviewable and covered by
+      # `test/runtime-deps.test.ts`.
+      - name: Verify zero runtime dependencies
+        run: node scripts/check-runtime-deps.js

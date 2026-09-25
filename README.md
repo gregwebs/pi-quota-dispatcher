@@ -17,6 +17,12 @@ deepseek: ok — metered
 planner -> claude-bridge/claude-opus-5-5  [unchanged]  (claude ok (session 0%, weekly 27%))
 reviewer -> openai-codex/gpt-6-astra      [unchanged]  (codex ok (session 0%, weekly 64%))
 implementer -> deepseek/deepseek-flash    [unchanged]  (deepseek ok (metered))
+
+config: built-in < global ~/.pi/agent/quota-dispatch.json (present) < project .pi/quota-dispatch.json (absent)
+  sessionSwitchAt = 75  [built-in]
+  weeklySwitchAt = 80  [global]
+  routes.reviewer.primary.model = claude-bridge/claude-opus-5-5  [global]
+  ...
 ```
 
 ## Why
@@ -54,19 +60,48 @@ Then `/reload`, and run `/quota-dispatch` to confirm it registered.
 The two reporting forms are read-only by construction — `report()` has no way to
 be asked to write, so "show me the state" cannot rewrite your agents.
 
+Every form also prints where each configured value came from, so "why is
+reviewer on gpt-6-astra?" is answerable without opening three files.
+
 ## Configuration
 
-Everything lives in `DEFAULT_CONFIG` at the top of `src/index.ts`.
+Configuration lives in JSON files you own, not in the installed package — so
+`pi install`/update cannot silently revert your routes:
 
-```ts
-routes: {
-  reviewer: {
-    primary:   { model: "openai-codex/gpt-6-astra",    rail: "codex" },
-    alternate: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
-  },
-  // ...
+| Layer | Path |
+|---|---|
+| built-in defaults | `defaultConfig()` in `src/config.ts` |
+| **global** | `<agent dir>/quota-dispatch.json`, normally `~/.pi/agent/quota-dispatch.json` |
+| **project** | `.pi/quota-dispatch.json` (the project Pi config directory) |
+
+The agent dir comes from `getAgentDir()`, so `PI_CODING_AGENT_DIR` and a
+rebranded distribution's config directory are honoured; the project path is
+built from pi's `CONFIG_DIR_NAME` rather than a hardcoded `.pi`.
+
+**Precedence: built-in < global < project**, deep-merged per route. A file only
+has to state what it changes:
+
+```json
+{
+  "weeklySwitchAt": 80,
+  "routes": {
+    "reviewer": {
+      "primary": { "model": "claude-bridge/claude-opus-5-5", "rail": "claude" }
+    }
+  }
 }
 ```
+
+That global file moves `weeklySwitchAt` and reviewer's primary, and leaves the
+other two routes and every other scalar at their built-in values. A project file
+with `{"routes": {"implementer": null}}` drops the implementer route, so a
+project that only uses two agents can say so; `{"alternate": null}` drops a
+single candidate.
+
+Merging is field-wise, so naming only a `model` keeps the `rail` beneath it.
+That is usually not what you want when you move an agent to a different
+provider — state both, as above — and the loader warns when a model's prefix
+reads like a rail other than the one declared.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -77,8 +112,49 @@ routes: {
 | `ttlMs` | `180000` | How long a quota reading is reused |
 | `pollMs` | `300000` | How often to re-evaluate while a session is open |
 
-`agentDir`, `claudeCredsPath` and `piAuthPath` are overridable mainly so the
-test suite can point at a fixture directory.
+`claudeCredsPath` is settable too, defaulting to
+`~/.claude/.credentials.json`; choosing a different Claude profile is a real
+use. `agentDir` and `piAuthPath` (defaults `<agent dir>/agents` and
+`<agent dir>/auth.json`) are deliberately **not** settable from JSON: they are
+paths pi itself owns, derived from `getAgentDir()`, so a file pointing them
+elsewhere would only make the dispatcher edit files nothing reads. Relocate
+them with `PI_CODING_AGENT_DIR`, and note that naming either in a config file
+warns. Both remain fields on the config object for programmatic use and tests.
+
+### When something is wrong with it
+
+Bad configuration never stops the dispatcher from starting:
+
+- **Missing file** — not an error. It is simply not a layer.
+- **Unparseable file** — logged to `console.error` and skipped whole, and the
+  layers below it still apply. A half-applied config is harder to reason about
+  than the defaults.
+- **Unknown key, malformed `model` (no `/`), unknown `rail`, a route left
+  without a `primary`, an out-of-range number, an invalid agent name, a value
+  of the wrong type** — logged, and the previous layer's value stands for that
+  key alone. A typo in a project file cannot undo a correct global one. An
+  invalid value never removes a valid one; dropping a route stays explicit
+  (route-level `null`).
+
+Agent names are filenames (`<agent dir>/<name>.md`), so they must be lowercase
+letters, digits and dashes, starting with a letter (`planner`,
+`code-reviewer`); anything else is ignored. `ttlMs` and `pollMs` must be whole
+milliseconds in Node's timer range (1–2147483647); the switching thresholds and
+`margin` are used-percentages in 0–100. A numeric warning always states the
+range it enforced.
+
+Every warning names the file it came from, and the `/quota-dispatch` report ends
+with the same provenance listing, so a config that is not doing what you meant
+says so instead of quietly routing you somewhere else.
+
+Config is read once when the extension loads; `/reload` after editing.
+
+### Out of scope
+
+Config can only route among the rails the extension already knows how to read
+(`claude`, `codex`, `deepseek`). Adding a genuinely new quota rail — its
+endpoint and response parser — still requires code, so there is no `rails` block
+to configure.
 
 ## The policy
 
@@ -165,7 +241,7 @@ they change or move.
 | Rail | Credential | Endpoint |
 |---|---|---|
 | Claude | `~/.claude/.credentials.json` → `claudeAiOauth.accessToken` | `api.anthropic.com/api/oauth/usage` |
-| Codex | `~/.pi/agent/auth.json` → `openai-codex.access` + `accountId` | `chatgpt.com/backend-api/wham/usage` |
+| Codex | `<agent dir>/auth.json` (normally `~/.pi/agent/auth.json`) → `openai-codex.access` + `accountId` | `chatgpt.com/backend-api/wham/usage` |
 
 Credentials are read, never logged, and never transmitted anywhere except to the
 provider that issued them.
@@ -178,7 +254,9 @@ provider that issued them.
   you stop using Claude Code the Claude side goes dormant — but nothing gets
   moved onto the other plan to compensate, so the failure is quiet.
 - **Global state.** The agent files are shared across all sessions and projects,
-  exactly as they are when you edit them by hand.
+  exactly as they are when you edit them by hand. A project override therefore
+  changes the model written into a file that every project reads; the project
+  layer decides *what* gets written, not *where*.
 - **A running agent keeps its model.** A switch applies to the next spawn, not to
   work already in flight.
 - **Same-rail congestion is possible.** If both plans are tight, agents can end
@@ -197,11 +275,13 @@ provider that issued them.
 
 ## Development
 
-Zero runtime dependencies. Tests use the Node built-in runner:
+Zero runtime dependencies. Tests use the Node built-in runner, but `npm test`
+needs the dev dependency installed, because `src/config.ts` reads pi's config
+helpers at run time:
 
 ```bash
-npm test        # 44 tests, no install required
-npm install && npm run typecheck
+npm ci && npm test    # install the dev dependency, then run the suite
+npm run typecheck
 ```
 
 ## License

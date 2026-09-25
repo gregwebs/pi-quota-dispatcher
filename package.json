@@ -29,7 +29,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/dispatch.test.ts",
+    "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
