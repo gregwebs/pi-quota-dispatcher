@@ -27,23 +27,45 @@
  */
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  DEFAULT_CONFIG,
+  type DispatcherConfig,
+  type LoadedConfig,
+  type Rail,
+  type Route,
+  describeConfig,
+  loadConfig,
+} from "./config.ts";
+
+// Config is a separate module because it is read from disk at run time; it is
+// re-exported here so `src/index.ts` remains the one import path for the
+// extension's whole surface.
+export {
+  CONFIG_FILE_NAME,
+  DEFAULT_CONFIG,
+  defaultConfig,
+  describeConfig,
+  globalConfigPath,
+  loadConfig,
+  mergeConfig,
+  projectConfigPath,
+} from "./config.ts";
+export type {
+  Candidate,
+  ConfigFile,
+  ConfigSource,
+  DispatcherConfig,
+  LoadConfigDeps,
+  LoadedConfig,
+  MergeLayer,
+  MergeResult,
+  Rail,
+  Route,
+} from "./config.ts";
 
 // ---------------------------------------------------------------- types
-
-export type Rail = "claude" | "codex" | "deepseek";
-
-export interface Candidate {
-  model: string;
-  rail: Rail;
-}
-
-export interface Route {
-  primary: Candidate;
-  alternate?: Candidate;
-}
 
 /**
  * The two budgets a rail imposes, which move on very different clocks.
@@ -84,34 +106,6 @@ export interface RailState {
   note?: string;
 }
 
-export interface DispatcherConfig {
-  agentDir: string;
-  claudeCredsPath: string;
-  piAuthPath: string;
-  /** Quota readings are cached this long. 5h/7d windows move slowly. */
-  ttlMs: number;
-  /** Re-evaluate on this cadence while a session is open. */
-  pollMs: number;
-  /**
-   * Consider the alternate once the primary's *session* budget reaches this.
-   * This is the acute cap: the one that blocks you mid-task, and the only one
-   * that recovers within hours, so a switch made on it is reversible.
-   */
-  sessionSwitchAt: number;
-  /**
-   * ...or once its *weekly* budget reaches this.
-   *
-   * Deliberately higher than `sessionSwitchAt`. The weekly window does not
-   * recover for days, so a switch made on it is close to one-way and should be
-   * a last resort rather than the routine signal.
-   */
-  weeklySwitchAt: number;
-  /** ...and only when the alternate is at least this many points healthier. */
-  margin: number;
-  /** Agents absent from this table are never touched. */
-  routes: Record<string, Route>;
-}
-
 export type Outcome =
   | "written"
   | "would-write"
@@ -134,33 +128,6 @@ export type Outcome =
 export type Decision =
   | { agent: string; file: string; kind: "assign"; model: string; why: string }
   | { agent: string; file: string; kind: "hold"; why: string };
-
-export const DEFAULT_CONFIG: DispatcherConfig = {
-  agentDir: join(homedir(), ".pi", "agent", "agents"),
-  claudeCredsPath: join(homedir(), ".claude", ".credentials.json"),
-  piAuthPath: join(homedir(), ".pi", "agent", "auth.json"),
-  ttlMs: 3 * 60 * 1000,
-  pollMs: 5 * 60 * 1000,
-  sessionSwitchAt: 75,
-  weeklySwitchAt: 90,
-  margin: 10,
-  routes: {
-    planner: {
-      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
-      alternate: { model: "openai-codex/gpt-6-sol", rail: "codex" },
-    },
-    reviewer: {
-      primary: { model: "openai-codex/gpt-6-astra", rail: "codex" },
-      alternate: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
-    },
-    implementer: {
-      // DeepSeek is metered but cheap and effectively unbounded, so it is the
-      // resting place; the codex model is the pressure valve, not the default.
-      primary: { model: "deepseek/deepseek-flash", rail: "deepseek" },
-      alternate: { model: "openai-codex/gpt-6-luna", rail: "codex" },
-    },
-  },
-};
 
 // ---------------------------------------------------------------- parsing
 
@@ -287,6 +254,21 @@ function budgetSummary(state: RailState): string {
 }
 
 /**
+ * Whether `file` (already formed by `join`) lies inside `dir`.
+ *
+ * A plain `file.startsWith(dir)` is not enough: an `agentDir` sibling such as
+ * `<agentDir>-evil` shares the prefix without being inside. Comparing resolved
+ * paths and requiring the separator is what makes `agentDir + "/x"` fail to
+ * match it. `dir` is resolved too, so a relative or trailing-slash `agentDir`
+ * compares the same way.
+ */
+function isInside(dir: string, file: string): boolean {
+  const root = resolve(dir);
+  const target = resolve(file);
+  return target === root || target.startsWith(root + sep);
+}
+
+/**
  * Pick the model for one agent from current rail headroom.
  *
  * The session and weekly budgets are weighed *separately*, session first. They
@@ -307,6 +289,13 @@ function budgetSummary(state: RailState): string {
  * budget, because a rail that is tight there would block the work just as
  * surely. Without that, one agent can be moved onto the very rail another was
  * moved off in the same pass.
+ *
+ * Containment is checked here even though the config seam validates names:
+ * `decide` is handed a `DispatcherConfig` that need not have come through
+ * `mergeConfig`, so the name is not trusted. This path check is the guarantee
+ * that a write lands inside `agentDir`; the regex upstream only makes a name
+ * conventional. A name that resolves outside holds rather than assigning,
+ * because a hold writes nothing and the file stays as the user left it.
  */
 export function decide(
   agent: string,
@@ -315,6 +304,14 @@ export function decide(
   cfg: DispatcherConfig,
 ): Decision {
   const file = join(cfg.agentDir, `${agent}.md`);
+  if (!isInside(cfg.agentDir, file)) {
+    return {
+      agent,
+      file,
+      kind: "hold",
+      why: `"${agent}" resolves outside the agents directory (${file}) — holding`,
+    };
+  }
   const primary = rails.get(route.primary.rail);
   const alt = route.alternate ? rails.get(route.alternate.rail) : undefined;
 
@@ -639,28 +636,48 @@ export function createDispatcher(
 // ---------------------------------------------------------------- extension
 
 export default function (pi: ExtensionAPI) {
-  const dispatcher = createDispatcher();
+  /**
+   * Config is resolved once per extension load, and the command reports which
+   * layer every value came from. `/reload` is what picks up an edit, which is
+   * the same deal as any other pi config file and keeps the polling cadence
+   * from changing underfoot mid-session.
+   */
+  let boot: Promise<{ loaded: LoadedConfig; dispatcher: Dispatcher }> | undefined;
+  const bootOnce = () =>
+    (boot ??= loadConfig().then((loaded) => ({
+      loaded,
+      dispatcher: createDispatcher(loaded.config),
+    })));
+
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let stopped = false;
 
   pi.registerCommand("quota-dispatch", {
     description: "Show subscription headroom and which model each agent is dispatched to",
     handler: async (args, ctx) => {
       const a = (args ?? "").trim();
+      const { loaded, dispatcher } = await bootOnce();
 
       // Only this form writes. The plain and `refresh` forms are read-only.
+      let lines: string[];
       if (a.includes("apply")) {
         const rows = await dispatcher.evaluate({ force: true });
-        const lines = [
+        lines = [
           "[applied]",
           ...rows.map(
             (r) => `${describeDecision(r.decision)}  [${r.outcome}]  (${r.decision.why})`,
           ),
         ];
-        ctx.ui.notify(lines.join("\n"), "info");
-        return;
+      } else {
+        const force = a.includes("refresh");
+        lines = await dispatcher.report({ force });
       }
 
-      const force = a.includes("refresh");
-      ctx.ui.notify((await dispatcher.report({ force })).join("\n"), "info");
+      // Every form ends with the provenance block, so "where did this value
+      // come from?" is answerable from whichever one you ran. Both branches
+      // build the body first and share this tail rather than duplicating it.
+      lines.push("", ...describeConfig(loaded));
+      ctx.ui.notify(lines.join("\n"), "info");
     },
   });
 
@@ -668,17 +685,23 @@ export default function (pi: ExtensionAPI) {
   // frontmatter. Note that neither quota request sets a timeout yet, so a
   // stalled endpoint can delay session start — see the README limitations.
   pi.on("session_start", async () => {
+    const { dispatcher } = await bootOnce();
     await dispatcher.evaluate().catch(() => {});
   });
 
   // Periodic re-evaluation so workflow and mention spawns, which bypass the
-  // Agent tool, still see current frontmatter.
-  const timer = setInterval(() => {
-    void dispatcher.evaluate().catch(() => {});
-  }, DEFAULT_CONFIG.pollMs);
-  timer.unref?.();
+  // Agent tool, still see current frontmatter. Starts only once the config has
+  // been read, because the cadence is one of the things it configures.
+  void bootOnce().then(({ loaded, dispatcher }) => {
+    if (stopped) return;
+    timer = setInterval(() => {
+      void dispatcher.evaluate().catch(() => {});
+    }, loaded.config.pollMs);
+    timer.unref?.();
+  });
 
   pi.on("session_shutdown", async () => {
-    clearInterval(timer);
+    stopped = true;
+    if (timer) clearInterval(timer);
   });
 }

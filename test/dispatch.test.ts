@@ -305,6 +305,58 @@ test("a metered primary is never tight, so it is left where it is", () => {
   assert.equal(assignedModel(d), "deepseek/deepseek-flash");
 });
 
+// ---------------------------------------------------------------- containment
+
+// The guarantee: a write never lands outside `cfg.agentDir`. The config seam
+// validates names, but `decide` is handed a `DispatcherConfig` that need not
+// have come through `mergeConfig`, so it re-checks the resolved path and holds
+// rather than assigning when it escapes.
+
+test("decide holds rather than assigning when the agent resolves outside agentDir", () => {
+  const confined: DispatcherConfig = { ...DEFAULT_CONFIG, agentDir: "/tmp/agents" };
+  const healthy = rails({ session: 0, weekly: 0 }, { session: 0, weekly: 0 });
+
+  const escaped = decide("../outside", DEFAULT_CONFIG.routes.planner, healthy, confined);
+  assert.equal(escaped.kind, "hold");
+  assert.equal("model" in escaped, false, "a hold must carry no model to write");
+  assert.equal(escaped.file, "/tmp/outside.md");
+  assert.ok(escaped.why.includes("/tmp/outside.md"), escaped.why);
+});
+
+test("decide holds for a sibling directory that merely shares agentDir's prefix", () => {
+  // `/tmp/agents-evil` starts with the string `/tmp/agents`, so a naive
+  // `file.startsWith(agentDir)` would accept it. Only a resolved,
+  // separator-aware check rejects it.
+  const confined: DispatcherConfig = { ...DEFAULT_CONFIG, agentDir: "/tmp/agents" };
+  const healthy = rails({ session: 0, weekly: 0 }, { session: 0, weekly: 0 });
+
+  const d = decide("../agents-evil/agent", DEFAULT_CONFIG.routes.planner, healthy, confined);
+  assert.equal(d.kind, "hold");
+  assert.equal("model" in d, false, "a hold must carry no model to write");
+  assert.equal(d.file, "/tmp/agents-evil/agent.md");
+  assert.ok(d.why.includes("/tmp/agents-evil/agent.md"), d.why);
+});
+
+test("decide assigns normally for a well-behaved name", () => {
+  const confined: DispatcherConfig = { ...DEFAULT_CONFIG, agentDir: "/tmp/agents" };
+  const healthy = rails({ session: 0, weekly: 0 }, { session: 0, weekly: 0 });
+
+  const d = decide("planner", DEFAULT_CONFIG.routes.planner, healthy, confined);
+  assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
+  assert.equal(d.file, "/tmp/agents/planner.md");
+});
+
+test("decide treats a name that normalizes back inside agentDir as contained", () => {
+  // The guarantee is containment, not filename shape: `sub/../planner` joins to
+  // `/tmp/agents/planner.md`, which is inside, so it is an ordinary assign.
+  const confined: DispatcherConfig = { ...DEFAULT_CONFIG, agentDir: "/tmp/agents" };
+  const healthy = rails({ session: 0, weekly: 0 }, { session: 0, weekly: 0 });
+
+  const d = decide("sub/../planner", DEFAULT_CONFIG.routes.planner, healthy, confined);
+  assert.equal(d.kind, "assign");
+  assert.equal(d.file, "/tmp/agents/planner.md");
+});
+
 // ------------------------------------------------- destination eligibility
 
 // The run that exposed this moved the planner *onto* codex on the session rule
