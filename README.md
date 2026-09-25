@@ -47,9 +47,12 @@ Then `/reload`, and run `/quota-dispatch` to confirm it registered.
 
 | Command | Effect |
 |---|---|
-| `/quota-dispatch` | Show rail pressure and the current decision per agent |
-| `/quota-dispatch refresh` | Force a re-fetch, then show |
-| `/quota-dispatch dry` | Show what it *would* write, change nothing |
+| `/quota-dispatch` | Show rail pressure and the current decision per agent. Read-only. |
+| `/quota-dispatch refresh` | Force a re-fetch, then show. Read-only. |
+| `/quota-dispatch apply` | Write the decisions out now. The only form that touches a file. |
+
+The two reporting forms are read-only by construction — `report()` has no way to
+be asked to write, so "show me the state" cannot rewrite your agents.
 
 ## Configuration
 
@@ -85,8 +88,11 @@ current rail pressure, so re-evaluating is idempotent and cannot drift:
    `alt.pressure < primary.pressure - margin`.
 2. Otherwise stay on the primary.
 3. **Unreadable quota is not evidence of pressure.** If either rail cannot be
-   read, hold the primary rather than flapping onto the other plan on the
-   strength of a failed HTTP call.
+   read, the dispatcher makes no assignment at all: `Decision` is either an
+   assign or an explicit hold, and a hold carries no model, so there is nothing
+   to write. Every agent file is left exactly as you left it. A failed HTTP call
+   must never move work onto the other plan — least of all back onto the rail
+   that was under pressure.
 
 Rails are per-provider: `claude-bridge/*` and `anthropic/*` consume the Claude
 subscription, `openai-codex/*` consumes the Codex subscription, and `deepseek/*`
@@ -129,15 +135,23 @@ provider that issued them.
 
 - **The Claude token expires** (typically within hours). Claude Code refreshes it
   on use; this extension only reads it. Once it lapses, the Claude rail reports
-  unavailable and the dispatcher *holds* rather than moving work. Safe, but if
-  you stop using Claude Code the Claude side goes dormant.
+  unavailable and the dispatcher holds, leaving every agent file untouched. If
+  you stop using Claude Code the Claude side goes dormant — but nothing gets
+  moved onto the other plan to compensate, so the failure is quiet.
 - **Global state.** The agent files are shared across all sessions and projects,
   exactly as they are when you edit them by hand.
 - **A running agent keeps its model.** A switch applies to the next spawn, not to
   work already in flight.
 - **Same-rail congestion is possible.** If both plans are tight, agents can end
-  up resting on the same rail. The margin rule stops rapid flapping but does not
-  balance load across agents.
+  up resting on the same rail; the policy does not balance load across agents.
+- **The margin is not hysteresis.** Each evaluation compares the two rails
+  against each other only, with no memory of what an agent is currently assigned
+  to. So when readings hover around the threshold — primary at 90, alternate
+  oscillating either side of 80 — an agent can alternate between rails on
+  successive polls. Making the policy stateful is a known open improvement.
+- **Quota requests have no timeout yet.** Neither fetch sets an abort signal, so
+  a stalled endpoint delays the evaluation that `session_start` awaits. The
+  practical effect is a slow session start, not lost data.
 - **Cosmetic duplication.** When the dispatcher selects a model that also appears
   in your commented notes, you get `model: X` alongside `# model: X`. Harmless,
   and deduping would mean deleting your notes.
@@ -147,7 +161,7 @@ provider that issued them.
 Zero runtime dependencies. Tests use the Node built-in runner:
 
 ```bash
-npm test        # 23 tests, no install required
+npm test        # 28 tests, no install required
 npm install && npm run typecheck
 ```
 

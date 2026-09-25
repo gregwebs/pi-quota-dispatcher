@@ -79,15 +79,24 @@ export type Outcome =
   | "written"
   | "would-write"
   | "unchanged"
+  | "held"
   | "skipped (no file)"
   | "skipped (no frontmatter)";
 
-export interface Decision {
-  agent: string;
-  file: string;
-  model: string;
-  why: string;
-}
+/**
+ * Either an instruction to assign a model, or an explicit refusal to have an
+ * opinion.
+ *
+ * This used to be a bare `model` string, with "hold" represented by naming the
+ * primary. That made "I have no reading, leave things alone" indistinguishable
+ * from "this agent belongs on the primary", so an unreadable quota rewrote any
+ * agent a previous evaluation had moved onto the alternate — dragging work back
+ * onto the very rail that was under pressure. A hold has no model; the type now
+ * says so, and callers cannot read one out by accident.
+ */
+export type Decision =
+  | { agent: string; file: string; kind: "assign"; model: string; why: string }
+  | { agent: string; file: string; kind: "hold"; why: string };
 
 export const DEFAULT_CONFIG: DispatcherConfig = {
   agentDir: join(homedir(), ".pi", "agent", "agents"),
@@ -159,8 +168,9 @@ export function parseCodexUsage(data: any): {
  * Pick the model for one agent from current rail pressure.
  *
  * Deliberate rule: unreadable quota is *not* evidence of pressure. When a rail
- * cannot be read we hold the primary rather than flapping onto the other plan
- * on the strength of a failed HTTP call.
+ * cannot be read we make no assignment at all, leaving the file exactly as the
+ * user left it. Substituting the primary here would move agents back onto a
+ * constrained rail on the strength of a failed HTTP call.
  */
 export function decide(
   agent: string,
@@ -173,13 +183,19 @@ export function decide(
   const alt = route.alternate ? rails.get(route.alternate.rail) : undefined;
 
   if (!route.alternate || !alt) {
-    return { agent, file, model: route.primary.model, why: "no alternate configured" };
+    return {
+      agent,
+      file,
+      kind: "assign",
+      model: route.primary.model,
+      why: "no alternate configured",
+    };
   }
   if (!primary?.ok) {
     return {
       agent,
       file,
-      model: route.primary.model,
+      kind: "hold",
       why: `${route.primary.rail} unreadable (${primary?.note ?? "unknown"}) — holding`,
     };
   }
@@ -187,7 +203,7 @@ export function decide(
     return {
       agent,
       file,
-      model: route.primary.model,
+      kind: "hold",
       why: `${route.alternate.rail} unreadable (${alt.note}) — holding`,
     };
   }
@@ -195,6 +211,7 @@ export function decide(
     return {
       agent,
       file,
+      kind: "assign",
       model: route.alternate.model,
       why: `${primary.rail} ${primary.pressure.toFixed(0)}% >= ${cfg.switchAt}%, ${alt.rail} ${alt.pressure.toFixed(0)}%`,
     };
@@ -202,6 +219,7 @@ export function decide(
   return {
     agent,
     file,
+    kind: "assign",
     model: route.primary.model,
     why: `${primary.rail} ${primary.pressure.toFixed(0)}% ok`,
   };
@@ -249,6 +267,13 @@ export async function applyDecision(
   return "written";
 }
 
+/** One-line rendering of a decision, for reports and command output. */
+export function describeDecision(decision: Decision): string {
+  return decision.kind === "hold"
+    ? `${decision.agent} -> (left as is)`
+    : `${decision.agent} -> ${decision.model}`;
+}
+
 // ---------------------------------------------------------------- rails
 
 function unavailable(rail: Rail, note: string): RailState {
@@ -288,7 +313,7 @@ export interface Dispatcher {
   railState(rail: Rail, force?: boolean): Promise<RailState>;
   allRails(force?: boolean): Promise<Map<Rail, RailState>>;
   evaluate(opts?: { force?: boolean; dry?: boolean }): Promise<Array<{ decision: Decision; outcome: Outcome }>>;
-  report(opts?: { force?: boolean; dry?: boolean }): Promise<string[]>;
+  report(opts?: { force?: boolean }): Promise<string[]>;
 }
 
 export function createDispatcher(
@@ -377,22 +402,48 @@ export function createDispatcher(
     return new Map(states.map((s) => [s.rail, s]));
   }
 
-  async function evaluate(
-    opts: { force?: boolean; dry?: boolean } = {},
+  async function decideAll(
+    rails: Map<Rail, RailState>,
+    dry: boolean,
   ): Promise<Array<{ decision: Decision; outcome: Outcome }>> {
-    const rails = await allRails(opts.force);
     const decisions = Object.entries(cfg.routes).map(([agent, route]) =>
       decide(agent, route, rails, cfg),
     );
     return Promise.all(
       decisions.map(async (decision) => ({
         decision,
-        outcome: await applyDecision(decision.file, decision.model, opts.dry ?? false),
+        // A hold carries no model, so there is nothing to write and the file
+        // is left exactly as the user left it.
+        outcome:
+          decision.kind === "hold"
+            ? ("held" as const)
+            : await applyDecision(decision.file, decision.model, dry),
       })),
     );
   }
 
-  async function report(opts: { force?: boolean; dry?: boolean } = {}): Promise<string[]> {
+  async function evaluate(
+    opts: { force?: boolean; dry?: boolean } = {},
+  ): Promise<Array<{ decision: Decision; outcome: Outcome }>> {
+    return decideAll(await allRails(opts.force), opts.dry ?? false);
+  }
+
+  /**
+   * Read-only by construction: there is deliberately no way to ask `report` to
+   * write.
+   *
+   * It previously forwarded a `dry` flag straight into `evaluate`, which meant
+   * the plain `/quota-dispatch` "show me the state" command silently rewrote
+   * agent files whenever a switch happened to be due. A function called
+   * `report` should not be able to mutate, so the option is gone rather than
+   * defaulted correctly — a default is something a caller can override by
+   * accident.
+   *
+   * Rails are also fetched once and shared with the decisions, so the numbers
+   * on screen are the numbers the decisions were made from, and `refresh` costs
+   * two HTTP requests rather than four.
+   */
+  async function report(opts: { force?: boolean } = {}): Promise<string[]> {
     const rails = await allRails(opts.force);
     const lines: string[] = [];
     for (const rail of ["claude", "codex", "deepseek"] as Rail[]) {
@@ -402,8 +453,8 @@ export function createDispatcher(
       else lines.push(`${rail}: ${s.windows.map((w) => `${w.label} ${w.used.toFixed(0)}%`).join(", ")}`);
     }
     lines.push("");
-    for (const { decision, outcome } of await evaluate(opts)) {
-      lines.push(`${decision.agent} -> ${decision.model}  [${outcome}]  (${decision.why})`);
+    for (const { decision, outcome } of await decideAll(rails, true)) {
+      lines.push(`${describeDecision(decision)}  [${outcome}]  (${decision.why})`);
     }
     return lines;
   }
@@ -420,14 +471,28 @@ export default function (pi: ExtensionAPI) {
     description: "Show subscription headroom and which model each agent is dispatched to",
     handler: async (args, ctx) => {
       const a = (args ?? "").trim();
-      const dry = a.includes("dry");
-      const force = a.includes("refresh") || dry;
-      const lines = await dispatcher.report({ force, dry });
-      ctx.ui.notify(`${dry ? "[dry run]\n" : ""}${lines.join("\n")}`, "info");
+
+      // Only this form writes. The plain and `refresh` forms are read-only.
+      if (a.includes("apply")) {
+        const rows = await dispatcher.evaluate({ force: true });
+        const lines = [
+          "[applied]",
+          ...rows.map(
+            (r) => `${describeDecision(r.decision)}  [${r.outcome}]  (${r.decision.why})`,
+          ),
+        ];
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
+
+      const force = a.includes("refresh");
+      ctx.ui.notify((await dispatcher.report({ force })).join("\n"), "info");
     },
   });
 
-  // Fire-and-forget: a slow quota endpoint must not delay session start.
+  // Awaited on purpose, so the first spawn of the session already sees current
+  // frontmatter. Note that neither quota request sets a timeout yet, so a
+  // stalled endpoint can delay session start — see the README limitations.
   pi.on("session_start", async () => {
     await dispatcher.evaluate().catch(() => {});
   });

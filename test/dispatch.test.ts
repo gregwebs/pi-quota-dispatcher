@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
+  type Decision,
   type DispatcherConfig,
   type Rail,
   type RailState,
@@ -131,53 +132,67 @@ function rails(claude: Partial<RailState>, codex: Partial<RailState>): Map<Rail,
 
 const cfg: DispatcherConfig = { ...DEFAULT_CONFIG, agentDir: "/agents" };
 
-test("decide holds the primary while both rails have headroom", () => {
+/**
+ * Narrow an assign-decision, failing loudly if the dispatcher held instead.
+ * A hold deliberately carries no model, so this is the only honest way to read
+ * the assigned one.
+ */
+function assignedModel(d: Decision): string {
+  assert.equal(d.kind, "assign", `expected an assignment, got a hold: ${d.why}`);
+  return d.kind === "assign" ? d.model : "";
+}
+
+test("decide assigns the primary while both rails have headroom", () => {
   const d = decide("planner", DEFAULT_CONFIG.routes.planner, rails({ pressure: 27 }, { pressure: 64 }), cfg);
-  assert.equal(d.model, "claude-bridge/claude-opus-5-5");
+  assert.equal(d.kind, "assign");
+  assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
 });
 
 test("decide moves planner off claude when claude is tight", () => {
   const d = decide("planner", DEFAULT_CONFIG.routes.planner, rails({ pressure: 90 }, { pressure: 10 }), cfg);
-  assert.equal(d.model, "openai-codex/gpt-6-sol");
+  assert.equal(assignedModel(d), "openai-codex/gpt-6-sol");
 });
 
 test("decide moves reviewer off codex when codex is tight", () => {
   const d = decide("reviewer", DEFAULT_CONFIG.routes.reviewer, rails({ pressure: 10 }, { pressure: 90 }), cfg);
-  assert.equal(d.model, "claude-bridge/claude-opus-5-5");
+  assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
 });
 
 test("decide does not switch when the margin is not met", () => {
   // codex 85 is >= switchAt but only 5 points below claude's 90, so < margin.
   const reviewer = decide("reviewer", DEFAULT_CONFIG.routes.reviewer, rails({ pressure: 90 }, { pressure: 85 }), cfg);
-  assert.equal(reviewer.model, "openai-codex/gpt-6-astra");
+  assert.equal(assignedModel(reviewer), "openai-codex/gpt-6-astra");
   const planner = decide("planner", DEFAULT_CONFIG.routes.planner, rails({ pressure: 90 }, { pressure: 85 }), cfg);
-  assert.equal(planner.model, "claude-bridge/claude-opus-5-5");
+  assert.equal(assignedModel(planner), "claude-bridge/claude-opus-5-5");
 });
 
 test("decide switches on limit_reached pressure of 100", () => {
   const d = decide("reviewer", DEFAULT_CONFIG.routes.reviewer, rails({ pressure: 10 }, { pressure: 100 }), cfg);
-  assert.equal(d.model, "claude-bridge/claude-opus-5-5");
+  assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
 });
 
-test("decide holds rather than flapping when the primary rail is unreadable", () => {
+// A hold is not "assign the primary". These decisions carry no model at all,
+// because naming one is what let an unreadable quota drag agents back onto the
+// rail that was under pressure.
+test("decide makes no assignment when the primary rail is unreadable", () => {
   const d = decide(
     "planner",
     DEFAULT_CONFIG.routes.planner,
     rails({ ok: false, pressure: Infinity, note: "HTTP 401" }, { pressure: 1 }),
     cfg,
   );
-  assert.equal(d.model, "claude-bridge/claude-opus-5-5");
+  assert.equal(d.kind, "hold");
   assert.match(d.why, /unreadable/);
 });
 
-test("decide holds when the alternate rail is unreadable", () => {
+test("decide makes no assignment when the alternate rail is unreadable", () => {
   const d = decide(
     "planner",
     DEFAULT_CONFIG.routes.planner,
     rails({ pressure: 99 }, { ok: false, pressure: Infinity, note: "HTTP 500" }),
     cfg,
   );
-  assert.equal(d.model, "claude-bridge/claude-opus-5-5");
+  assert.equal(d.kind, "hold");
 });
 
 // ---------------------------------------------------------------- dispatcher
@@ -329,7 +344,8 @@ test("an unreadable api holds every agent in place", async () => {
     },
   );
   const lines = await failing.report({ force: true });
-  assert.ok(lines.some((l) => l.includes("planner -> claude-bridge/claude-opus-5-5")));
+  assert.ok(lines.some((l) => l.includes("planner -> (left as is)")));
+  assert.ok(lines.some((l) => l.includes("[held]")));
   assert.ok(lines.some((l) => l.includes("unreadable")));
 });
 
@@ -338,7 +354,7 @@ test("limit_reached on codex moves the reviewer onto claude", async () => {
   const d = dispatcherFor(fx, 10, 20, true);
   const results = await d.evaluate({ force: true });
   const reviewer = results.find((r) => r.decision.agent === "reviewer")!;
-  assert.equal(reviewer.decision.model, "claude-bridge/claude-opus-5-5");
+  assert.equal(assignedModel(reviewer.decision), "claude-bridge/claude-opus-5-5");
   assert.equal(reviewer.outcome, "written");
 });
 
@@ -357,9 +373,69 @@ test("a missing credential file holds every agent, even when a switch looks due"
   const results = await d.evaluate({ force: true });
   const planner = results.find((r) => r.decision.agent === "planner")!;
 
-  assert.equal(planner.decision.model, "claude-bridge/claude-opus-5-5");
-  assert.equal(planner.outcome, "unchanged");
+  assert.equal(planner.decision.kind, "hold");
+  assert.equal(planner.outcome, "held");
   assert.match(planner.decision.why, /unreadable/);
+});
+
+/**
+ * Regression: "hold" used to be spelled by naming the primary, so an
+ * unreadable quota rewrote any agent a previous evaluation had moved onto the
+ * alternate — dragging work back onto the rail that was under pressure.
+ */
+test("an unreadable quota leaves an agent on the alternate untouched", async () => {
+  const fx = await fixture({ planner: "openai-codex/gpt-6-sol" });
+  const d = createDispatcher(
+    { ...DEFAULT_CONFIG, ...fx, claudeCredsPath: join(fx.agentDir, "absent.json") },
+    { fetchImpl: stubFetch(95, 1) },
+  );
+
+  const path = join(fx.agentDir, "planner.md");
+  const before = await readFile(path, "utf8");
+  const results = await d.evaluate({ force: true });
+  const after = await readFile(path, "utf8");
+
+  assert.equal(results.find((r) => r.decision.agent === "planner")!.outcome, "held");
+  assert.equal(after, before, "a hold must not touch the file");
+  assert.match(after, /^model: "openai-codex\/gpt-6-sol"$/m);
+});
+
+/**
+ * Regression: `report` used to forward a `dry` flag into `evaluate`, so the
+ * plain `/quota-dispatch` "show me the state" command silently rewrote agent
+ * files whenever a switch happened to be due.
+ */
+test("report never writes, even when a switch is due", async () => {
+  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+  const d = dispatcherFor(fx, 90, 10); // claude tight: a switch to codex is due
+
+  const path = join(fx.agentDir, "planner.md");
+  const before = await readFile(path, "utf8");
+  const lines = await d.report({ force: true });
+  const after = await readFile(path, "utf8");
+
+  assert.equal(after, before, "report must be read-only");
+  // It still reports what a real evaluation would do.
+  assert.ok(lines.some((l) => l.includes("planner -> openai-codex/gpt-6-sol")));
+  assert.ok(lines.some((l) => l.includes("[would-write]")));
+});
+
+test("a forced report fetches each rail exactly once", async () => {
+  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+  let calls = 0;
+  const inner = stubFetch(10, 10) as unknown as (u: unknown) => Promise<unknown>;
+  const d = createDispatcher(
+    { ...DEFAULT_CONFIG, ...fx },
+    {
+      fetchImpl: (async (url: string | URL) => {
+        calls++;
+        return inner(url);
+      }) as unknown as typeof fetch,
+    },
+  );
+
+  await d.report({ force: true });
+  assert.equal(calls, 2, "the two live rails, once each");
 });
 
 test("an expired claude token counts as unreadable rather than switching", async () => {
@@ -373,7 +449,7 @@ test("an expired claude token counts as unreadable rather than switching", async
   const results = await d.evaluate({ force: true });
   const planner = results.find((r) => r.decision.agent === "planner")!;
 
-  assert.equal(planner.decision.model, "claude-bridge/claude-opus-5-5");
+  assert.equal(planner.decision.kind, "hold");
   assert.match(planner.decision.why, /unreadable/);
 });
 
