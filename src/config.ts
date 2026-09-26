@@ -3,7 +3,7 @@
  *
  * Three layers, later wins:
  *
- *   built-in  the shipped defaults in `defaultConfig()`
+ *   built-in  the shipped defaults in `defaultConfig()` (no agents at all)
  *   global    `<agentDir>/quota-dispatch.json`   (`~/.pi/agent/quota-dispatch.json`)
  *   project   `<cwd>/<CONFIG_DIR_NAME>/quota-dispatch.json`   (`.pi/quota-dispatch.json`)
  *
@@ -15,6 +15,7 @@
  * reported and skipped, and an invalid value is reported and the previous
  * layer's value stands. The dispatcher must always start.
  */
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -29,10 +30,52 @@ export interface Candidate {
   rail: Rail;
 }
 
-export interface Route {
+/**
+ * One agent's destinations, in priority order.
+ *
+ * `primary` is where the agent belongs when nothing is tight. `alternates` is a
+ * *priority* list, consulted in order: the first one that is usable and
+ * meaningfully healthier than the primary wins. The order is the user's
+ * statement of intent and is deliberately never re-sorted by headroom, which
+ * would give the policy a second source of oscillation.
+ *
+ * The list is not deep-merged. A layer that mentions `alternates` replaces it
+ * whole — merging element by element is not what a priority order means — and
+ * it is accepted or rejected as a unit: one unusable element discards the whole
+ * list and leaves the previous layer's list standing. Provenance follows: the
+ * sources for `alternates[<index>]` are rewritten wholesale on replacement, so
+ * an index the new list does not have carries no source at all.
+ *
+ * An empty list pins the agent to its primary: the primary is then assigned
+ * with no readability check and is never held, because there is nothing else
+ * the answer could be.
+ */
+export interface AgentRoute {
   primary: Candidate;
-  alternate?: Candidate;
+  alternates: Candidate[];
 }
+
+/**
+ * The entry-level skip instructions a layer may put on an agent. Both are
+ * consumed while the layers are folded and are never part of the effective
+ * config, because they say what to do with an entry rather than what the entry
+ * is.
+ *
+ *   `disable`  the agent is off: remove it, whatever lower layers said, and
+ *              record the removal once. A `disable` with nothing to remove
+ *              removes nothing and records nothing.
+ *   `ignore`   this copy of the entry does not govern: it contributes nothing,
+ *              warns nothing and leaves a lower layer's route standing. Set as
+ *              well as `disable`, `ignore` wins — there is no conflict to
+ *              report, because a copy that governs nothing cannot also turn
+ *              something off.
+ *
+ * `false` is legal and inert — it asserts nothing — so `disable: false` alone
+ * leaves a lower layer's route exactly as it was. Any other non-boolean value
+ * is not a skip instruction at all: it warns and is treated as absent, leaving
+ * the rest of the entry to apply.
+ */
+export type SkipFlag = "disable" | "ignore";
 
 export interface DispatcherConfig {
   agentDir: string;
@@ -58,8 +101,16 @@ export interface DispatcherConfig {
   weeklySwitchAt: number;
   /** ...and only when the alternate is at least this many points healthier. */
   margin: number;
-  /** Agents absent from this table are never touched. */
-  routes: Record<string, Route>;
+  /**
+   * The agents this extension manages, keyed by agent name — a name is the
+   * filename stem, `<agentDir>/<name>.md`.
+   *
+   * There are no shipped entries. This extension writes to agent files, so a
+   * table of default names means editing files the user never named; an agent is
+   * managed only once the user has listed it here. An agent absent from this
+   * table is never touched.
+   */
+  agents: Record<string, AgentRoute>;
 }
 
 /** Name of the file, in both the global and the project directory. */
@@ -117,8 +168,8 @@ const OWNED_PATH_SCALARS: ReadonlyMap<string, string> = new Map([
 
 /**
  * Agent names are filenames: `<agentDir>/<agent>.md`. A key like `../outside`
- * would write outside the agents directory, so a route is only accepted when
- * its key matches the convention the shipped agents use.
+ * would write outside the agents directory, so an agent is only accepted when
+ * its key matches the convention agent files use.
  */
 const AGENT_NAME = /^[a-z][a-z0-9-]*$/;
 
@@ -137,10 +188,10 @@ const AGENT_NAME = /^[a-z][a-z0-9-]*$/;
  */
 function agentNameRejection(name: string): string | undefined {
   if (!AGENT_NAME.test(name)) {
-    return `route "${name}" is not a valid agent name (lowercase letters, digits and dashes, starting with a letter)`;
+    return `agent "${name}" is not a valid agent name (lowercase letters, digits and dashes, starting with a letter)`;
   }
   if (name in Object.prototype) {
-    return `route "${name}" shadows Object.prototype and is not manageable`;
+    return `agent "${name}" shadows Object.prototype and is not manageable`;
   }
   return undefined;
 }
@@ -184,13 +235,11 @@ function railFromModel(model: string): Rail | undefined {
  *   sessionSwitchAt  75
  *   weeklySwitchAt   90
  *   margin           10
- *   routes           planner     claude-bridge/claude-opus-5-5  -> openai-codex/gpt-6-sol
- *                    reviewer    openai-codex/gpt-6-astra       -> claude-bridge/claude-opus-5-5
- *                    implementer deepseek/deepseek-flash        -> openai-codex/gpt-6-luna
  *
- * (Each route's first model is its primary on the rail its prefix implies; the
- * implementer rests on DeepSeek because it is metered, and uses codex as the
- * pressure valve rather than the default.)
+ * `agents` is empty, and that is the point. There is no opinion here about
+ * which agents exist or where their work should go: a shipped table names files
+ * the user never named and routes work to rails they never chose. The README
+ * shows the snippet to paste instead.
  */
 export function defaultConfig(agentDir: string = getAgentDir()): DispatcherConfig {
   return {
@@ -202,20 +251,7 @@ export function defaultConfig(agentDir: string = getAgentDir()): DispatcherConfi
     sessionSwitchAt: 75,
     weeklySwitchAt: 90,
     margin: 10,
-    routes: {
-      planner: {
-        primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
-        alternate: { model: "openai-codex/gpt-6-sol", rail: "codex" },
-      },
-      reviewer: {
-        primary: { model: "openai-codex/gpt-6-astra", rail: "codex" },
-        alternate: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
-      },
-      implementer: {
-        primary: { model: "deepseek/deepseek-flash", rail: "deepseek" },
-        alternate: { model: "openai-codex/gpt-6-luna", rail: "codex" },
-      },
-    },
+    agents: {},
   };
 }
 
@@ -254,13 +290,19 @@ export interface LoadedConfig {
   files: ConfigFile[];
   /**
    * Dotted key -> the layer that supplied the effective value. Covers the
-   * scalar keys and each route candidate field, e.g.
-   * `sessionSwitchAt` and `routes.planner.primary.model`. A key no layer set
-   * is `"built-in"`.
+   * scalar keys and each candidate field of each agent, e.g. `sessionSwitchAt`,
+   * `agents.planner.primary.model` and `agents.planner.alternates[0].model`. A
+   * key no layer set is `"built-in"`.
    *
-   * It describes the config that actually resulted, so a route or candidate a
+   * It describes the config that actually resulted, so an agent or candidate a
    * layer proposes but validation rejects leaves no entry: `sources` never
    * names a layer that supplied a value `config` does not hold.
+   *
+   * The one key that is not a value is `agents.<name>`, with no `.primary` or
+   * `.alternates` suffix. It records that this layer removed that agent with
+   * `disable`, which is the only way an agent that a lower layer configured can
+   * be absent from `config` — and therefore the answer to "why is this agent not
+   * managed?".
    */
   sources: Record<string, ConfigSource>;
   /** Everything reported while loading, each prefixed with its file path. */
@@ -274,6 +316,13 @@ export interface LoadConfigDeps {
   cwd?: string;
   /** Reads a file's text. Rejects with `code: "ENOENT"` when it is missing. */
   readFile?: (path: string) => Promise<string>;
+  /**
+   * Whether a file is there, for the "configured but absent" check on the
+   * agent files the effective table names. Defaults to `existsSync`.
+   * Deliberately not `readFile`: the check is about the file existing, not about
+   * being able to read it.
+   */
+  fileExists?: (path: string) => boolean;
   /** Where warnings go. Defaults to `console.error`. */
   warn?: (message: string) => void;
 }
@@ -293,6 +342,7 @@ export async function loadConfig(deps: LoadConfigDeps = {}): Promise<LoadedConfi
   const agentDir = deps.agentDir ?? getAgentDir();
   const cwd = deps.cwd ?? process.cwd();
   const read = deps.readFile ?? ((path: string) => readFile(path, "utf8"));
+  const exists = deps.fileExists ?? existsSync;
   const warn = deps.warn ?? console.error;
 
   const globalPath = globalConfigPath(agentDir);
@@ -345,6 +395,18 @@ export async function loadConfig(deps: LoadConfigDeps = {}): Promise<LoadedConfi
   const merged = mergeConfig(defaultConfig(agentDir), layers);
   warnings.push(...merged.warnings);
 
+  // An agent the effective table names, whose file is not there, is a config
+  // that quietly does nothing for that agent: `decide` reports "skipped (no
+  // file)" at every evaluation and the reason is never surfaced. The warning is
+  // prefixed with the path it is about, like every other one, because that path
+  // is what the reader has to go and create.
+  for (const agent of Object.keys(merged.config.agents).sort()) {
+    const file = join(merged.config.agentDir, `${agent}.md`);
+    if (!exists(file)) {
+      warnings.push(`${file}: configured agent "${agent}" has no file`);
+    }
+  }
+
   for (const warning of warnings) {
     try {
       warn(warning);
@@ -378,56 +440,127 @@ export interface MergeResult {
 /**
  * Fold parsed layers over `base`, validating as it goes.
  *
- * Deep per route: a layer that names one agent only touches that agent, and a
- * candidate that names only `model` keeps the base `rail`. `null` is the
- * explicit eraser — `{"routes": {"implementer": null}}` drops a route, and
- * `{"alternate": null}` drops a candidate — so a project can say "I only use
- * two of these agents" without restating the table.
+ * Deep per agent: a layer that names one agent only touches that agent, and a
+ * candidate that names only `model` keeps the base `rail`. Two things are not
+ * deep, and both are deliberate. `alternates` is replaced as a whole whenever a
+ * layer mentions it (see `AgentRoute`), and the skip flags act on the entry as a
+ * unit (see `SkipFlag`).
+ *
+ * There is no `null`. It used to mean "remove this", which made one mistyped
+ * value silently delete a route. Removal is now `disable: true`, which says what
+ * it is doing; `null` anywhere — an agent, a candidate, an element of
+ * `alternates` — warns and leaves the previous layer's value standing.
  *
  * Warnings. A layer warning is prefixed with the layer's `label`, which
  * defaults to its `source`, e.g. `global: ...`; `loadConfig` passes the file
- * path as the label, which is what a reader needs in order to go and fix it. A
- * route rejected while cloning `base` is prefixed `built-in:`, because that is
+ * path as the label, which is what a reader needs in order to go and fix it. An
+ * agent rejected while cloning `base` is prefixed `built-in:`, because that is
  * the layer the base stands for. The kinds are:
  *
- *   - an unrecognised key, at the top level or inside a route or candidate
- *   - a value of the wrong type
+ *   - an unrecognised key, at the top level or inside an agent, candidate or
+ *     skip flag
+ *   - a value of the wrong type, including a skip flag that is not a boolean
  *   - a scalar outside its permitted range: the timers are whole milliseconds
  *     in Node's timer range, the rest are 0–100 percentages
  *   - an agent name that is not a safe filename, on a layer key or on a base
- *     route (see `AGENT_NAME` and `agentNameRejection`)
+ *     entry (see `AGENT_NAME` and `agentNameRejection`)
  *   - a `model` that is not a string containing `/`
  *   - a `rail` that is not one of the three known rails
  *   - a `model` whose prefix reads like a different rail's model than the one
  *     declared, which is what a partial override leaves behind
- *   - a route left without a `primary`, which leaves the previous route for
+ *   - an `alternates` that is not an array, or that holds an element which is
+ *     not a usable candidate: the list is accepted or rejected as a unit
+ *   - an agent left without a `primary`, which leaves the previous entry for
  *     that agent intact rather than erasing it
+ *   - the obsolete `routes` key, which is reported with the name that replaced
+ *     it
  *
- * `sources` describes the config that survives: a route or candidate a layer
+ * `sources` describes the config that survives: an agent or candidate a layer
  * proposes but validation rejects contributes nothing, so provenance can never
- * point at a value the merge did not accept. A committed route commits its
+ * point at a value the merge did not accept. A committed entry commits its
  * values and its sources together.
  */
+/**
+ * Validate one candidate at `dotted`, merging over `current` when there is one.
+ *
+ * Returns `undefined` when the value cannot complete a candidate, having already
+ * warned; the caller then leaves the value it already holds standing. The staged
+ * sources are returned rather than written, so a candidate that is rejected
+ * after being partly read leaves provenance untouched.
+ */
+function parseCandidate(
+  value: unknown,
+  dotted: string,
+  current: Candidate | undefined,
+  source: ConfigSource,
+  warn: (message: string) => void,
+): { candidate: Candidate; sources: Map<string, ConfigSource> } | undefined {
+  if (!isPlainObject(value)) {
+    warn(`"${dotted}" must be an object`);
+    return undefined;
+  }
+
+  const candidate: Partial<Candidate> = current ? { ...current } : {};
+  const sources = new Map<string, ConfigSource>();
+  for (const [key, fieldValue] of Object.entries(value)) {
+    if (key === "model") {
+      if (typeof fieldValue === "string" && fieldValue.includes("/")) {
+        candidate.model = fieldValue;
+        sources.set(`${dotted}.model`, source);
+      } else {
+        warn(`"${dotted}.model" must be a string containing "/"`);
+      }
+    } else if (key === "rail") {
+      if (isRail(fieldValue)) {
+        candidate.rail = fieldValue;
+        sources.set(`${dotted}.rail`, source);
+      } else {
+        warn(`"${dotted}.rail" must be one of "claude", "codex", "deepseek"`);
+      }
+    } else {
+      warn(`unknown key "${dotted}.${key}"`);
+    }
+  }
+
+  if (candidate.model !== undefined && candidate.rail !== undefined) {
+    const resolved = candidate as Candidate;
+    const implied = railFromModel(resolved.model);
+    if (implied !== undefined && implied !== resolved.rail) {
+      warn(
+        `"${dotted}.model" "${resolved.model}" reads as the ${implied} rail but rail is "${resolved.rail}"`,
+      );
+    }
+    return { candidate: resolved, sources };
+  }
+
+  if (candidate.model !== undefined || candidate.rail !== undefined) {
+    // Only ever reached for a candidate a layer introduces: an existing one
+    // already carries both fields, so a partial override completes it.
+    warn(`"${dotted}" needs both "model" and "rail"`);
+  }
+  return undefined;
+}
+
 export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): MergeResult {
   const warnings: string[] = [];
-  const routes: Record<string, Route> = {};
-  for (const [agent, route] of Object.entries(base.routes)) {
-    // Normally the base is `defaultConfig()`, whose keys are the shipped agent
-    // names and always valid, so this only fires for a config a caller built
-    // programmatically. A bad key is the same defect class as a bad layer key —
-    // it names a file — so it gets the same warning and is dropped rather than
-    // cloned into the effective config.
+  const agents: Record<string, AgentRoute> = {};
+  for (const [agent, route] of Object.entries(base.agents)) {
+    // Normally the base is `defaultConfig()`, which ships no agents at all, so
+    // this only fires for a config a caller built programmatically. A bad key is
+    // the same defect class as a bad layer key — it names a file — so it gets
+    // the same warning and is dropped rather than cloned into the effective
+    // config.
     const rejection = agentNameRejection(agent);
     if (rejection) {
       warnings.push(`built-in: ${rejection}`);
       continue;
     }
-    routes[agent] = {
+    agents[agent] = {
       primary: { ...route.primary },
-      ...(route.alternate ? { alternate: { ...route.alternate } } : {}),
+      alternates: route.alternates.map((candidate) => ({ ...candidate })),
     };
   }
-  const config: DispatcherConfig = { ...base, routes };
+  const config: DispatcherConfig = { ...base, agents };
   const scalarTarget = config as unknown as Record<ScalarKey, string | number>;
 
   const sources: Record<string, ConfigSource> = {};
@@ -439,121 +572,159 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
   };
 
   for (const key of SCALAR_KEYS) setSource(key, "built-in");
-  for (const [agent, route] of Object.entries(config.routes)) {
-    setSource(`routes.${agent}.primary.model`, "built-in");
-    setSource(`routes.${agent}.primary.rail`, "built-in");
-    if (route.alternate) {
-      setSource(`routes.${agent}.alternate.model`, "built-in");
-      setSource(`routes.${agent}.alternate.rail`, "built-in");
-    }
+  for (const [agent, route] of Object.entries(config.agents)) {
+    setSource(`agents.${agent}.primary.model`, "built-in");
+    setSource(`agents.${agent}.primary.rail`, "built-in");
+    route.alternates.forEach((_, index) => {
+      setSource(`agents.${agent}.alternates[${index}].model`, "built-in");
+      setSource(`agents.${agent}.alternates[${index}].rail`, "built-in");
+    });
   }
 
-  const dropRoute = (agent: string): void => {
-    // Own property only: a key like `constructor` would otherwise reach an
-    // inherited value that is not a route at all.
-    if (!Object.hasOwn(config.routes, agent)) return;
-    delete config.routes[agent];
-    clearSource(`routes.${agent}.primary.model`);
-    clearSource(`routes.${agent}.primary.rail`);
-    clearSource(`routes.${agent}.alternate.model`);
-    clearSource(`routes.${agent}.alternate.rail`);
+  /** Forget every value `agent` contributed, including every list index. */
+  const clearAgentSources = (agent: string): void => {
+    for (const key of Object.keys(sources)) {
+      if (key === `agents.${agent}` || key.startsWith(`agents.${agent}.`)) clearSource(key);
+    }
   };
 
-  const applyRoute = (
+  /**
+   * Remove `agent` from the effective table, and record who removed it.
+   *
+   * The record is the bare `agents.<agent>` key, which is not a value: it is how
+   * `/quota-dispatch` answers "why is this agent not managed?". A disable that
+   * had nothing to remove records nothing, because nothing changed.
+   */
+  const disableAgent = (agent: string, source: ConfigSource): void => {
+    // Own property only: a key like `constructor` would otherwise reach an
+    // inherited value that is not an agent at all.
+    if (!Object.hasOwn(config.agents, agent)) return;
+    delete config.agents[agent];
+    clearAgentSources(agent);
+    setSource(`agents.${agent}`, source);
+  };
+
+  const applyAgent = (
     agent: string,
     data: Record<string, unknown>,
     source: ConfigSource,
     warn: (message: string) => void,
   ): void => {
-    // Own property only, so `{"routes":{"constructor":{}}}` does not resolve
-    // to `Object.prototype.constructor` and commit a phantom route.
-    const existing = Object.hasOwn(config.routes, agent) ? config.routes[agent] : undefined;
-    const holders: { primary?: Candidate; alternate?: Candidate } = {
+    // Own property only, so `{"agents":{"constructor":{}}}` does not resolve
+    // to `Object.prototype.constructor` and commit a phantom agent.
+    const existing = Object.hasOwn(config.agents, agent) ? config.agents[agent] : undefined;
+
+    // The entry-level skip instructions act on the entry as a unit, so they are
+    // settled before anything inside it is looked at. `ignore` wins over
+    // `disable`: a copy that governs nothing cannot also turn something off, and
+    // there is no conflict to report. Either `true` is a complete answer, and
+    // `false` is inert, so the rest of the entry applies. A non-boolean is not
+    // a skip instruction at all — it warns and is treated as absent.
+    const skipFlag = (flag: SkipFlag): boolean => {
+      const value = data[flag];
+      if (value === undefined) return false;
+      if (typeof value === "boolean") return value;
+      warn(`"agents.${agent}.${flag}" must be true or false`);
+      return false;
+    };
+    if (skipFlag("ignore")) return;
+    if (skipFlag("disable")) {
+      disableAgent(agent, source);
+      return;
+    }
+
+    const holders: { primary?: Candidate; alternates?: Candidate[] } = {
       ...(existing ? { primary: { ...existing.primary } } : {}),
-      ...(existing?.alternate ? { alternate: { ...existing.alternate } } : {}),
+      ...(existing ? { alternates: existing.alternates.map((c) => ({ ...c })) } : {}),
     };
 
-    // Provenance is staged here, not written as candidates are validated: a
-    // route or candidate that is later rejected must leave `sources` byte-for-
-    // byte as it was, so it can only describe the effective config. `null` is a
-    // staged erasure, applied together with the commit. Because the commit
-    // below writes `config.routes[agent]` and then drains `pending`, a value
-    // and its source are never out of step.
+    // Provenance is staged here, not written as candidates are validated: an
+    // agent or candidate that is later rejected must leave `sources` byte-for-
+    // byte as it was, so it can only describe the effective config. Because the
+    // commit below writes `config.agents[agent]` and then drains `pending`, a
+    // value and its source are never out of step.
     const pending = new Map<string, ConfigSource | null>();
 
     for (const [field, value] of Object.entries(data)) {
-      if (field !== "primary" && field !== "alternate") {
-        warn(`unknown key "routes.${agent}.${field}"`);
+      if (field === "disable" || field === "ignore") {
+        // Already consumed as a skip instruction; a `false` one is valid and
+        // inert, so it is not an unknown key.
         continue;
       }
-      const slot = field;
-      const dotted = `routes.${agent}.${slot}`;
-      const current = holders[slot];
-
-      if (value === null) {
-        delete holders[slot];
-        pending.set(`${dotted}.model`, null);
-        pending.set(`${dotted}.rail`, null);
-        continue;
-      }
-      if (!isPlainObject(value)) {
-        warn(`"${dotted}" must be an object or null`);
+      if (field !== "primary" && field !== "alternates") {
+        warn(`unknown key "agents.${agent}.${field}"`);
         continue;
       }
 
-      const candidate: Partial<Candidate> = current ? { ...current } : {};
-      // A candidate's sources are collected locally and only folded into
-      // `pending` once the candidate is accepted, so a candidate rejected for
-      // lacking `model` or `rail` leaves its half-set provenance behind.
-      const candidateSources = new Map<string, ConfigSource>();
-      for (const [key, fieldValue] of Object.entries(value)) {
-        if (key === "model") {
-          if (typeof fieldValue === "string" && fieldValue.includes("/")) {
-            candidate.model = fieldValue;
-            candidateSources.set(`${dotted}.model`, source);
-          } else {
-            warn(`"${dotted}.model" must be a string containing "/"`);
-          }
-        } else if (key === "rail") {
-          if (isRail(fieldValue)) {
-            candidate.rail = fieldValue;
-            candidateSources.set(`${dotted}.rail`, source);
-          } else {
-            warn(`"${dotted}.rail" must be one of "claude", "codex", "deepseek"`);
-          }
-        } else {
-          warn(`unknown key "${dotted}.${key}"`);
+      if (field === "primary") {
+        const dotted = `agents.${agent}.primary`;
+        if (value === null) {
+          // `null` is no longer an eraser. A route needs a primary, so the only
+          // way to name a removal is the explicit flag; a `null` here changes
+          // nothing and the previous primary stands.
+          warn(`"${dotted}" is null; a route needs a primary (to remove the agent use disable: true)`);
+          continue;
         }
+        const parsed = parseCandidate(value, dotted, holders.primary, source, warn);
+        if (!parsed) continue;
+        holders.primary = parsed.candidate;
+        for (const [key, from] of parsed.sources) pending.set(key, from);
+        continue;
       }
 
-      if (candidate.model !== undefined && candidate.rail !== undefined) {
-        const resolved = candidate as Candidate;
-        const implied = railFromModel(resolved.model);
-        if (implied !== undefined && implied !== resolved.rail) {
-          warn(
-            `"${dotted}.model" "${resolved.model}" reads as the ${implied} rail but rail is "${resolved.rail}"`,
-          );
+      const dotted = `agents.${agent}.alternates`;
+      if (!Array.isArray(value)) {
+        warn(`"${dotted}" must be an array`);
+        continue;
+      }
+      // A layer that mentions the list replaces it whole, never element by
+      // element: `alternates` is a priority order, and the order is not
+      // something element-wise merging can express. Each element is a candidate
+      // in its own right — it inherits nothing from whatever used to sit at the
+      // same index — and the list is accepted or rejected as a unit, so a single
+      // unusable element leaves the previous list, and its provenance, exactly
+      // as they were.
+      const nextAlternates: Candidate[] = [];
+      const nextStages: Array<Map<string, ConfigSource>> = [];
+      let usable = true;
+      for (let index = 0; index < value.length; index++) {
+        const parsed = parseCandidate(value[index], `${dotted}[${index}]`, undefined, source, warn);
+        if (!parsed) {
+          usable = false;
+          continue;
         }
-        holders[slot] = resolved;
-        for (const [key, from] of candidateSources) pending.set(key, from);
-      } else if (candidate.model !== undefined || candidate.rail !== undefined) {
-        // Only ever reached for a candidate a layer introduces: an existing one
-        // already carries both fields, so a partial override completes it.
-        warn(`"${dotted}" needs both "model" and "rail"`);
+        nextAlternates.push(parsed.candidate);
+        nextStages.push(parsed.sources);
+      }
+      if (!usable) continue;
+
+      const previousLength = holders.alternates?.length ?? 0;
+      holders.alternates = nextAlternates;
+      // An index the new list does not reach has no value in the effective
+      // config, so it must carry no source: stage a clear for each.
+      for (let index = nextAlternates.length; index < previousLength; index++) {
+        pending.set(`${dotted}[${index}].model`, null);
+        pending.set(`${dotted}[${index}].rail`, null);
+      }
+      for (const stage of nextStages) {
+        for (const [key, from] of stage) pending.set(key, from);
       }
     }
 
     if (!holders.primary) {
-      // Never remove a route a lower layer set: an invalid value leaves the
-      // previous value standing. Deletion stays explicit (route-level `null`).
+      // Never remove an agent a lower layer set: an invalid value leaves the
+      // previous value standing. Removal stays explicit (`disable: true`).
       // Returning here discards `pending`, so neither value nor source moves.
-      warn(`route "${agent}" has no primary`);
+      warn(`agent "${agent}" has no primary`);
       return;
     }
-    config.routes[agent] = {
+    config.agents[agent] = {
       primary: holders.primary,
-      ...(holders.alternate ? { alternate: holders.alternate } : {}),
+      alternates: holders.alternates ?? [],
     };
+    // An entry that lands here is managed, so a removal a lower layer recorded
+    // for this agent no longer describes the effective config.
+    clearSource(`agents.${agent}`);
     for (const [key, from] of pending) {
       if (from === null) clearSource(key);
       else setSource(key, from);
@@ -573,25 +744,34 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
     }
 
     for (const [key, value] of Object.entries(layer.data)) {
-      if (key === "routes") {
+      if (key === "agents") {
         if (!isPlainObject(value)) {
-          warn(`"routes" must be an object`);
+          warn(`"agents" must be an object`);
           continue;
         }
-        for (const [agent, routeValue] of Object.entries(value)) {
+        for (const [agent, agentValue] of Object.entries(value)) {
           const rejection = agentNameRejection(agent);
           if (rejection) {
             warn(rejection);
             continue;
           }
-          if (routeValue === null) {
-            dropRoute(agent);
-          } else if (!isPlainObject(routeValue)) {
-            warn(`route "${agent}" must be an object or null`);
+          if (agentValue === null) {
+            // `null` no longer removes an agent. Removal is the explicit flag,
+            // and an invalid value leaves the previous entry standing rather
+            // than erasing it.
+            warn(`agent "${agent}" is null; to remove an agent use disable: true`);
+          } else if (!isPlainObject(agentValue)) {
+            warn(`agent "${agent}" must be an object`);
           } else {
-            applyRoute(agent, routeValue, source, warn);
+            applyAgent(agent, agentValue, source, warn);
           }
         }
+        continue;
+      }
+
+      if (key === "routes") {
+        // A hint, not an alias: the old spelling is never read.
+        warn(`unknown key "routes" (renamed to "agents")`);
         continue;
       }
 
@@ -636,10 +816,17 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
  *
  *   `config: built-in < global <path> (present|absent) < project <path> (present|absent)`
  *
- * Then one line per effective value, scalars in a fixed order followed by
- * routes sorted by agent, each rendered `<dotted-key> = <value>  [<source>]`:
+ * Then one line per effective value, scalars in a fixed order followed by the
+ * agents sorted by name, each rendered `<dotted-key> = <value>  [<source>]`:
  *
  *   `  sessionSwitchAt = 75  [built-in]`
+ *
+ * An agent renders one `.model`/`.rail` pair per candidate, `primary` first and
+ * then each `alternates[<index>]` in priority order, so the list reads the way
+ * it is consulted. An agent a layer disabled is not in the effective config and
+ * has no candidates to render; it appears as the single line
+ * `  agents.<name> = disabled  [<source>]`, which is what makes "why is this
+ * agent not managed?" answerable from the same block.
  *
  * Finally one `  warning: <text>` line per warning, if any.
  */
@@ -657,14 +844,32 @@ export function describeConfig(loaded: LoadedConfig): string[] {
     lines.push(`  ${key} = ${String(loaded.config[key])}  [${sourceOf(key)}]`);
   }
 
-  for (const agent of Object.keys(loaded.config.routes).sort()) {
-    const route = loaded.config.routes[agent];
-    for (const [slot, candidate] of [
+  // A disabled agent is absent from `loaded.config.agents` by construction, so
+  // the block has to read the removal markers out of `sources` as well; without
+  // that, the one agent you most want to ask about — the one that is not
+  // managed — would not appear at all. The bare `agents.<name>` key is the
+  // marker; a value key always has a `.primary` or `.alternates[...]` suffix.
+  const disabled = new Map<string, ConfigSource>();
+  for (const [key, source] of Object.entries(loaded.sources)) {
+    const removed = /^agents\.([a-z][a-z0-9-]*)$/.exec(key);
+    if (removed) disabled.set(removed[1], source);
+  }
+  const names = new Set<string>([...Object.keys(loaded.config.agents), ...disabled.keys()]);
+
+  for (const agent of [...names].sort()) {
+    const route = loaded.config.agents[agent];
+    if (!route) {
+      lines.push(`  agents.${agent} = disabled  [${disabled.get(agent) ?? "built-in"}]`);
+      continue;
+    }
+    const slots: Array<[string, Candidate]> = [
       ["primary", route.primary],
-      ["alternate", route.alternate],
-    ] as const) {
-      if (!candidate) continue;
-      const dotted = `routes.${agent}.${slot}`;
+      ...route.alternates.map(
+        (candidate, index): [string, Candidate] => [`alternates[${index}]`, candidate],
+      ),
+    ];
+    for (const [slot, candidate] of slots) {
+      const dotted = `agents.${agent}.${slot}`;
       lines.push(`  ${dotted}.model = ${candidate.model}  [${sourceOf(`${dotted}.model`)}]`);
       lines.push(`  ${dotted}.rail = ${candidate.rail}  [${sourceOf(`${dotted}.rail`)}]`);
     }

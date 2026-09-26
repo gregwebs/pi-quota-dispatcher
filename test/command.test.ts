@@ -50,16 +50,30 @@ async function fixture(pollMs = 2_147_483_647): Promise<Fixture> {
     "utf8",
   );
 
+  // The shipped config names no agents, so the fixture has to name them itself.
+  // planner is claude-primary, so a tight claude session moves it to its codex
+  // alternate. reviewer is configured but deliberately has no file, so it must
+  // be reported as skipped rather than crash.
   await writeFile(
     join(agentDir, CONFIG_FILE_NAME),
-    JSON.stringify({ claudeCredsPath, pollMs }),
+    JSON.stringify({
+      claudeCredsPath,
+      pollMs,
+      agents: {
+        planner: {
+          primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+          alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
+        },
+        reviewer: {
+          primary: { model: "openai-codex/gpt-6-astra", rail: "codex" },
+          alternates: [{ model: "claude-bridge/claude-opus-5-5", rail: "claude" }],
+        },
+      },
+    }),
     "utf8",
   );
   await writeFile(join(projectDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), JSON.stringify({ margin: 10 }), "utf8");
 
-  // planner is claude-primary, so a tight claude session moves it to its codex
-  // alternate. reviewer and implementer deliberately have no file, so one of
-  // them must be reported as skipped rather than crash.
   const plannerFile = join(agentsDir, "planner.md");
   await writeFile(plannerFile, TEMPLATE("planner", "claude-bridge/claude-opus-5-5"), "utf8");
 

@@ -31,10 +31,11 @@ import { join, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_CONFIG,
+  type AgentRoute,
+  type Candidate,
   type DispatcherConfig,
   type LoadedConfig,
   type Rail,
-  type Route,
   describeConfig,
   loadConfig,
 } from "./config.ts";
@@ -53,6 +54,7 @@ export {
   projectConfigPath,
 } from "./config.ts";
 export type {
+  AgentRoute,
   Candidate,
   ConfigFile,
   ConfigSource,
@@ -62,7 +64,7 @@ export type {
   MergeLayer,
   MergeResult,
   Rail,
-  Route,
+  SkipFlag,
 } from "./config.ts";
 
 // ---------------------------------------------------------------- types
@@ -279,10 +281,26 @@ function isInside(dir: string, file: string): boolean {
  * figure set the policy on its own, because it is almost always the larger of
  * the two.
  *
- * Deliberate rule: unreadable quota is *not* evidence of pressure. When a rail
- * cannot be read we make no assignment at all, leaving the file exactly as the
- * user left it. Substituting the primary here would move agents back onto a
- * constrained rail on the strength of a failed HTTP call.
+ * Deliberate rule: an unreadable quota is *not* evidence of pressure, and it is
+ * not evidence of room either — it is a missing reading. The policy holds when a
+ * reading it does not have could have changed the answer, and otherwise proceeds
+ * on the readings it does have:
+ *
+ *   - the primary's rail unreadable, or reporting nothing for a budget it should
+ *     have reported, holds: that missing number is exactly the one that decides
+ *     whether to move;
+ *   - a primary that is readable and below every threshold is assigned even when
+ *     an alternate is unreadable, because no alternate could have been chosen;
+ *   - when the primary is tight, the alternates are walked in priority order and
+ *     the first usable one wins — but an unreadable alternate that comes before
+ *     the winner holds instead, and an unreadable alternate holds when nothing
+ *     readable qualifies either, since the missing reading might have won.
+ *
+ * Substituting the primary whenever a read fails would move agents back onto a
+ * constrained rail on the strength of a failed HTTP call; holding whenever any
+ * read fails would drag work off a healthy primary for no reason. Both are
+ * guesses about numbers nobody read, so the rule is stated as what the missing
+ * number could have done.
  *
  * A destination is held to the same standard as a source. It must be strictly
  * healthier on the budget that triggered the move *and* not tight on its other
@@ -299,7 +317,7 @@ function isInside(dir: string, file: string): boolean {
  */
 export function decide(
   agent: string,
-  route: Route,
+  route: AgentRoute,
   rails: Map<Rail, RailState>,
   cfg: DispatcherConfig,
 ): Decision {
@@ -312,10 +330,10 @@ export function decide(
       why: `"${agent}" resolves outside the agents directory (${file}) — holding`,
     };
   }
-  const primary = rails.get(route.primary.rail);
-  const alt = route.alternate ? rails.get(route.alternate.rail) : undefined;
 
-  if (!route.alternate || !alt) {
+  // An empty list pins the agent to its primary. There is nothing else the
+  // answer could be, so no reading is consulted and no hold is possible.
+  if (!route.alternates.length) {
     return {
       agent,
       file,
@@ -324,7 +342,12 @@ export function decide(
       why: "no alternate configured",
     };
   }
-  if (!primary?.ok) {
+
+  // A state missing from the map is as unreadable as one with `ok: false`: we
+  // have no reading either way. A missing reading is exactly what the hold rule
+  // is about, so it is handled before any threshold is consulted.
+  const primary = rails.get(route.primary.rail);
+  if (!primary || !primary.ok) {
     return {
       agent,
       file,
@@ -332,61 +355,140 @@ export function decide(
       why: `${route.primary.rail} unreadable (${primary?.note ?? "unknown"}) — holding`,
     };
   }
-  if (!alt.ok) {
+
+  // A rail that is readable but silent about a budget it should report is the
+  // same danger: the missing number is the one that decides whether to move, so
+  // it is unknown rather than idle. Guessing here is what let a rail that was
+  // blocked outright read as the roomiest place to send work.
+  const primaryAbsent = absentBudgets(primary);
+  if (primaryAbsent.length) {
     return {
       agent,
       file,
       kind: "hold",
-      why: `${route.alternate.rail} unreadable (${alt.note}) — holding`,
+      why: `${primary.rail} did not report its ${primaryAbsent.join(" and ")} budget (${budgetSummary(primary)}) — holding`,
     };
   }
 
-  // An unreported budget is unknown, not idle. Guessing here is what let a rail
-  // that was blocked outright read as the roomiest place to send work.
-  for (const state of [primary, alt]) {
-    const absent = absentBudgets(state);
-    if (absent.length) {
-      return {
-        agent,
-        file,
-        kind: "hold",
-        why: `${state.rail} did not report its ${absent.join(" and ")} budget (${budgetSummary(state)}) — holding`,
-      };
-    }
+  // The positive half of the sensitivity rule: a primary below every threshold
+  // is assigned whatever the alternates say, because no alternate could have
+  // been chosen, so an unreadable one is no reason to hold.
+  const tightBudgets = BUDGET_ORDER.filter(
+    (budget) => budgetUsed(primary, budget)! >= thresholdFor(budget, cfg),
+  );
+  if (!tightBudgets.length) {
+    return {
+      agent,
+      file,
+      kind: "assign",
+      model: route.primary.model,
+      why: `${primary.rail} ok (${budgetSummary(primary)})`,
+    };
   }
 
   const reasons: string[] = [];
   for (const budget of BUDGET_ORDER) {
     const used = budgetUsed(primary, budget)!;
     const threshold = thresholdFor(budget, cfg);
+    // Only a budget the primary is tight on can trigger a switch; the other one
+    // is weighed on its own pass, so a spent week is not masked by a merely
+    // tight session.
     if (used < threshold) continue;
 
     const spare = OTHER_BUDGET[budget];
-    const altUsed = budgetUsed(alt, budget)!;
-    const altSpare = budgetUsed(alt, spare)!;
+    const spareThreshold = thresholdFor(spare, cfg);
 
-    // A destination that is tight on its *other* budget would block this work
-    // just as surely, so switching there trades one cap for another rather than
-    // relieving anything. This is what stops an agent being moved onto the very
-    // rail another agent was moved off in the same pass.
-    if (altSpare >= thresholdFor(spare, cfg)) {
-      reasons.push(
-        `${primary.rail} ${budget} ${pct(used)} >= ${pct(threshold)} but ${alt.rail} ${spare} ${pct(altSpare)} is itself tight`,
+    // The alternates are consulted in the priority order the user wrote, never
+    // re-sorted by headroom: order is the only intent the numbers cannot
+    // express, and a "healthiest" rule would add a second source of
+    // oscillation to a policy that already swaps models near a threshold.
+    const rejected: string[] = [];
+    const missing: string[] = [];
+    let winner: Candidate | undefined;
+    let winnerUsed = 0;
+    let winnerIndex = -1;
+    for (let index = 0; index < route.alternates.length; index++) {
+      const candidate = route.alternates[index];
+      const state = rails.get(candidate.rail);
+      if (!state || !state.ok) {
+        missing.push(`${candidate.rail} unreadable (${state?.note ?? "unknown"})`);
+        continue;
+      }
+      const absent = absentBudgets(state);
+      if (absent.length) {
+        missing.push(
+          `${candidate.rail} did not report its ${absent.join(" and ")} budget (${budgetSummary(state)})`,
+        );
+        continue;
+      }
+      const altUsed = budgetUsed(state, budget)!;
+      const altSpare = budgetUsed(state, spare)!;
+
+      // A destination that is tight on its *other* budget would block this work
+      // just as surely, so switching there trades one cap for another rather
+      // than relieving anything. This is what stops an agent being moved onto
+      // the very rail another agent was moved off in the same pass.
+      if (altSpare >= spareThreshold) {
+        // Named by model, not just rail: two alternates can share a rail, and a
+        // rail alone cannot say which one was passed over.
+        rejected.push(
+          `rejected ${candidate.model} on ${candidate.rail} (${spare} ${pct(altSpare)} is itself tight)`,
+        );
+        continue;
+      }
+      if (altUsed < used - cfg.margin) {
+        winner = candidate;
+        winnerUsed = altUsed;
+        winnerIndex = index;
+        break;
+      }
+      rejected.push(
+        `rejected ${candidate.model} on ${candidate.rail} (${budget} ${pct(altUsed)} is within margin)`,
       );
-      continue;
     }
-    if (altUsed < used - cfg.margin) {
+
+    if (winner) {
+      // We stop at the first usable candidate, so one we could not read that
+      // came earlier in order may have been that candidate. The missing reading
+      // could have changed the answer, so we hold rather than guess past it.
+      if (missing.length) {
+        return {
+          agent,
+          file,
+          kind: "hold",
+          why: `${missing.join("; ")} could have won before ${winner.model} on ${winner.rail} — holding`,
+        };
+      }
+      // The walk stopped at the winner, so anything after it in priority order
+      // was never read. They lost their place to the winner rather than being
+      // rejected on health, and the line says so; a user asking "why not my
+      // second alternate?" sees the answer here.
+      const notConsulted = route.alternates
+        .slice(winnerIndex + 1)
+        .map((c) => `${c.model} on ${c.rail} not consulted (lower priority than the winner)`);
+      const notes = [...rejected, ...notConsulted];
+      const notesText = notes.length ? `; ${notes.join("; ")}` : "";
       return {
         agent,
         file,
         kind: "assign",
-        model: route.alternate.model,
-        why: `${primary.rail} ${budget} ${pct(used)} >= ${pct(threshold)}, ${alt.rail} ${budget} ${pct(altUsed)}`,
+        model: winner.model,
+        why: `${primary.rail} ${budget} ${pct(used)} >= ${pct(threshold)}, choosing ${winner.model} on ${winner.rail} (${budget} ${pct(winnerUsed)})${notesText}`,
       };
     }
-    reasons.push(
-      `${primary.rail} ${budget} ${pct(used)} >= ${pct(threshold)} but ${alt.rail} ${budget} ${pct(altUsed)} is within margin`,
-    );
+
+    // Nothing readable qualified. If an alternate we could not read might have,
+    // the missing reading could have been the answer, so we hold instead of
+    // resting the agent back on a rail we know is tight.
+    if (missing.length) {
+      return {
+        agent,
+        file,
+        kind: "hold",
+        why: `${missing.join("; ")} could have won on ${budget} (${primary.rail} ${pct(used)} >= ${pct(threshold)}) — holding`,
+      };
+    }
+    reasons.push(...rejected);
   }
 
   return {
@@ -577,7 +679,7 @@ export function createDispatcher(
     rails: Map<Rail, RailState>,
     dry: boolean,
   ): Promise<Array<{ decision: Decision; outcome: Outcome }>> {
-    const decisions = Object.entries(cfg.routes).map(([agent, route]) =>
+    const decisions = Object.entries(cfg.agents).map(([agent, route]) =>
       decide(agent, route, rails, cfg),
     );
     return Promise.all(
