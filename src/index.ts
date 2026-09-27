@@ -3,7 +3,10 @@
  *
  * Keeps agent `model:` frontmatter in sync with subscription headroom, so you
  * stop hand-editing `~/.pi/agent/agents/*.md` every time a quota starts to run
- * out.
+ * out. It writes the `thinking:` line beside it when the configuration states a
+ * level, because the model a budget can afford is often the model that should
+ * think differently — see `upsertThinking` for the one guarantee it makes about
+ * that line (there is only ever a forward one).
  *
  * Design notes
  * ------------
@@ -19,8 +22,12 @@
  *      agents would inherit the parent model — a reviewer quietly downgraded to
  *      the session model is worse than a stale-but-sane one.
  *
- * The policy is stateless: the target model is a pure function of current rail
- * headroom, so re-evaluating is idempotent and cannot drift.
+ * The policy is stateless: the target model, and any level that goes with it,
+ * are pure functions of current rail headroom, so re-evaluating the same
+ * readings is idempotent and the model cannot drift. The `thinking:` line is the
+ * one thing a file does not converge on — a pass that resolves no level leaves
+ * whatever is there — so which level an agent runs at can depend on the order of
+ * past passes. See docs/adr/0004-thinking-levels.md.
  *
  * Quota is read from two undocumented-but-stable endpoints the vendors' own
  * clients use. No credentials are ever logged.
@@ -44,11 +51,13 @@ import {
   type DispatcherConfig,
   type LoadedConfig,
   type Rail,
+  type ThinkingLevel,
   agentNameRejection,
   describeConfig,
   globalConfigPath,
   loadConfig,
   railFromModel,
+  thinkingFor,
 } from "./config.ts";
 
 // Config is a separate module because it is read from disk at run time; it is
@@ -57,13 +66,17 @@ import {
 export {
   CONFIG_FILE_NAME,
   DEFAULT_CONFIG,
+  THINKING_LEVELS,
   defaultConfig,
   describeConfig,
   globalConfigPath,
+  isThinkingLevel,
   loadConfig,
   mergeConfig,
+  modelIdRejection,
   projectConfigPath,
   railFromModel,
+  thinkingFor,
 } from "./config.ts";
 export type {
   AgentRoute,
@@ -75,8 +88,10 @@ export type {
   LoadedConfig,
   MergeLayer,
   MergeResult,
+  ModelDefault,
   Rail,
   SkipFlag,
+  ThinkingLevel,
 } from "./config.ts";
 
 import { checkModels, modelLookup } from "./models.ts";
@@ -150,9 +165,23 @@ export type Outcome =
  * per candidate it passed over, so a route with several alternates puts each on
  * its own line rather than joining them into one long sentence. Notes are never
  * dropped for brevity — the rendered layout is `describeDecisionLines`'s job.
+ *
+ * `thinking` rides along on an assign for the same reason `model` does: it is
+ * part of the instruction to write, and it comes from the same pure resolution
+ * over the chosen candidate. It is absent when nothing names a level, which is
+ * not a level of "none" but the absence of an opinion — the file's `thinking:`
+ * line is then left as it is, whether that is what the user wrote or what an
+ * earlier pass wrote.
  */
 export type Decision =
-  | { agent: string; file: string; kind: "assign"; model: string; why: string }
+  | {
+      agent: string;
+      file: string;
+      kind: "assign";
+      model: string;
+      thinking?: ThinkingLevel;
+      why: string;
+    }
   | { agent: string; file: string; kind: "hold"; why: string };
 
 // ---------------------------------------------------------------- parsing
@@ -368,16 +397,27 @@ export function decide(
     };
   }
 
-  // An empty list pins the agent to its primary. There is nothing else the
-  // answer could be, so no reading is consulted and no hold is possible.
-  if (!route.alternates.length) {
+  /**
+   * An assign for `candidate`, carrying the level the three places that can
+   * state one resolve to. Both fields come from the same pure resolution, so the
+   * pair written to the file is always the pair the decision reported.
+   */
+  const assign = (candidate: Candidate, why: string): Decision => {
+    const thinking = thinkingFor(cfg, route, candidate);
     return {
       agent,
       file,
       kind: "assign",
-      model: route.primary.model,
-      why: "no alternate configured",
+      model: candidate.model,
+      ...(thinking !== undefined ? { thinking } : {}),
+      why,
     };
+  };
+
+  // An empty list pins the agent to its primary. There is nothing else the
+  // answer could be, so no reading is consulted and no hold is possible.
+  if (!route.alternates.length) {
+    return assign(route.primary, "no alternate configured");
   }
 
   // A state missing from the map is as unreadable as one with `ok: false`: we
@@ -414,13 +454,7 @@ export function decide(
     (budget) => budgetUsed(primary, budget)! >= thresholdFor(budget, cfg),
   );
   if (!tightBudgets.length) {
-    return {
-      agent,
-      file,
-      kind: "assign",
-      model: route.primary.model,
-      why: `${primary.rail} ok (${budgetSummary(primary)})`,
-    };
+    return assign(route.primary, `${primary.rail} ok (${budgetSummary(primary)})`);
   }
 
   const reasons: string[] = [];
@@ -512,16 +546,13 @@ export function decide(
           ),
         };
       }
-      return {
-        agent,
-        file,
-        kind: "assign",
-        model: winner.model,
-        why: withNotes(
+      return assign(
+        winner,
+        withNotes(
           `${primary.rail} ${budget} ${pct(used)} >= ${pct(threshold)}, choosing ${winner.model} on ${winner.rail} (${budget} ${pct(winnerUsed)})`,
           notes,
         ),
-      };
+      );
     }
 
     // Nothing readable qualified. If an alternate we could not read might have,
@@ -541,18 +572,15 @@ export function decide(
     reasons.push(...rejected);
   }
 
-  return {
-    agent,
-    file,
-    kind: "assign",
-    model: route.primary.model,
-    why: reasons.length
+  return assign(
+    route.primary,
+    reasons.length
       ? withNotes(
           `${primary.rail} tight on ${tightBudgets.join(" and ")} (${budgetSummary(primary)}) and no alternate won`,
           reasons,
         )
       : `${primary.rail} ok (${budgetSummary(primary)})`,
-  };
+  );
 }
 
 /**
@@ -685,6 +713,70 @@ export function upsertModel(src: string, model: string): string | null {
     return head.replace(/^name:[^\n]*$/m, (l) => `${l}\n${line}`) + tail;
   }
   return null;
+}
+
+/** The uncommented `thinking:` line, capturing everything after the colon. */
+const THINKING_LINE = /^thinking:[ \t]*(.*?)[ \t]*$/m;
+
+/**
+ * The thinking level the uncommented `thinking:` line declares, decoded, if any.
+ */
+function activeThinking(head: string): string | undefined {
+  const match = THINKING_LINE.exec(head);
+  return match ? decodeScalar(match[1]) : undefined;
+}
+
+/**
+ * Set the uncommented `thinking:` line inside the frontmatter block, beside the
+ * model it applies to.
+ *
+ * `undefined` writes nothing at all, and that is a deliberate absence rather
+ * than a default: a level no layer named is not a level of "none", so the
+ * file's line is left as it is — whether the user put it there or an earlier
+ * pass did — and `src` comes back byte-for-byte, which is what keeps the pass
+ * reporting `unchanged`.
+ *
+ * There is **no removal and no restore**. The dispatcher does not remember what
+ * a file said before it wrote a level, and does not put anything back when an
+ * agent moves to a candidate that names none — so on a route where only the
+ * alternates state a level, the level written on the way out is still there on
+ * the way home. That is the honest consequence of treating this line as the
+ * dispatcher's to write: the guarantee is only ever forward (`what this pass
+ * resolved`), never a promise about what the file used to hold, and it is also
+ * why `model:` converges on the decision while this line need not. A candidate
+ * that wants its own level back states one.
+ *
+ * Unlike `model`, the value is written unquoted — `thinking: high` — which is
+ * how pi's own agent files and the subagents plugin's editor spell it. A line
+ * that is already correct is left byte-for-byte, so `thinking: "high"` is not
+ * rewritten to `thinking: high`; only a value that differs is replaced.
+ *
+ * Returns `src` unchanged when the file has no usable frontmatter, and also when
+ * its frontmatter carries neither a `model:` nor a `name:` line to hang the
+ * level beside. That is unreachable from `applyDecision`, which has already
+ * refused a file `upsertModel` could not rewrite, and it is the honest answer
+ * for a direct call: there is nothing to write.
+ */
+export function upsertThinking(src: string, thinking: ThinkingLevel | undefined): string {
+  if (thinking === undefined) return src;
+  const head = frontmatter(src);
+  if (head === undefined) return src;
+  const tail = src.slice(head.length);
+  const line = `thinking: ${thinking}`;
+
+  if (THINKING_LINE.test(head)) {
+    if (activeThinking(head) === thinking) return src;
+    return head.replace(THINKING_LINE, line) + tail;
+  }
+  // Beside the model it qualifies where there is one, and after `name:`, where
+  // `upsertModel` puts a model line it has to insert.
+  if (MODEL_LINE.test(head)) {
+    return head.replace(MODEL_LINE, (l) => `${l}\n${line}`) + tail;
+  }
+  if (/^name:[^\n]*$/m.test(head)) {
+    return head.replace(/^name:[^\n]*$/m, (l) => `${l}\n${line}`) + tail;
+  }
+  return src;
 }
 
 /**
@@ -872,23 +964,35 @@ export function unconfiguredNotice(
 export async function applyDecision(
   file: string,
   model: string,
+  thinking: ThinkingLevel | undefined,
   dry: boolean,
 ): Promise<Outcome> {
   if (!existsSync(file)) return "skipped (no file)";
   const src = await readFile(file, "utf8");
-  const next = upsertModel(src, model);
-  if (next === null) return "skipped (no frontmatter)";
+  const withModel = upsertModel(src, model);
+  if (withModel === null) return "skipped (no frontmatter)";
+  // The model first, so a `thinking:` line that has to be inserted lands beside
+  // the model line rather than beside `name:`. `next` is compared against the
+  // original source, not against `withModel`, so a pass that changed nothing at
+  // all still reports `unchanged` and writes nothing.
+  const next = upsertThinking(withModel, thinking);
   if (next === src) return "unchanged";
   if (dry) return "would-write";
   await writeFile(file, next, "utf8");
   return "written";
 }
 
-/** One-line rendering of a decision, for reports and command output. */
+/**
+ * One-line rendering of a decision, for reports and command output.
+ *
+ * A resolved thinking level is named on the line because it is part of what the
+ * write does: the model is already reported in full, and "what will this agent be
+ * running at" is the other half of the same answer.
+ */
 export function describeDecision(decision: Decision): string {
-  return decision.kind === "hold"
-    ? `${decision.agent} -> (left as is)`
-    : `${decision.agent} -> ${decision.model}`;
+  if (decision.kind === "hold") return `${decision.agent} -> (left as is)`;
+  const thinking = decision.thinking === undefined ? "" : ` (thinking: ${decision.thinking})`;
+  return `${decision.agent} -> ${decision.model}${thinking}`;
 }
 
 /**
@@ -1270,7 +1374,7 @@ export function createDispatcher(
         outcome:
           decision.kind === "hold"
             ? ("held" as const)
-            : await applyDecision(decision.file, decision.model, dry),
+            : await applyDecision(decision.file, decision.model, decision.thinking, dry),
       })),
     );
   }

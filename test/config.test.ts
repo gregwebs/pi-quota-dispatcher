@@ -7,18 +7,22 @@ import { test } from "node:test";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 import {
+  type Candidate,
   type DispatcherConfig,
   type LoadedConfig,
   type MergeLayer,
   type SkipFlag,
+  type ThinkingLevel,
   CONFIG_FILE_NAME,
   DEFAULT_CONFIG,
+  THINKING_LEVELS,
   defaultConfig,
   describeConfig,
   globalConfigPath,
   loadConfig,
   mergeConfig,
   projectConfigPath,
+  thinkingFor,
 } from "../src/config.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
@@ -74,6 +78,7 @@ function base(): DispatcherConfig {
     sessionSwitchAt: 75,
     weeklySwitchAt: 90,
     margin: 10,
+    models: {},
     agents: {
       planner: {
         primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
@@ -1385,6 +1390,30 @@ test("sources never names a value the merged config does not hold", () => {
       layers: [{ source: "project", data: { agents: { planner: { alternates: [null] } } } }],
     },
     {
+      name: "alternate list replaced by a shorter, level-less one",
+      layers: [
+        {
+          source: "global",
+          data: {
+            agents: {
+              planner: {
+                alternates: [
+                  { model: "openai-codex/gpt-6-sol", rail: "codex", thinking: "low" },
+                  { model: "openai-codex/gpt-6-luna", rail: "codex", thinking: "off" },
+                ],
+              },
+            },
+          },
+        },
+        {
+          source: "project",
+          data: {
+            agents: { planner: { alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }] } },
+          },
+        },
+      ],
+    },
+    {
       name: "model of the wrong type",
       layers: [{ source: "project", data: { agents: { planner: { primary: { model: 123 } } } } }],
     },
@@ -1449,4 +1478,270 @@ test("the value a rejected override leaves standing keeps its real source in des
   assert.ok(line.includes("claude-bridge/claude-opus-5-6"), line);
   assert.ok(line.includes("[global]"), line);
   assert.ok(!line.includes("[built-in]"), line);
+});
+
+// ---------------------------------------------------------------- thinking
+
+/**
+ * A base with a level stated at each of the five places one can be stated, so
+ * that the precedence and merge tests have something at every rung. Separate
+ * from `base()` because most tests assert whole-config equality against it.
+ */
+function thinkingBase(): DispatcherConfig {
+  return {
+    ...base(),
+    models: {
+      "claude-bridge/claude-opus-5-5": { thinking: "low" },
+      "openai-codex/gpt-6-sol": { thinking: "minimal" },
+    },
+    agents: {
+      ...base().agents,
+      planner: {
+        thinking: "medium",
+        primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude", thinking: "xhigh" },
+        // The level lives here rather than on `base()`'s alternate, so the "a
+        // list replacement keeps nothing from the old list" assertions have a
+        // real level to lose.
+        alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex", thinking: "minimal" }],
+      },
+    },
+  };
+}
+
+test("a level can be stated on a model, a route and a candidate, each with provenance", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "global",
+      data: {
+        models: { "claude-bridge/claude-opus-5-5": { thinking: "low" } },
+        agents: {
+          planner: {
+            thinking: "medium",
+            primary: { thinking: "xhigh" },
+            alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex", thinking: "off" }],
+          },
+        },
+      },
+    },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.config.models["claude-bridge/claude-opus-5-5"].thinking, "low");
+  assert.equal(r.sources["models.claude-bridge/claude-opus-5-5.thinking"], "global");
+  assert.equal(r.config.agents.planner.thinking, "medium");
+  assert.equal(r.sources["agents.planner.thinking"], "global");
+  assert.equal(r.config.agents.planner.primary.thinking, "xhigh");
+  assert.equal(r.sources["agents.planner.primary.thinking"], "global");
+  assert.equal(r.config.agents.planner.alternates[0].thinking, "off");
+  assert.equal(r.sources["agents.planner.alternates[0].thinking"], "global");
+
+  // A candidate nothing said anything about gains no key at all: "no level" is
+  // the absence of a value, not a value of `undefined`.
+  assert.equal(Object.hasOwn(r.config.agents.reviewer.primary, "thinking"), false);
+  assert.equal(Object.hasOwn(r.sources, "agents.reviewer.primary.thinking"), false);
+});
+
+test("mergeConfig carries a base level through, marked built-in", () => {
+  const r = mergeConfig(thinkingBase(), []);
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.sources["models.claude-bridge/claude-opus-5-5.thinking"], "built-in");
+  assert.equal(r.sources["agents.planner.thinking"], "built-in");
+  assert.equal(r.sources["agents.planner.primary.thinking"], "built-in");
+});
+
+test("a layer that changes only a model keeps the base level beneath it", () => {
+  const r = mergeConfig(thinkingBase(), [
+    { source: "project", data: { agents: { planner: { primary: { model: "claude-bridge/claude-opus-5-6" } } } } },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  // `primary` merges field-wise, so the level survives a move to another model
+  // on the same route — and it is still the base layer that supplied it.
+  assert.equal(r.config.agents.planner.primary.thinking, "xhigh");
+  assert.equal(r.sources["agents.planner.primary.thinking"], "built-in");
+  assert.equal(r.config.agents.planner.thinking, "medium");
+});
+
+test("a route's thinking is replaced whole by the highest layer that states one", () => {
+  const r = mergeConfig(thinkingBase(), [
+    { source: "project", data: { agents: { planner: { thinking: "max" } } } },
+  ]);
+  assert.equal(r.config.agents.planner.thinking, "max");
+  assert.equal(r.sources["agents.planner.thinking"], "project");
+});
+
+test("a level on the old list does not survive its replacement", () => {
+  const r = mergeConfig(thinkingBase(), [
+    {
+      source: "project",
+      data: { agents: { planner: { alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }] } } },
+    },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.equal(Object.hasOwn(r.config.agents.planner.alternates[0], "thinking"), false);
+  // The source goes with the value: the old element's level is no longer
+  // something the effective config holds, so provenance may not name it.
+  assert.equal(Object.hasOwn(r.sources, "agents.planner.alternates[0].thinking"), false);
+  // The new element's own fields are present and attributed to the new layer.
+  assert.equal(r.config.agents.planner.alternates[0].model, "openai-codex/gpt-6-sol");
+  assert.equal(r.sources["agents.planner.alternates[0].model"], "project");
+});
+
+test("a shorter replacement list clears the thinking provenance of the index it drops", () => {
+  const twoLevels: DispatcherConfig = {
+    ...base(),
+    agents: {
+      ...base().agents,
+      planner: {
+        primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+        alternates: [
+          { model: "openai-codex/gpt-6-sol", rail: "codex", thinking: "low" },
+          { model: "openai-codex/gpt-6-luna", rail: "codex", thinking: "off" },
+        ],
+      },
+    },
+  };
+  const r = mergeConfig(twoLevels, [
+    {
+      source: "project",
+      data: { agents: { planner: { alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }] } } },
+    },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.config.agents.planner.alternates.length, 1);
+  assert.deepEqual(
+    Object.keys(r.sources)
+      .filter((key) => key.startsWith("agents.planner.alternates[1]"))
+      .sort(),
+    [],
+    "the dropped index must carry no provenance at all",
+  );
+  assert.equal(Object.hasOwn(r.sources, "agents.planner.alternates[0].thinking"), false);
+});
+
+test("a mistyped level warns and leaves the lower layer's level standing", () => {
+  const route = mergeConfig(thinkingBase(), [
+    { source: "project", data: { agents: { planner: { thinking: "hgih" } } } },
+  ]);
+  assert.equal(route.config.agents.planner.thinking, "medium");
+  assert.equal(route.sources["agents.planner.thinking"], "built-in");
+  assert.ok(
+    route.warnings.some((w) => w.includes('"agents.planner.thinking" must be one of')),
+    route.warnings.join("\n"),
+  );
+
+  const candidate = mergeConfig(thinkingBase(), [
+    { source: "project", data: { agents: { planner: { primary: { thinking: "hgih" } } } } },
+  ]);
+  assert.equal(candidate.config.agents.planner.primary.thinking, "xhigh");
+  assert.equal(candidate.sources["agents.planner.primary.thinking"], "built-in");
+  assert.ok(
+    candidate.warnings.some((w) => w.includes('"agents.planner.primary.thinking" must be one of')),
+    candidate.warnings.join("\n"),
+  );
+});
+
+test("the rejection names every level pi accepts", () => {
+  const r = mergeConfig(base(), [
+    { source: "project", data: { agents: { planner: { thinking: "hgih" } } } },
+  ]);
+  const warning = r.warnings.find((w) => w.includes("agents.planner.thinking"));
+  assert.ok(warning, r.warnings.join("\n"));
+  for (const level of THINKING_LEVELS) assert.ok(warning.includes(`"${level}"`), warning);
+});
+
+test("the models table rejects a shapeless key, a shapeless entry and an unknown key", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: {
+        models: {
+          "gpt-6-sol": { thinking: "low" },
+          "openai-codex/gpt-6-sol": "low",
+          "openai-codex/gpt-6-luna": { thinkng: "low" },
+        },
+      },
+    },
+  ]);
+  const text = r.warnings.join("\n");
+  assert.ok(text.includes('model "gpt-6-sol" is not a provider/model id'), text);
+  assert.ok(text.includes('model "openai-codex/gpt-6-sol" must be an object'), text);
+  assert.ok(text.includes('unknown key "models.openai-codex/gpt-6-luna.thinkng"'), text);
+  assert.deepEqual(r.config.models, {});
+  assert.deepEqual(Object.keys(r.sources).filter((k) => k.startsWith("models.")), []);
+});
+
+test("a models entry that is not an object warns without taking the table down", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "global",
+      data: { models: { "claude-bridge/claude-opus-5-5": { thinking: "low" } } },
+    },
+    { source: "project", data: { models: { "openai-codex/gpt-6-sol": 7 } } },
+  ]);
+  assert.ok(r.warnings.some((w) => w.includes('model "openai-codex/gpt-6-sol" must be an object')));
+  // The entry a lower layer supplied is untouched: a bad value never removes a
+  // valid one.
+  assert.equal(r.config.models["claude-bridge/claude-opus-5-5"].thinking, "low");
+});
+
+test("a bad model key in a programmatic base is dropped with a built-in warning", () => {
+  const bad: DispatcherConfig = { ...base(), models: { "gpt-6-sol": { thinking: "low" } } };
+  const r = mergeConfig(bad, []);
+  assert.ok(r.warnings.some((w) => w.startsWith("built-in: ") && w.includes("gpt-6-sol")), r.warnings.join("\n"));
+  assert.deepEqual(r.config.models, {});
+});
+
+test("thinkingFor prefers the candidate, then the route, then the model", () => {
+  const cfg: DispatcherConfig = { ...base(), models: { "claude-bridge/claude-opus-5-5": { thinking: "low" } } };
+  const primary: Candidate = { model: "claude-bridge/claude-opus-5-5", rail: "claude" };
+  const unmodelled: Candidate = { model: "deepseek/deepseek-flash", rail: "deepseek" };
+  const route = (thinking?: ThinkingLevel) => ({
+    ...(thinking !== undefined ? { thinking } : {}),
+    primary,
+    alternates: [],
+  });
+
+  assert.equal(thinkingFor(cfg, route("medium"), { ...primary, thinking: "xhigh" }), "xhigh");
+  assert.equal(thinkingFor(cfg, route("medium"), primary), "medium");
+  assert.equal(thinkingFor(cfg, route(), primary), "low");
+  // Nothing states one for this model, so the honest answer is "no opinion".
+  assert.equal(thinkingFor(cfg, route("medium"), unmodelled), "medium");
+  assert.equal(thinkingFor(cfg, route(), unmodelled), undefined);
+});
+
+test("describeConfig renders a level only where something states one", async () => {
+  const fs = fakeFs({
+    [GLOBAL_PATH]: JSON.stringify({
+      models: { "openai-codex/gpt-6-sol": { thinking: "low" } },
+      agents: {
+        planner: {
+          thinking: "medium",
+          primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude", thinking: "xhigh" },
+        },
+      },
+    }),
+  });
+  const loaded = await loadConfig({
+    agentDir: AGENT_DIR,
+    cwd: CWD,
+    readFile: fs.readFile,
+    warn: () => {},
+    fileExists: () => true,
+  });
+
+  const lines = describeConfig(loaded);
+  assert.ok(lines.includes("  models.openai-codex/gpt-6-sol.thinking = low  [global]"), lines.join("\n"));
+  assert.ok(lines.includes("  agents.planner.thinking = medium  [global]"), lines.join("\n"));
+  assert.ok(lines.includes("  agents.planner.primary.thinking = xhigh  [global]"), lines.join("\n"));
+  // reviewer kept the base candidates, none of which states a level.
+  assert.ok(!lines.some((l) => l.includes("agents.reviewer.primary.thinking")), lines.join("\n"));
+  assert.ok(!lines.some((l) => l.includes("agents.planner.alternates[0].thinking")), lines.join("\n"));
+  // The model line comes before the agent block, because routes read it.
+  assert.ok(lines.indexOf("  models.openai-codex/gpt-6-sol.thinking = low  [global]") < lines.indexOf("  agents.planner.thinking = medium  [global]"));
+});
+
+test("describeConfig marks a base level built-in", () => {
+  const r = mergeConfig(thinkingBase(), []);
+  const lines = describeConfig({ config: r.config, files: [], sources: r.sources, warnings: r.warnings });
+  assert.ok(lines.includes("  agents.planner.primary.thinking = xhigh  [built-in]"), lines.join("\n"));
+  assert.ok(lines.includes("  models.claude-bridge/claude-opus-5-5.thinking = low  [built-in]"), lines.join("\n"));
 });
