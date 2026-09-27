@@ -185,8 +185,12 @@ const AGENT_NAME = /^[a-z][a-z0-9-]*$/;
  * The rejection is a whole sentence so the layer loop and the base clone can
  * report the same thing; the caller supplies the prefix (`built-in:` for the
  * base).
+ *
+ * Exported because the startup snippet proposes agent names, and a name it
+ * proposes has to be one the loader would accept — otherwise the "paste-ready"
+ * table warns the moment it is pasted.
  */
-function agentNameRejection(name: string): string | undefined {
+export function agentNameRejection(name: string): string | undefined {
   if (!AGENT_NAME.test(name)) {
     return `agent "${name}" is not a valid agent name (lowercase letters, digits and dashes, starting with a letter)`;
   }
@@ -208,8 +212,12 @@ function isRail(value: unknown): value is Rail {
 /**
  * The rail a model's prefix implies, or `undefined` for a prefix we do not
  * recognise. An unknown prefix is not evidence of a mistake, so it never warns.
+ *
+ * Exported because the startup snippet derives each candidate's `rail` from the
+ * model an agent file already declares, and a second copy of these prefixes
+ * would be free to drift from the one the loader validates against.
  */
-function railFromModel(model: string): Rail | undefined {
+export function railFromModel(model: string): Rail | undefined {
   if (model.startsWith("claude-bridge/") || model.startsWith("anthropic/")) return "claude";
   if (model.startsWith("openai-codex/")) return "codex";
   if (model.startsWith("deepseek/")) return "deepseek";

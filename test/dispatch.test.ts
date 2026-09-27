@@ -12,9 +12,11 @@ import {
   type RailState,
   type RailWindow,
   DEFAULT_CONFIG,
+  applyDecision,
   budgetUsed,
   createDispatcher,
   decide,
+  describeDecisionLines,
   parseClaudeUsage,
   parseCodexUsage,
   upsertModel,
@@ -136,6 +138,195 @@ test("upsertModel inserts a model line when only commented ones exist", () => {
 test("upsertModel returns null without usable frontmatter", () => {
   assert.equal(upsertModel("no frontmatter here", "a/b"), null);
   assert.equal(upsertModel("---\nname: x\n", "a/b"), null);
+});
+
+// The formatting of a model that already names the target is not a reason to
+// rewrite the file. `applyDecision` keys `unchanged` off byte equality, so a
+// quoted `model:` line and a bare one both have to compare equal to the target.
+test("upsertModel treats a matching model as no change, quoting aside", () => {
+  const quoted = `---\nname: x\nmodel: "claude-bridge/claude-opus-5-5"\n---\n`;
+  assert.equal(upsertModel(quoted, "claude-bridge/claude-opus-5-5"), quoted);
+
+  const bare = `---\nname: x\nmodel: claude-bridge/claude-opus-5-5\n---\n`;
+  assert.equal(upsertModel(bare, "claude-bridge/claude-opus-5-5"), bare);
+
+  // Single quotes are a YAML-legal way to write the same value, so they name
+  // the same model and must not force a rewrite either.
+  const single = `---\nname: x\nmodel: 'claude-bridge/claude-opus-5-5'\n---\n`;
+  assert.equal(upsertModel(single, "claude-bridge/claude-opus-5-5"), single);
+});
+
+// The model is compared as *decoded*, so every YAML spelling of the same id — a
+// trailing comment, a JSON `\/` escape — is a no-op rather than a rewrite.
+test("upsertModel decodes a comment or an escape before comparing", () => {
+  for (const line of [
+    `model: claude-bridge/claude-opus-5-5`,
+    `model: "claude-bridge/claude-opus-5-5"`,
+    `model: 'claude-bridge/claude-opus-5-5'`,
+    `model: claude-bridge/claude-opus-5-5 # moved here`,
+    `model: "claude-bridge/claude-opus-5-5" # moved here`,
+    `model: "claude-bridge\\/claude-opus-5-5"`,
+  ]) {
+    const src = `---\nname: x\n${line}\n---\n`;
+    assert.equal(upsertModel(src, "claude-bridge/claude-opus-5-5"), src, `must be unchanged: ${line}`);
+  }
+});
+
+// An ambiguous value is not evidence the file already points at the target, so
+// it is rewritten rather than assumed equal.
+test("upsertModel rewrites a model line it cannot decode", () => {
+  for (const line of [
+    `model: "claude-bridge/claude-opus-5-5`, // unterminated quote
+    `model: "claude-bridge\\q/x"`, // an escape JSON rejects
+  ]) {
+    const src = `---\nname: x\n${line}\n---\n`;
+    const out = upsertModel(src, "claude-bridge/claude-opus-5-5");
+    assert.notEqual(out, src, `must be rewritten: ${line}`);
+    assert.match(out ?? "", /^model: "claude-bridge\/claude-opus-5-5"$/m, line);
+  }
+});
+
+// A `#` opens a comment only at line start or after whitespace, so one inside a
+// model id is part of the value rather than the start of a comment.
+test("upsertModel only strips a # that starts a comment", () => {
+  const hashId = `---\nname: x\nmodel: weird/a#b\n---\n`;
+  assert.equal(upsertModel(hashId, "weird/a#b"), hashId, "a#b is the whole value");
+
+  const commented = `---\nname: x\nmodel: weird/a #b\n---\n`;
+  assert.notEqual(upsertModel(commented, "weird/a#b"), commented, "a space before # starts a comment");
+});
+
+test("upsertModel still rewrites when the active model differs", () => {
+  const src = `---\nname: x\nmodel: "claude-bridge/claude-opus-5-5"\n---\n`;
+  const out = upsertModel(src, "openai-codex/gpt-6-sol");
+  assert.ok(out);
+  assert.match(out, /^model: "openai-codex\/gpt-6-sol"$/m);
+  assert.notEqual(out, src);
+});
+
+test("upsertModel still inserts a model line when there is none", () => {
+  const src = `---\nname: x\nthinking: high\n---\n`;
+  const out = upsertModel(src, "openai-codex/gpt-6-sol");
+  assert.ok(out);
+  assert.match(out, /^model: "openai-codex\/gpt-6-sol"$/m);
+});
+
+test("applyDecision reports unchanged, and writes nothing, when only the quoting differs", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pqd-unchanged-"));
+  const file = join(dir, "agent.md");
+  // The active line is quoted; the target is bare. They name the same model, so
+  // the difference is punctuation only and the file must be left alone.
+  const src = `---\nname: agent\nmodel: 'claude-bridge/claude-opus-5-5'\n---\n\nBody.\n`;
+  await writeFile(file, src, "utf8");
+
+  assert.equal(await applyDecision(file, "claude-bridge/claude-opus-5-5", false), "unchanged");
+  assert.equal(await readFile(file, "utf8"), src, "an unchanged pass must not touch the file");
+});
+
+// The same decoding runs through `applyDecision`, so a commented line the
+// policy already agrees with is left byte-for-byte alone.
+test("applyDecision leaves a commented model line alone", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pqd-unchanged-"));
+  const file = join(dir, "agent.md");
+  const src = `---\nname: agent\nmodel: claude-bridge/claude-opus-5-5 # pinned\n---\n\nBody.\n`;
+  await writeFile(file, src, "utf8");
+
+  assert.equal(await applyDecision(file, "claude-bridge/claude-opus-5-5", false), "unchanged");
+  assert.equal(await readFile(file, "utf8"), src, "a commented line already naming the model must not change");
+});
+
+test("applyDecision reports would-write on a dry run when the model differs", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pqd-unchanged-"));
+  const file = join(dir, "agent.md");
+  const src = `---\nname: agent\nmodel: "claude-bridge/claude-opus-5-5"\n---\n\nBody.\n`;
+  await writeFile(file, src, "utf8");
+
+  assert.equal(await applyDecision(file, "openai-codex/gpt-6-sol", true), "would-write");
+  assert.equal(await readFile(file, "utf8"), src);
+});
+
+// ---------------------------------------------------------------- decision rendering
+
+// The acceptance criterion for multi-alternate routes is about substance, not
+// layout: every candidate that was passed over is named, and the reason it lost
+// its place survives. The renderer is free to wrap or to put one candidate per
+// line, so this asserts nothing was dropped rather than a line count.
+test("describeDecisionLines drops no passed-over candidate or reason", () => {
+  const decision: Decision = {
+    agent: "planner",
+    file: "/a/planner.md",
+    kind: "assign",
+    model: "openai-codex/gpt-6-sol",
+    why: [
+      "claude session 90% >= 75%, choosing openai-codex/gpt-6-sol on codex",
+      "rejected deepseek/deepseek-flash on deepseek (weekly 100% is itself tight)",
+      "openai-codex/gpt-5.6-luna on codex not consulted (lower priority than the winner)",
+    ].join("\n"),
+  };
+
+  const lines = describeDecisionLines(decision, "unchanged");
+  const text = lines.join("\n");
+
+  assert.ok(lines[0].includes("[unchanged]"), lines[0]);
+  assert.ok(lines[0].includes("openai-codex/gpt-6-sol"), lines[0]);
+
+  // Each rejected/never-consulted candidate, and why it lost its place.
+  assert.ok(text.includes("deepseek/deepseek-flash"), text);
+  assert.ok(text.includes("weekly 100% is itself tight"), text);
+  assert.ok(text.includes("gpt-5.6-luna"), text);
+  assert.ok(text.includes("not consulted"), text);
+});
+
+test("describeDecisionLines renders a hold as a headline plus its reasoning", () => {
+  const decision: Decision = {
+    agent: "planner",
+    file: "/a/planner.md",
+    kind: "hold",
+    why: "claude unreadable (HTTP 401) — holding",
+  };
+
+  const lines = describeDecisionLines(decision, "held");
+  const text = lines.join("\n");
+
+  assert.ok(lines[0].includes("[held]"), lines[0]);
+  assert.ok(text.includes("unreadable"), text);
+});
+
+// The shape the issue asked for end to end: the winner stays on the headline
+// line, and every candidate the walk passed over gets its own line. The
+// substance test above cannot catch this — it is handed a hand-built `why` — so
+// this drives a real `decide` through the renderer, where `withNotes` is what
+// puts the candidates on separate lines.
+test("a real multi-alternate decision puts each passed-over candidate on its own line", () => {
+  const route: AgentRoute = {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [
+      { model: "openai-codex/gpt-6-sol", rail: "codex" },
+      { model: "openai-codex/gpt-5.6-luna", rail: "codex" },
+      { model: "deepseek/deepseek-flash", rail: "deepseek" },
+    ],
+  };
+  const decided = decide(
+    "planner",
+    route,
+    railMap(
+      railState("claude", { session: 90, weekly: 0 }),
+      railState("codex", { session: 20, weekly: 0 }),
+      railState("deepseek", { session: 0, weekly: 0 }),
+    ),
+    cfg,
+  );
+  assert.equal(assignedModel(decided), "openai-codex/gpt-6-sol");
+
+  const lines = describeDecisionLines(decided, "written");
+  const headline = lines[0];
+  assert.ok(headline.includes("openai-codex/gpt-6-sol"), headline);
+
+  for (const passedOver of ["gpt-5.6-luna", "deepseek/deepseek-flash"]) {
+    const on = lines.filter((l) => l.includes(passedOver));
+    assert.equal(on.length, 1, `expected one line naming ${passedOver}:\n${lines.join("\n")}`);
+    assert.notEqual(on[0], headline, `${passedOver} belongs on its own line, not the headline`);
+  }
 });
 
 // ---------------------------------------------------------------- policy
@@ -479,6 +670,58 @@ test("an unreadable alternate earlier in order than a usable one holds instead",
   );
   assert.equal(d.kind, "hold");
   assert.ok(d.why.includes("codex"), d.why);
+});
+
+// Two alternates can share a rail. A missing reading must name each model, or
+// "codex unreadable" twice would not say which candidate went unread.
+test("a hold names both models when two alternates share a rail", () => {
+  const route: AgentRoute = {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [
+      { model: "openai-codex/gpt-6-sol", rail: "codex" },
+      { model: "openai-codex/gpt-5.6-luna", rail: "codex" },
+    ],
+  };
+  const d = decide(
+    "planner",
+    route,
+    railMap(
+      railState("claude", { session: 90, weekly: 0 }),
+      railState("codex", { ok: false, note: "HTTP 500" }),
+    ),
+    cfg,
+  );
+  assert.equal(d.kind, "hold");
+  assert.ok(d.why.includes("openai-codex/gpt-6-sol"), d.why);
+  assert.ok(d.why.includes("openai-codex/gpt-5.6-luna"), d.why);
+});
+
+// A hold is still a walk report: candidates after the provisional winner were
+// passed over too, and dropping them would hide why the hold did not choose one
+// of them.
+test("a hold still names the candidates after the provisional winner", () => {
+  const route: AgentRoute = {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [
+      { model: "openai-codex/gpt-6-sol", rail: "codex" }, // unreadable, ahead of the winner
+      { model: "deepseek/deepseek-flash", rail: "deepseek" }, // the provisional winner
+      { model: "deepseek/deepseek-r1", rail: "deepseek" }, // never consulted
+    ],
+  };
+  const d = decide(
+    "planner",
+    route,
+    railMap(
+      railState("claude", { session: 90, weekly: 0 }),
+      railState("codex", { ok: false, note: "HTTP 500" }),
+      railState("deepseek", { session: 0, weekly: 0 }),
+    ),
+    cfg,
+  );
+  assert.equal(d.kind, "hold");
+  assert.ok(d.why.includes("openai-codex/gpt-6-sol"), d.why);
+  assert.ok(d.why.includes("deepseek/deepseek-r1"), d.why);
+  assert.match(d.why, /not consulted/, d.why);
 });
 
 // The asymmetry that makes the rule a rule: an unreadable alternate *later* in

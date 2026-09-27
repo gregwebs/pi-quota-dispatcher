@@ -24,12 +24,33 @@ interface Fixture {
 }
 
 /**
+ * The routes the command fixture names. `planner` is claude-primary, so a tight
+ * claude session moves it to its codex alternate. `reviewer` is configured but
+ * deliberately has no file, so it must be reported as skipped rather than crash.
+ */
+const CONFIGURED_AGENTS = {
+  planner: {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
+  },
+  reviewer: {
+    primary: { model: "openai-codex/gpt-6-astra", rail: "codex" },
+    alternates: [{ model: "claude-bridge/claude-opus-5-5", rail: "claude" }],
+  },
+};
+
+/**
  * A self-contained project: a relocated agent dir (so nothing reads the
  * developer's real `~/.pi/agent`) and a project dir to `chdir` into. The global
  * config pins `claudeCredsPath` at a fixture file and lifts `pollMs` to the
- * timer maximum so the background poll never fires during the test.
+ * timer maximum so the background poll never fires during the test. The
+ * `agents` table defaults to the names the command tests route; passing `{}`
+ * makes an unconfigured install.
  */
-async function fixture(pollMs = 2_147_483_647): Promise<Fixture> {
+async function fixture(
+  pollMs = 2_147_483_647,
+  agents: Record<string, unknown> = CONFIGURED_AGENTS,
+): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "pqd-cmd-"));
   const agentDir = join(root, "agent");
   const projectDir = join(root, "project");
@@ -51,24 +72,12 @@ async function fixture(pollMs = 2_147_483_647): Promise<Fixture> {
   );
 
   // The shipped config names no agents, so the fixture has to name them itself.
-  // planner is claude-primary, so a tight claude session moves it to its codex
-  // alternate. reviewer is configured but deliberately has no file, so it must
-  // be reported as skipped rather than crash.
   await writeFile(
     join(agentDir, CONFIG_FILE_NAME),
     JSON.stringify({
       claudeCredsPath,
       pollMs,
-      agents: {
-        planner: {
-          primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
-          alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
-        },
-        reviewer: {
-          primary: { model: "openai-codex/gpt-6-astra", rail: "codex" },
-          alternates: [{ model: "claude-bridge/claude-opus-5-5", rail: "claude" }],
-        },
-      },
+      agents,
     }),
     "utf8",
   );
@@ -131,17 +140,23 @@ function stubFetch(overrides: Partial<RailReadings> = {}): typeof fetch {
   }) as unknown as typeof fetch;
 }
 
-type CommandHandler = (
-  args: string,
-  ctx: { ui: { notify: (text: string) => void } },
-) => Promise<void>;
+interface Ui {
+  notify: (text: string, level?: string) => void;
+  setStatus: (key: string, text?: string) => void;
+}
+
+type CommandHandler = (args: string, ctx: { hasUI: boolean; ui: Ui }) => Promise<void>;
+type EventHandler = (event: { reason: string }, ctx: { hasUI: boolean; ui: Ui }) => Promise<void>;
 
 /** What a test can drive once the extension is installed. */
 interface Harness {
   /** Run the `quota-dispatch` command and return the text it notified. */
   run: (args: string) => Promise<string>;
   /** Fire the `session_start` handler the extension registered. */
-  sessionStart: () => Promise<void>;
+  sessionStart: (reason?: string) => Promise<void>;
+  /** Everything the extension pushed to the UI, in order. */
+  notifications: Array<{ text: string; level: string }>;
+  statuses: Array<{ key: string; text: string | undefined }>;
 }
 
 /**
@@ -153,6 +168,7 @@ async function withExtension(
   fx: Fixture,
   body: (h: Harness) => Promise<void>,
   fetchFactory: () => typeof fetch = stubFetch,
+  opts: { hasUI?: boolean } = {},
 ): Promise<void> {
   const previousEnv = process.env[ENV_AGENT_DIR];
   const previousCwd = process.cwd();
@@ -162,15 +178,25 @@ async function withExtension(
   process.chdir(fx.projectDir);
   globalThis.fetch = fetchFactory();
 
-  const notifications: string[] = [];
-  const eventHandlers: Record<string, () => Promise<void>> = {};
+  const hasUI = opts.hasUI ?? true;
+  const notifications: Array<{ text: string; level: string }> = [];
+  const statuses: Array<{ key: string; text: string | undefined }> = [];
+  const eventHandlers: Record<string, EventHandler> = {};
   let command: CommandHandler | undefined;
+
+  const makeCtx = (): { hasUI: boolean; ui: Ui } => ({
+    hasUI,
+    ui: {
+      notify: (text: string, level?: string) => notifications.push({ text, level: level ?? "" }),
+      setStatus: (key: string, text?: string) => statuses.push({ key, text }),
+    },
+  });
 
   const api = {
     registerCommand: (_name: string, spec: { handler: CommandHandler }) => {
       command = spec.handler;
     },
-    on: (event: string, handler: () => Promise<void>) => {
+    on: (event: string, handler: EventHandler) => {
       eventHandlers[event] = handler;
     },
   } as unknown as ExtensionAPI;
@@ -181,20 +207,22 @@ async function withExtension(
     assert.ok(handler, "the extension must register the quota-dispatch command");
 
     const harness: Harness = {
+      notifications,
+      statuses,
       run: async (args: string) => {
         notifications.length = 0;
-        await handler(args, { ui: { notify: (text: string) => notifications.push(text) } });
+        await handler(args, makeCtx());
         assert.equal(notifications.length, 1, "the command should notify exactly once");
-        return notifications[0];
+        return notifications[0].text;
       },
-      sessionStart: async () => {
-        await eventHandlers.session_start?.();
+      sessionStart: async (reason = "startup") => {
+        await eventHandlers.session_start?.({ reason }, makeCtx());
       },
     };
 
     await body(harness);
   } finally {
-    await eventHandlers.session_shutdown?.();
+    await eventHandlers.session_shutdown?.({ reason: "shutdown" }, makeCtx());
     globalThis.fetch = previousFetch;
     if (previousEnv === undefined) delete process.env[ENV_AGENT_DIR];
     else process.env[ENV_AGENT_DIR] = previousEnv;
@@ -295,6 +323,33 @@ test("session_start leaves a file alone when no switch is due", async () => {
 
   assert.equal(await readFile(fx.plannerFile, "utf8"), before, "no switch is due, so nothing may change");
 });
+
+/**
+ * The reason gates the fresh-install *ask*, not the dispatcher. A configured
+ * install evaluates and writes on every reason, including the two the ask stays
+ * silent on.
+ */
+for (const reason of ["resume", "fork"]) {
+  test(`a configured session_start still writes on ${reason}`, async () => {
+    const fx = await fixture();
+    // Each reason gets a fresh file on the primary, so an inert handler cannot
+    // pass by observing the model a previous reason already wrote.
+    assert.match(
+      await readFile(fx.plannerFile, "utf8"),
+      /claude-opus-5-5/,
+      "the fixture must start on the primary",
+    );
+
+    await withExtension(fx, async ({ sessionStart }) => {
+      await sessionStart(reason);
+      assert.match(
+        await readFile(fx.plannerFile, "utf8"),
+        /^model: "openai-codex\/gpt-6-sol"$/m,
+        `session_start(${reason}) must still evaluate and write`,
+      );
+    });
+  });
+}
 
 // ---------------------------------------------------------------- cache and refresh
 
@@ -423,4 +478,76 @@ test("the poll timer leaves files alone when no switch is due", async (t) => {
   );
 
   assert.equal(await readFile(fx.plannerFile, "utf8"), PRIMARY, "no switch is due, so nothing may change");
+});
+
+// ---------------------------------------------------------------- unmanaged files
+
+/**
+ * A configured install still has agent files it does not route. `scribe.md` is
+ * a real file no route names, so `/quota-dispatch` has to say so — otherwise a
+ * user cannot tell the file exists, or that it is deliberately untouched.
+ */
+test("the read-only forms report the files no route names", async () => {
+  const fx = await fixture();
+  await writeFile(join(fx.agentDir, "agents", "scribe.md"), TEMPLATE("scribe", "deepseek/deepseek-flash"), "utf8");
+
+  await withExtension(fx, async ({ run }) => {
+    for (const form of ["", "refresh"]) {
+      const text = await run(form);
+      // Scope the assertions to the unmanaged listing itself — its header line is
+      // followed by one `  <name>.md — model: …` line per file. The config dump
+      // further down also names `planner`, so slicing to the end of the text
+      // would report a routed file as unmanaged.
+      const header = "unmanaged agent files";
+      const at = text.indexOf(header);
+      assert.notEqual(at, -1, `${form || "plain"} must have an unmanaged section:\n${text}`);
+      const listed: string[] = [];
+      for (const line of text.slice(at).split("\n").slice(1)) {
+        if (!line.startsWith("  ") || !line.includes(".md")) break;
+        listed.push(line);
+      }
+      assert.ok(listed.some((l) => l.includes("scribe")), `${form || "plain"} must name the unmanaged file:\n${text}`);
+      assert.ok(
+        !listed.some((l) => l.includes("planner")),
+        `${form || "plain"} must not list a routed file as unmanaged:\n${text}`,
+      );
+      assert.ok(text.includes("claude: 5h 90%"), text);
+    }
+  });
+});
+
+/**
+ * `apply` is the one form that writes, and it writes only decisions. Narrating
+ * files it does not manage there would blur "what did it touch?" into a list of
+ * files it did not.
+ */
+test("the apply form does not narrate unmanaged files", async () => {
+  const fx = await fixture();
+  await writeFile(join(fx.agentDir, "agents", "scribe.md"), TEMPLATE("scribe", "deepseek/deepseek-flash"), "utf8");
+
+  await withExtension(fx, async ({ run }) => {
+    const text = await run("apply");
+    assert.ok(text.includes("[applied]"), text);
+    assert.ok(!text.includes("scribe"), `apply must not list unmanaged files:\n${text}`);
+  });
+});
+
+/**
+ * Explicit invocation is a diagnostic, not the install-time ask: even with an
+ * empty table `/quota-dispatch` reads the rails and prints them. It stays
+ * read-only, so the agents it found are not touched.
+ */
+test("an empty table still reports one line per rail and writes nothing", async () => {
+  const fx = await fixture(2_147_483_647, {});
+  const before = await readFile(fx.plannerFile, "utf8");
+
+  await withExtension(fx, async ({ run }) => {
+    const text = await run("");
+    assert.ok(text.includes("claude: 5h 90%"), text);
+    assert.ok(text.includes("codex: 5h 10%"), text);
+    assert.ok(text.includes("deepseek:"), text);
+    assert.ok(!text.includes("[applied]"), text);
+  });
+
+  assert.equal(await readFile(fx.plannerFile, "utf8"), before, "the diagnostic must be read-only");
 });
