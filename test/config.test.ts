@@ -10,6 +10,7 @@ import {
   type DispatcherConfig,
   type LoadedConfig,
   type MergeLayer,
+  type SkipFlag,
   CONFIG_FILE_NAME,
   DEFAULT_CONFIG,
   defaultConfig,
@@ -59,6 +60,9 @@ function fakeFs(files: Record<string, string>): FakeFs {
 /**
  * A fully specified built-in layer, written out by hand so these tests do not
  * depend on `defaultConfig()` agreeing with `mergeConfig()`.
+ *
+ * Each agent route has a non-empty `alternates`, so tests that say "the
+ * previous list stands" have something to stand.
  */
 function base(): DispatcherConfig {
   return {
@@ -70,18 +74,18 @@ function base(): DispatcherConfig {
     sessionSwitchAt: 75,
     weeklySwitchAt: 90,
     margin: 10,
-    routes: {
+    agents: {
       planner: {
         primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
-        alternate: { model: "openai-codex/gpt-6-sol", rail: "codex" },
+        alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
       },
       reviewer: {
         primary: { model: "openai-codex/gpt-6-astra", rail: "codex" },
-        alternate: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+        alternates: [{ model: "claude-bridge/claude-opus-5-5", rail: "claude" }],
       },
       implementer: {
         primary: { model: "deepseek/deepseek-flash", rail: "deepseek" },
-        alternate: { model: "openai-codex/gpt-6-luna", rail: "codex" },
+        alternates: [{ model: "openai-codex/gpt-6-luna", rail: "codex" }],
       },
     },
   };
@@ -109,22 +113,11 @@ test("defaultConfig documents the scalar defaults", () => {
   assert.equal(c.margin, 10);
 });
 
-test("defaultConfig ships the three documented routes and their models", () => {
+// No agent is managed until the configuration names it, so a fresh install
+// manages nothing and edits no file the user has not named.
+test("defaultConfig ships no agents", () => {
   const c = defaultConfig("/opt/pi/agent");
-  assert.deepEqual(c.routes, {
-    planner: {
-      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
-      alternate: { model: "openai-codex/gpt-6-sol", rail: "codex" },
-    },
-    reviewer: {
-      primary: { model: "openai-codex/gpt-6-astra", rail: "codex" },
-      alternate: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
-    },
-    implementer: {
-      primary: { model: "deepseek/deepseek-flash", rail: "deepseek" },
-      alternate: { model: "openai-codex/gpt-6-luna", rail: "codex" },
-    },
-  });
+  assert.deepEqual(c.agents, {});
 });
 
 test("defaultConfig honours PI_CODING_AGENT_DIR at call time", () => {
@@ -165,8 +158,8 @@ test("mergeConfig with no layers returns the base and marks every key built-in",
   assert.deepEqual(r.warnings, []);
   assert.equal(r.sources.sessionSwitchAt, "built-in");
   assert.equal(r.sources.margin, "built-in");
-  assert.equal(r.sources["routes.planner.primary.model"], "built-in");
-  assert.equal(r.sources["routes.reviewer.alternate.rail"], "built-in");
+  assert.equal(r.sources["agents.planner.primary.model"], "built-in");
+  assert.equal(r.sources["agents.reviewer.alternates[0].rail"], "built-in");
 });
 
 test("mergeConfig applies later layers over earlier ones", () => {
@@ -175,7 +168,7 @@ test("mergeConfig applies later layers over earlier ones", () => {
       source: "global",
       data: {
         sessionSwitchAt: 60,
-        routes: { planner: { primary: { model: "claude-bridge/claude-opus-5-6" } } },
+        agents: { planner: { primary: { model: "claude-bridge/claude-opus-5-6" } } },
       },
     },
     { source: "project", data: { sessionSwitchAt: 50 } },
@@ -183,48 +176,335 @@ test("mergeConfig applies later layers over earlier ones", () => {
   assert.deepEqual(r.warnings, []);
   assert.equal(r.config.sessionSwitchAt, 50);
   assert.equal(r.sources.sessionSwitchAt, "project");
-  assert.equal(r.config.routes.planner.primary.model, "claude-bridge/claude-opus-5-6");
-  assert.equal(r.sources["routes.planner.primary.model"], "global");
-  // A candidate that names only `model` keeps the base rail.
-  assert.equal(r.config.routes.planner.primary.rail, "claude");
-  assert.equal(r.sources["routes.planner.primary.rail"], "built-in");
+  assert.equal(r.config.agents.planner.primary.model, "claude-bridge/claude-opus-5-6");
+  assert.equal(r.sources["agents.planner.primary.model"], "global");
+  // A candidate that names only `model` keeps the base rail: `primary` merges
+  // field-wise.
+  assert.equal(r.config.agents.planner.primary.rail, "claude");
+  assert.equal(r.sources["agents.planner.primary.rail"], "built-in");
 });
 
-test("mergeConfig deep-merges per route, leaving unnamed routes and scalars alone", () => {
+test("mergeConfig deep-merges per agent, leaving unnamed agents and scalars alone", () => {
   const r = mergeConfig(base(), [
     {
       source: "project",
-      data: {
-        routes: { implementer: { alternate: { model: "openai-codex/gpt-7", rail: "codex" } } },
-      },
+      data: { agents: { implementer: { primary: { model: "deepseek/deepseek-v3" } } } },
     },
   ]);
   assert.deepEqual(r.warnings, []);
   assert.equal(r.config.sessionSwitchAt, 75);
-  assert.deepEqual(r.config.routes.planner, base().routes.planner);
-  assert.deepEqual(r.config.routes.reviewer, base().routes.reviewer);
-  assert.equal(r.config.routes.implementer.primary.model, "deepseek/deepseek-flash");
-  assert.equal(r.config.routes.implementer.alternate?.model, "openai-codex/gpt-7");
-  assert.equal(r.sources["routes.implementer.alternate.model"], "project");
+  assert.deepEqual(r.config.agents.planner, base().agents.planner);
+  assert.deepEqual(r.config.agents.reviewer, base().agents.reviewer);
+  assert.equal(r.config.agents.implementer.primary.model, "deepseek/deepseek-v3");
+  assert.equal(r.config.agents.implementer.primary.rail, "deepseek");
+  assert.equal(r.sources["agents.implementer.primary.model"], "project");
 });
 
-test("mergeConfig treats null as an eraser for a route", () => {
-  const r = mergeConfig(base(), [{ source: "project", data: { routes: { implementer: null } } }]);
-  assert.equal("implementer" in r.config.routes, false);
-  assert.equal(r.config.routes.planner.primary.model, "claude-bridge/claude-opus-5-5");
+// ------------------------------------------------------ alternates are a list
+
+test("a layer that mentions alternates replaces the whole list", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: {
+        agents: {
+          planner: {
+            alternates: [
+              { model: "deepseek/deepseek-flash", rail: "deepseek" },
+              { model: "openai-codex/gpt-6-astra", rail: "codex" },
+            ],
+          },
+        },
+      },
+    },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.deepEqual(
+    r.config.agents.planner.alternates.map((c) => c.model),
+    ["deepseek/deepseek-flash", "openai-codex/gpt-6-astra"],
+  );
+  assert.equal(r.sources["agents.planner.alternates[0].model"], "project");
+  assert.equal(r.sources["agents.planner.alternates[1].rail"], "project");
+  // `primary` is untouched: only the list was mentioned.
+  assert.deepEqual(r.config.agents.planner.primary, base().agents.planner.primary);
+  assert.equal(r.sources["agents.planner.primary.model"], "built-in");
 });
 
-test("mergeConfig treats null as an eraser for a candidate", () => {
-  const r = mergeConfig(base(), [{ source: "project", data: { routes: { planner: { alternate: null } } } }]);
-  assert.equal(r.config.routes.planner.alternate, undefined);
-  assert.equal(r.config.routes.planner.primary.model, "claude-bridge/claude-opus-5-5");
-});
-
-test("mergeConfig never mutates the base config", () => {
+test("a shorter replacement list drops provenance for the index it no longer has", () => {
   const b = base();
-  const snapshot = structuredClone(b);
-  mergeConfig(b, [{ source: "project", data: { sessionSwitchAt: 1, routes: { planner: null } } }]);
-  assert.deepEqual(b, snapshot);
+  b.agents.planner.alternates = [
+    { model: "openai-codex/gpt-6-sol", rail: "codex" },
+    { model: "deepseek/deepseek-flash", rail: "deepseek" },
+  ];
+  const r = mergeConfig(b, [
+    {
+      source: "project",
+      data: { agents: { planner: { alternates: [{ model: "openai-codex/gpt-6-luna", rail: "codex" }] } } },
+    },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.config.agents.planner.alternates.length, 1);
+  assert.equal(r.sources["agents.planner.alternates[0].model"], "project");
+  assert.equal("agents.planner.alternates[1].model" in r.sources, false);
+});
+
+test("an empty alternates list is accepted and pins the agent to its primary", () => {
+  const r = mergeConfig(base(), [
+    { source: "project", data: { agents: { planner: { alternates: [] } } } },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.deepEqual(r.config.agents.planner.alternates, []);
+  // The primary is left exactly as the lower layer had it.
+  assert.deepEqual(r.config.agents.planner.primary, base().agents.planner.primary);
+});
+
+test("an unusable element rejects the whole alternates list and the previous list stands", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: {
+        agents: {
+          planner: {
+            alternates: [
+              { model: "openai-codex/gpt-6-luna", rail: "codex" },
+              { model: "missing-slash" },
+            ],
+          },
+        },
+      },
+    },
+  ]);
+  assert.ok(r.warnings.length >= 1, r.warnings.join("\n"));
+  assert.deepEqual(r.config.agents.planner.alternates, base().agents.planner.alternates);
+  assert.equal(r.sources["agents.planner.alternates[0].model"], "built-in");
+});
+
+test("a non-array alternates is rejected and the previous list stands", () => {
+  // A lone candidate object is deliberately not shorthand for a one-element
+  // list; `alternates` is a list or it is nothing.
+  const rejected: unknown[] = [
+    { model: "openai-codex/gpt-6-luna", rail: "codex" },
+    "openai-codex/gpt-6-luna",
+    42,
+    { "0": { model: "openai-codex/gpt-6-luna", rail: "codex" } },
+  ];
+  for (const bad of rejected) {
+    const r = mergeConfig(base(), [
+      { source: "project", data: { agents: { planner: { alternates: bad } } } },
+    ]);
+    assert.ok(r.warnings.length >= 1, `${JSON.stringify(bad)}: ${r.warnings.join("\n")}`);
+    assert.deepEqual(
+      r.config.agents.planner.alternates,
+      base().agents.planner.alternates,
+      `${JSON.stringify(bad)}`,
+    );
+    assert.equal(r.sources["agents.planner.alternates[0].model"], "built-in", `${JSON.stringify(bad)}`);
+  }
+});
+
+// ---------------------------------------------------------------- skip flags
+
+// The `disable` / `ignore` matrix. Both are consumed while the layers are
+// folded and never survive into the effective config.
+
+const SKIP_FLAGS: readonly SkipFlag[] = ["disable", "ignore"];
+
+test("disable: true removes the agent whatever lower layers said and records it once", () => {
+  const r = mergeConfig(base(), [
+    { source: "project", data: { agents: { planner: { disable: true } } } },
+  ]);
+  assert.equal("planner" in r.config.agents, false);
+  assert.equal(r.sources["agents.planner"], "project");
+  // The removal is recorded once, and no candidate provenance survives it.
+  assert.deepEqual(
+    Object.keys(r.sources).filter((k) => k.startsWith("agents.planner")),
+    ["agents.planner"],
+  );
+  // Other agents are untouched.
+  assert.deepEqual(r.config.agents.reviewer, base().agents.reviewer);
+});
+
+test("disable: true with nothing to remove removes nothing and records nothing", () => {
+  const r = mergeConfig(base(), [
+    { source: "project", data: { agents: { ghost: { disable: true } } } },
+  ]);
+  assert.equal("ghost" in r.config.agents, false);
+  assert.deepEqual(
+    Object.keys(r.sources).filter((k) => k.startsWith("agents.ghost")),
+    [],
+  );
+  assert.equal(r.warnings.some((w) => w.includes("ghost")), false, r.warnings.join("\n"));
+});
+
+test("a higher layer re-adding a disabled agent clears the removal marker", () => {
+  // Reachable only through a caller-supplied base now that the built-ins ship
+  // no agents, but `mergeConfig` is exported and the invariant is about the
+  // effective config, not about which layer happened to supply the base.
+  const r = mergeConfig(base(), [
+    { source: "global", data: { agents: { planner: { disable: true } } } },
+    {
+      source: "project",
+      data: {
+        agents: {
+          planner: { primary: { model: "deepseek/deepseek-flash", rail: "deepseek" } },
+        },
+      },
+    },
+  ]);
+
+  assert.equal(r.config.agents.planner.primary.model, "deepseek/deepseek-flash");
+  assert.equal(r.sources["agents.planner.primary.model"], "project");
+  assert.deepEqual(r.warnings, []);
+  // The marker is a claim about the effective config, so it must not outlive
+  // the removal it records: an agent that is managed cannot also be reported as
+  // disabled, which is what a stale `agents.planner` key would render.
+  assert.equal("agents.planner" in r.sources, false);
+  const lines = describeConfig({ config: r.config, files: [], sources: r.sources, warnings: r.warnings });
+  assert.equal(
+    lines.some((l) => l.includes("agents.planner = disabled")),
+    false,
+    lines.join("\n"),
+  );
+  assert.ok(
+    lines.some((l) => l.includes("agents.planner.primary.model = deepseek/deepseek-flash")),
+    lines.join("\n"),
+  );
+});
+
+test("ignore: true contributes nothing, warns nothing and is absent from provenance", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: {
+        agents: {
+          planner: {
+            ignore: true,
+            primary: { model: "claude-bridge/claude-opus-5-6" },
+          },
+        },
+      },
+    },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  // The whole entry is skipped, so even its primary does not govern.
+  assert.deepEqual(r.config.agents.planner, base().agents.planner);
+  assert.equal("agents.planner" in r.sources, false);
+  assert.equal(r.sources["agents.planner.primary.model"], "built-in");
+});
+
+test("ignore: true on an agent no lower layer configured leaves it unmanaged", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: {
+        agents: {
+          newbie: {
+            ignore: true,
+            primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+          },
+        },
+      },
+    },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.equal("newbie" in r.config.agents, false);
+});
+
+test("disable and ignore together is legal and ignore wins", () => {
+  const r = mergeConfig(base(), [
+    { source: "project", data: { agents: { planner: { disable: true, ignore: true } } } },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  // ignore governs nothing, so there is nothing for disable to turn off; the
+  // lower layer's route stands uncancelled.
+  assert.deepEqual(r.config.agents.planner, base().agents.planner);
+  assert.equal("agents.planner" in r.sources, false);
+});
+
+test("disable: false alone is a no-op that leaves a lower layer's route standing", () => {
+  const r = mergeConfig(base(), [
+    { source: "project", data: { agents: { planner: { disable: false } } } },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.deepEqual(r.config.agents.planner, base().agents.planner);
+  assert.equal("agents.planner" in r.sources, false);
+});
+
+test("a non-boolean skip flag warns and is treated as absent", () => {
+  for (const flag of SKIP_FLAGS) {
+    for (const bad of ["yes", 1, null, {}, 0]) {
+      const r = mergeConfig(base(), [
+        {
+          source: "project",
+          data: {
+            agents: {
+              planner: {
+                [flag]: bad,
+                primary: { model: "claude-bridge/claude-opus-5-6" },
+              },
+            },
+          },
+        },
+      ]);
+      const label = `${flag}=${JSON.stringify(bad)}`;
+      assert.ok(
+        r.warnings.some((w) => w.includes(flag)),
+        `${label}: ${r.warnings.join("\n")}`,
+      );
+      // Treated as absent, so the rest of the entry still applies.
+      assert.equal(r.config.agents.planner.primary.model, "claude-bridge/claude-opus-5-6", label);
+      assert.equal(r.sources["agents.planner.primary.model"], "project", label);
+    }
+  }
+});
+
+// -------------------------------------------------------------------- null
+
+// `null` is no longer an eraser anywhere. It warns and leaves the previous
+// layer's value standing.
+
+test("a route-level null warns and leaves the previous route standing", () => {
+  const r = mergeConfig(base(), [
+    { source: "project", data: { agents: { implementer: null } } },
+  ]);
+  assert.ok(r.warnings.some((w) => w.includes("implementer")), r.warnings.join("\n"));
+  assert.deepEqual(r.config.agents.implementer, base().agents.implementer);
+  assert.equal(r.sources["agents.implementer.primary.model"], "built-in");
+});
+
+test("a candidate-level null warns and leaves the previous candidate standing", () => {
+  const r = mergeConfig(base(), [
+    { source: "project", data: { agents: { planner: { primary: null } } } },
+  ]);
+  assert.ok(r.warnings.some((w) => w.includes("planner")), r.warnings.join("\n"));
+  assert.deepEqual(r.config.agents.planner, base().agents.planner);
+  assert.equal(r.sources["agents.planner.primary.model"], "built-in");
+});
+
+test("a null inside alternates warns and leaves the whole previous list standing", () => {
+  const r = mergeConfig(base(), [
+    { source: "project", data: { agents: { planner: { alternates: [null] } } } },
+  ]);
+  assert.ok(r.warnings.length >= 1, r.warnings.join("\n"));
+  assert.deepEqual(r.config.agents.planner.alternates, base().agents.planner.alternates);
+  assert.equal(r.sources["agents.planner.alternates[0].model"], "built-in");
+});
+
+// ---------------------------------------------------------------- the routes hint
+
+test('"routes" warns with a rename hint to "agents" and is not an alias', () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: { routes: { planner: { primary: { model: "claude-bridge/claude-opus-5-6" } } } },
+    },
+  ]);
+  assert.ok(
+    r.warnings.some((w) => w.includes("routes") && w.includes("agents")),
+    r.warnings.join("\n"),
+  );
+  // A hint, not an alias: the old spelling changes nothing.
+  assert.deepEqual(r.config.agents, base().agents);
 });
 
 // ---------------------------------------------------------------- validation
@@ -235,11 +515,11 @@ test("mergeConfig warns about an unknown top-level key and ignores it", () => {
   assert.deepEqual(r.config, base());
 });
 
-test("mergeConfig warns about unknown keys inside a route and a candidate", () => {
+test("mergeConfig warns about unknown keys inside an agent and a candidate", () => {
   const r = mergeConfig(base(), [
-    { source: "project", data: { routes: { planner: { bogusRoute: 1, primary: { bogusCandidate: 2 } } } } },
+    { source: "project", data: { agents: { planner: { bogusAgent: 1, primary: { bogusCandidate: 2 } } } } },
   ]);
-  assert.ok(r.warnings.some((w) => w.includes("bogusRoute")), r.warnings.join("\n"));
+  assert.ok(r.warnings.some((w) => w.includes("bogusAgent")), r.warnings.join("\n"));
   assert.ok(r.warnings.some((w) => w.includes("bogusCandidate")), r.warnings.join("\n"));
 });
 
@@ -315,43 +595,50 @@ test("mergeConfig warns on a non-finite number and keeps the previous value", ()
 
 test("mergeConfig warns when a model is not a string or lacks a slash", () => {
   const notString = mergeConfig(base(), [
-    { source: "project", data: { routes: { planner: { primary: { model: 123 } } } } },
+    { source: "project", data: { agents: { planner: { primary: { model: 123 } } } } },
   ]);
-  assert.equal(notString.config.routes.planner.primary.model, "claude-bridge/claude-opus-5-5");
+  assert.equal(notString.config.agents.planner.primary.model, "claude-bridge/claude-opus-5-5");
   assert.ok(notString.warnings.some((w) => w.includes("model")), notString.warnings.join("\n"));
 
   const noSlash = mergeConfig(base(), [
-    { source: "project", data: { routes: { planner: { primary: { model: "gpt-6-sol" } } } } },
+    { source: "project", data: { agents: { planner: { primary: { model: "gpt-6-sol" } } } } },
   ]);
-  assert.equal(noSlash.config.routes.planner.primary.model, "claude-bridge/claude-opus-5-5");
+  assert.equal(noSlash.config.agents.planner.primary.model, "claude-bridge/claude-opus-5-5");
   assert.ok(noSlash.warnings.some((w) => w.includes("model")), noSlash.warnings.join("\n"));
 });
 
 test("mergeConfig warns on an unknown rail and keeps the previous one", () => {
   const r = mergeConfig(base(), [
-    { source: "project", data: { routes: { planner: { primary: { rail: "openai" } } } } },
+    { source: "project", data: { agents: { planner: { primary: { rail: "openai" } } } } },
   ]);
-  assert.equal(r.config.routes.planner.primary.rail, "claude");
+  assert.equal(r.config.agents.planner.primary.rail, "claude");
   assert.ok(r.warnings.some((w) => w.includes("rail")), r.warnings.join("\n"));
 });
 
-test("mergeConfig warns about a route left without a primary and keeps the old route", () => {
-  const r = mergeConfig(base(), [{ source: "project", data: { routes: { planner: { primary: null } } } }]);
+test("mergeConfig rejects a new agent proposed without a primary", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: { agents: { newbie: { alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }] } } },
+    },
+  ]);
+  assert.equal("newbie" in r.config.agents, false);
   assert.ok(r.warnings.some((w) => w.toLowerCase().includes("primary")), r.warnings.join("\n"));
-  // A primary of null is invalid, not deletion: the previous route stands.
-  assert.equal(r.config.routes.planner.primary.model, "claude-bridge/claude-opus-5-5");
-  assert.equal(r.config.routes.planner.alternate?.model, "openai-codex/gpt-6-sol");
+  assert.deepEqual(
+    Object.keys(r.sources).filter((k) => k.startsWith("agents.newbie")),
+    [],
+  );
 });
 
 test("mergeConfig warns but applies a model whose prefix names a different rail", () => {
   const r = mergeConfig(base(), [
     {
       source: "project",
-      data: { routes: { planner: { primary: { model: "openai-codex/gpt-6-sol", rail: "claude" } } } },
+      data: { agents: { planner: { primary: { model: "openai-codex/gpt-6-sol", rail: "claude" } } } },
     },
   ]);
-  assert.equal(r.config.routes.planner.primary.model, "openai-codex/gpt-6-sol");
-  assert.equal(r.config.routes.planner.primary.rail, "claude");
+  assert.equal(r.config.agents.planner.primary.model, "openai-codex/gpt-6-sol");
+  assert.equal(r.config.agents.planner.primary.rail, "claude");
   assert.ok(r.warnings.some((w) => w.toLowerCase().includes("rail")), r.warnings.join("\n"));
 });
 
@@ -359,21 +646,19 @@ test("mergeConfig does not warn when a model's prefix matches its declared rail"
   const r = mergeConfig(base(), [
     {
       source: "project",
-      data: { routes: { planner: { primary: { model: "openai-codex/gpt-6-sol", rail: "codex" } } } },
+      data: { agents: { planner: { primary: { model: "openai-codex/gpt-6-sol", rail: "codex" } } } },
     },
   ]);
   assert.deepEqual(r.warnings, []);
-  assert.equal(r.config.routes.planner.primary.model, "openai-codex/gpt-6-sol");
-  assert.equal(r.config.routes.planner.primary.rail, "codex");
+  assert.equal(r.config.agents.planner.primary.model, "openai-codex/gpt-6-sol");
+  assert.equal(r.config.agents.planner.primary.rail, "codex");
 });
 
-test("mergeConfig accepts the shipped claude-bridge model on the claude rail", () => {
+test("mergeConfig accepts the claude-bridge model on the claude rail", () => {
   const r = mergeConfig(base(), [
     {
       source: "project",
-      data: {
-        routes: { implementer: { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } } },
-      },
+      data: { agents: { implementer: { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } } } },
     },
   ]);
   assert.deepEqual(r.warnings, []);
@@ -420,28 +705,40 @@ test("mergeConfig rejects an agent name that is not a safe filename", () => {
   const r = mergeConfig(base(), [
     {
       source: "project",
-      data: { routes: { "../outside": { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } } } },
+      data: { agents: { "../outside": { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } } } },
     },
   ]);
-  assert.equal("../outside" in r.config.routes, false, "a traversal name must not become a route");
+  assert.equal("../outside" in r.config.agents, false, "a traversal name must not become an agent");
   assert.ok(r.warnings.some((w) => w.includes("../outside")), r.warnings.join("\n"));
-  // The shipped routes are untouched.
-  assert.deepEqual(Object.keys(r.config.routes).sort(), ["implementer", "planner", "reviewer"]);
+  // The base agents are untouched.
+  assert.deepEqual(Object.keys(r.config.agents).sort(), ["implementer", "planner", "reviewer"]);
 });
 
 test("mergeConfig drops a programmatically built base route whose name is unsafe", () => {
   const built = base();
   // A base config does not have to have come from `defaultConfig()`: a caller
   // can hand `mergeConfig` anything, so the base's own keys are validated too.
-  built.routes["../outside"] = { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } };
-  built.routes["constructor"] = { primary: { model: "openai-codex/gpt-6-astra", rail: "codex" } };
-  built.routes["toString"] = { primary: { model: "openai-codex/gpt-6-astra", rail: "codex" } };
-  built.routes["code-reviewer"] = { primary: { model: "deepseek/deepseek-flash", rail: "deepseek" } };
+  built.agents["../outside"] = {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [],
+  };
+  built.agents["constructor"] = {
+    primary: { model: "openai-codex/gpt-6-astra", rail: "codex" },
+    alternates: [],
+  };
+  built.agents["toString"] = {
+    primary: { model: "openai-codex/gpt-6-astra", rail: "codex" },
+    alternates: [],
+  };
+  built.agents["code-reviewer"] = {
+    primary: { model: "deepseek/deepseek-flash", rail: "deepseek" },
+    alternates: [],
+  };
 
   const r = mergeConfig(built, []);
-  assert.equal(Object.hasOwn(r.config.routes, "../outside"), false);
-  assert.equal(Object.hasOwn(r.config.routes, "constructor"), false);
-  assert.equal(Object.hasOwn(r.config.routes, "toString"), false);
+  assert.equal(Object.hasOwn(r.config.agents, "../outside"), false);
+  assert.equal(Object.hasOwn(r.config.agents, "constructor"), false);
+  assert.equal(Object.hasOwn(r.config.agents, "toString"), false);
   assert.ok(
     r.warnings.some((w) => w.startsWith("built-in:") && w.includes("../outside")),
     r.warnings.join("\n"),
@@ -460,20 +757,26 @@ test("mergeConfig drops a programmatically built base route whose name is unsafe
   );
 
   // The control: a legitimate dashed name in the same base is still managed.
-  assert.equal(r.config.routes["code-reviewer"].primary.model, "deepseek/deepseek-flash");
-  assert.equal(r.sources["routes.code-reviewer.primary.model"], "built-in");
+  assert.equal(r.config.agents["code-reviewer"].primary.model, "deepseek/deepseek-flash");
+  assert.equal(r.sources["agents.code-reviewer.primary.model"], "built-in");
 });
 
-test("a layer-level null cannot resurrect a base route with an unsafe name", () => {
+test("a layer-level null on an unsafe base name leaves it absent", () => {
   const built = base();
-  built.routes["../outside"] = { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } };
-  built.routes["constructor"] = { primary: { model: "openai-codex/gpt-6-astra", rail: "codex" } };
+  built.agents["../outside"] = {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [],
+  };
+  built.agents["constructor"] = {
+    primary: { model: "openai-codex/gpt-6-astra", rail: "codex" },
+    alternates: [],
+  };
 
   const r = mergeConfig(built, [
-    { source: "project", data: { routes: { "../outside": null, constructor: null } } },
+    { source: "project", data: { agents: { "../outside": null, constructor: null } } },
   ]);
-  assert.equal(Object.hasOwn(r.config.routes, "../outside"), false);
-  assert.equal(Object.hasOwn(r.config.routes, "constructor"), false);
+  assert.equal(Object.hasOwn(r.config.agents, "../outside"), false);
+  assert.equal(Object.hasOwn(r.config.agents, "constructor"), false);
   assert.ok(r.warnings.some((w) => w.includes("../outside")), r.warnings.join("\n"));
   assert.ok(r.warnings.some((w) => w.includes("constructor")), r.warnings.join("\n"));
 });
@@ -482,11 +785,12 @@ test("mergeConfig accepts a dashed agent name", () => {
   const r = mergeConfig(base(), [
     {
       source: "project",
-      data: { routes: { "agent-2": { primary: { model: "openai-codex/gpt-6-astra", rail: "codex" } } } },
+      data: { agents: { "agent-2": { primary: { model: "openai-codex/gpt-6-astra", rail: "codex" } } } },
     },
   ]);
   assert.deepEqual(r.warnings, []);
-  assert.equal(r.config.routes["agent-2"].primary.model, "openai-codex/gpt-6-astra");
+  assert.equal(r.config.agents["agent-2"].primary.model, "openai-codex/gpt-6-astra");
+  assert.deepEqual(r.config.agents["agent-2"].alternates, []);
 });
 
 test("mergeConfig prefixes warnings with the layer's label, defaulting to its source", () => {
@@ -593,20 +897,59 @@ test("loadConfig lets the project layer win over the global one", async () => {
   assert.equal(loaded.sources.margin, "global");
 });
 
-test("a project override of one agent leaves the others and the scalars intact", async () => {
-  const defaults = defaultConfig(AGENT_DIR);
+test("a project layer can name an agent, leaving the scalars at their defaults", async () => {
   const fs = fakeFs({
     [PROJECT_PATH]: JSON.stringify({
-      routes: { implementer: { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } } },
+      agents: { planner: { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } } },
     }),
   });
-  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
+  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {}, fileExists: () => true });
   assert.deepEqual(loaded.warnings, []);
   assert.equal(loaded.config.sessionSwitchAt, 75);
-  assert.deepEqual(loaded.config.routes.planner, defaults.routes.planner);
-  assert.deepEqual(loaded.config.routes.reviewer, defaults.routes.reviewer);
-  assert.equal(loaded.config.routes.implementer.primary.model, "claude-bridge/claude-opus-5-5");
-  assert.equal(loaded.config.routes.implementer.alternate?.model, "openai-codex/gpt-6-luna");
+  assert.deepEqual(Object.keys(loaded.config.agents), ["planner"]);
+  // No `alternates` was named, so the agent is pinned to its primary.
+  assert.deepEqual(loaded.config.agents.planner.alternates, []);
+  assert.equal(loaded.sources["agents.planner.primary.model"], "project");
+});
+
+// A configured agent with no file would otherwise silently do nothing: it is
+// reported at load, and it stays configured so a file can be created later.
+test("loadConfig warns about a configured agent whose file is absent and keeps it configured", async () => {
+  const missing = join(AGENT_DIR, "agents", "planner.md");
+  const fs = fakeFs({
+    [PROJECT_PATH]: JSON.stringify({
+      agents: { planner: { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } } },
+    }),
+  });
+  const loaded = await loadConfig({
+    agentDir: AGENT_DIR,
+    cwd: CWD,
+    readFile: fs.readFile,
+    warn: () => {},
+    fileExists: (path) => path !== missing,
+  });
+  assert.ok(
+    loaded.warnings.some((w) => w.includes(missing) && w.includes("planner")),
+    loaded.warnings.join("\n"),
+  );
+  assert.ok(loaded.config.agents.planner, "the agent stays configured");
+  assert.equal(loaded.sources["agents.planner.primary.model"], "project");
+});
+
+test("loadConfig stays silent when a configured agent's file exists", async () => {
+  const fs = fakeFs({
+    [PROJECT_PATH]: JSON.stringify({
+      agents: { planner: { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } } },
+    }),
+  });
+  const loaded = await loadConfig({
+    agentDir: AGENT_DIR,
+    cwd: CWD,
+    readFile: fs.readFile,
+    warn: () => {},
+    fileExists: () => true,
+  });
+  assert.deepEqual(loaded.warnings, []);
 });
 
 test("an invalid project value does not clobber a valid global value", async () => {
@@ -719,6 +1062,34 @@ async function loadedWithProjectOverride(): Promise<LoadedConfig> {
   return loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
 }
 
+/** A loaded config with two configured agents and a two-element alternate list. */
+async function loadedWithAgents(): Promise<LoadedConfig> {
+  const fs = fakeFs({
+    [PROJECT_PATH]: JSON.stringify({
+      agents: {
+        planner: {
+          primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+          alternates: [
+            { model: "openai-codex/gpt-6-sol", rail: "codex" },
+            { model: "deepseek/deepseek-flash", rail: "deepseek" },
+          ],
+        },
+        reviewer: {
+          primary: { model: "openai-codex/gpt-6-astra", rail: "codex" },
+          alternates: [],
+        },
+      },
+    }),
+  });
+  return loadConfig({
+    agentDir: AGENT_DIR,
+    cwd: CWD,
+    readFile: fs.readFile,
+    warn: () => {},
+    fileExists: () => true,
+  });
+}
+
 test("describeConfig's first line names the layers and both files' presence", async () => {
   const loaded = await loadedWithProjectOverride();
   const lines = describeConfig(loaded);
@@ -742,11 +1113,57 @@ test("describeConfig renders one sourced line per value and marks the project ov
   assert.ok(untouched, lines.join("\n"));
   assert.ok(untouched.includes("180000"), untouched);
   assert.ok(untouched.includes("[built-in]"), untouched);
+});
 
-  const routeField = lines.find((l) => l.includes("routes.planner.primary.model"));
-  assert.ok(routeField, lines.join("\n"));
-  assert.ok(routeField.includes("claude-bridge/claude-opus-5-5"), routeField);
-  assert.ok(routeField.includes("[built-in]"), routeField);
+test("describeConfig emits agents.<name>.primary.model and agents.<name>.alternates[N].model", async () => {
+  const loaded = await loadedWithAgents();
+  const lines = describeConfig(loaded);
+  const lineFor = (key: string): string | undefined => lines.find((l) => l.startsWith(`  ${key} = `));
+
+  const primary = lineFor("agents.planner.primary.model");
+  assert.ok(primary, lines.join("\n"));
+  assert.ok(primary.includes("claude-bridge/claude-opus-5-5"), primary);
+  assert.ok(primary.includes("[project]"), primary);
+
+  for (const index of [0, 1]) {
+    const line = lineFor(`agents.planner.alternates[${index}].model`);
+    assert.ok(line, `missing alternates[${index}]\n${lines.join("\n")}`);
+    assert.ok(line.includes("[project]"), line);
+  }
+  assert.ok(
+    lineFor("agents.planner.alternates[0].model")!.includes("openai-codex/gpt-6-sol"),
+    lines.join("\n"),
+  );
+  assert.ok(
+    lineFor("agents.planner.alternates[1].rail")!.includes("deepseek"),
+    lines.join("\n"),
+  );
+});
+
+test("describeConfig shows a disabled agent once as agents.<name> = disabled [<layer>]", async () => {
+  const fs = fakeFs({
+    [GLOBAL_PATH]: JSON.stringify({
+      agents: {
+        planner: {
+          primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+          alternates: [],
+        },
+      },
+    }),
+    [PROJECT_PATH]: JSON.stringify({ agents: { planner: { disable: true } } }),
+  });
+  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
+  const lines = describeConfig(loaded);
+
+  const disabled = lines.filter((l) => l.includes("agents.planner = disabled"));
+  assert.equal(disabled.length, 1, lines.join("\n"));
+  assert.match(disabled[0], /agents\.planner = disabled\s+\[project\]/);
+  // The agent is gone from the effective table, so no candidate lines remain.
+  assert.equal(
+    lines.some((l) => l.startsWith("  agents.planner.primary")),
+    false,
+    lines.join("\n"),
+  );
 });
 
 test("describeConfig lists the path scalars with their sources", async () => {
@@ -767,23 +1184,22 @@ test("describeConfig lists the path scalars with their sources", async () => {
   }
 });
 
-test("describeConfig lists scalars before routes and sorts routes by agent", async () => {
-  const loaded = await loadedWithProjectOverride();
+test("describeConfig lists scalars before agents and sorts agents by name", async () => {
+  const loaded = await loadedWithAgents();
   const lines = describeConfig(loaded);
 
-  const firstRoute = lines.findIndex((l) => l.includes("routes."));
-  assert.ok(firstRoute > 0, lines.join("\n"));
+  const firstAgent = lines.findIndex((l) => l.includes("agents."));
+  assert.ok(firstAgent > 0, lines.join("\n"));
   for (const scalar of ["agentDir", "claudeCredsPath", "piAuthPath", "ttlMs", "pollMs", "sessionSwitchAt", "weeklySwitchAt", "margin"]) {
     const i = lines.findIndex((l) => l.includes(scalar));
     assert.ok(i >= 0, `missing ${scalar}`);
-    assert.ok(i < firstRoute, `${scalar} should come before the route lines`);
+    assert.ok(i < firstAgent, `${scalar} should come before the agent lines`);
   }
 
-  const impl = lines.findIndex((l) => l.includes("routes.implementer."));
-  const planner = lines.findIndex((l) => l.includes("routes.planner."));
-  const reviewer = lines.findIndex((l) => l.includes("routes.reviewer."));
-  assert.ok(impl >= 0 && planner >= 0 && reviewer >= 0, lines.join("\n"));
-  assert.ok(impl < planner && planner < reviewer, `routes out of order: ${lines.join(" | ")}`);
+  const planner = lines.findIndex((l) => l.includes("agents.planner."));
+  const reviewer = lines.findIndex((l) => l.includes("agents.reviewer."));
+  assert.ok(planner >= 0 && reviewer >= 0, lines.join("\n"));
+  assert.ok(planner < reviewer, `agents out of order: ${lines.join(" | ")}`);
 
   for (const l of lines.slice(1).filter((l) => l.includes(" = "))) {
     assert.match(l, /\[(?:built-in|global|project)\]\s*$/);
@@ -812,78 +1228,91 @@ test("describeConfig includes a warning line per warning and none when there are
  * which is exactly what a stale provenance entry violates.
  */
 function resolveDotted(config: DispatcherConfig, key: string): { exists: boolean; value: unknown } {
-  const parts = key.split(".");
   let current: unknown = config;
-  for (const part of parts) {
-    if (current === null || typeof current !== "object" || !Object.hasOwn(current, part)) {
-      return { exists: false, value: undefined };
+  // A segment is `name` or `name[<index>]`; `alternates[0]` is the array
+  // element at index 0, not a property literally named `alternates[0]`.
+  for (const segment of key.split(".")) {
+    const indexed = /^(.*)\[(\d+)\]$/.exec(segment);
+    const steps: Array<string | number> = indexed ? [indexed[1], Number(indexed[2])] : [segment];
+    for (const step of steps) {
+      if (current === null || typeof current !== "object" || !Object.hasOwn(current, step)) {
+        return { exists: false, value: undefined };
+      }
+      current = (current as Record<string | number, unknown>)[step];
     }
-    current = (current as Record<string, unknown>)[part];
   }
   return { exists: true, value: current };
+}
+
+/**
+ * `agents.<name>` (two segments, no candidate suffix) is the one `sources` key
+ * that is not a value: it records the layer that removed the agent with
+ * `disable`. Everything else must resolve.
+ */
+function isDisabledKey(key: string): boolean {
+  return /^agents\.[^.]+$/.test(key);
 }
 
 // Regression guard: `mergeConfig` used to write `sources` while validating, so
 // a route or candidate that was later rejected (or erased and not replaced)
 // left provenance claiming a layer supplied a value `config` did not hold.
-test("a rejected route leaves no provenance for its candidates", () => {
-  // The project erases the primary (invalid) but offers a replacement
-  // alternate. The whole route is rejected, so the built-in alternate stays in
-  // force and must still be attributed to the built-in layer.
+test("a rejected candidate proposal leaves the lower layer's provenance intact", () => {
   const r = mergeConfig(base(), [
     {
       source: "project",
       data: {
-        routes: {
-          planner: { primary: null, alternate: { model: "openai-codex/gpt-6-luna", rail: "codex" } },
+        agents: {
+          planner: {
+            primary: { model: 123 },
+            alternates: [{ model: "openai-codex/gpt-6-luna" }],
+          },
         },
       },
     },
   ]);
-  assert.ok(r.warnings.some((w) => w.toLowerCase().includes("primary")), r.warnings.join("\n"));
-  assert.equal(r.config.routes.planner.primary.model, "claude-bridge/claude-opus-5-5");
-  assert.equal(r.config.routes.planner.alternate?.model, "openai-codex/gpt-6-sol");
-  assert.equal(r.sources["routes.planner.primary.model"], "built-in");
-  assert.equal(r.sources["routes.planner.alternate.model"], "built-in");
+  assert.ok(r.warnings.length >= 1, r.warnings.join("\n"));
+  assert.deepEqual(r.config.agents.planner, base().agents.planner);
+  assert.equal(r.sources["agents.planner.primary.model"], "built-in");
+  assert.equal(r.sources["agents.planner.alternates[0].model"], "built-in");
+  assert.equal(r.sources["agents.planner.alternates[0].rail"], "built-in");
 });
 
-test("a rejected new route leaves no provenance keys at all", () => {
+test("a rejected new agent leaves no provenance keys at all", () => {
   const r = mergeConfig(base(), [
-    { source: "project", data: { routes: { newbie: { primary: { model: "claude-bridge/x" } } } } },
+    { source: "project", data: { agents: { newbie: { primary: { model: "claude-bridge/x" } } } } },
   ]);
-  assert.equal(Object.hasOwn(r.config.routes, "newbie"), false);
+  assert.equal(Object.hasOwn(r.config.agents, "newbie"), false);
   assert.ok(r.warnings.some((w) => w.includes("newbie")), r.warnings.join("\n"));
-  // Not merely "not project": no `routes.newbie.*` key may exist at all.
   assert.deepEqual(
-    Object.keys(r.sources).filter((key) => key.startsWith("routes.newbie")),
+    Object.keys(r.sources).filter((key) => key.startsWith("agents.newbie")),
     [],
   );
 });
 
-test("erasing a route with an invalid primary keeps the lower layer's value and source", () => {
+test("a rejected override leaves the lower layer's value and source standing", () => {
   const r = mergeConfig(base(), [
     {
       source: "global",
-      data: { routes: { planner: { primary: { model: "claude-bridge/claude-opus-5-6" } } } },
+      data: { agents: { planner: { primary: { model: "claude-bridge/claude-opus-5-6" } } } },
     },
-    { source: "project", data: { routes: { planner: { primary: null } } } },
+    { source: "project", data: { agents: { planner: { primary: { model: 123 } } } } },
   ]);
-  assert.equal(r.config.routes.planner.primary.model, "claude-bridge/claude-opus-5-6");
-  assert.equal(r.sources["routes.planner.primary.model"], "global");
+  assert.equal(r.config.agents.planner.primary.model, "claude-bridge/claude-opus-5-6");
+  assert.equal(r.sources["agents.planner.primary.model"], "global");
 });
 
-test("a rejected candidate inside an accepted route leaves no provenance for it", () => {
-  // The global drops the planner alternate; the project offers a model-only
-  // replacement, which cannot complete a candidate from nothing. The route is
-  // still accepted (its primary survives), but the alternate is absent and must
-  // leave no trace in `sources`.
+test("a rejected alternates list leaves the lower list's provenance standing", () => {
+  // The global replaces the planner alternates with an empty list; the project
+  // offers a model-only replacement, which cannot complete a candidate. The
+  // list is rejected as a unit, so the empty list and its (absent) provenance
+  // stand.
   const r = mergeConfig(base(), [
-    { source: "global", data: { routes: { planner: { alternate: null } } } },
-    { source: "project", data: { routes: { planner: { alternate: { model: "openai-codex/gpt-6-luna" } } } } },
+    { source: "global", data: { agents: { planner: { alternates: [] } } } },
+    { source: "project", data: { agents: { planner: { alternates: [{ model: "openai-codex/gpt-6-luna" }] } } } },
   ]);
-  assert.equal(r.config.routes.planner.alternate, undefined);
+  assert.deepEqual(r.config.agents.planner.alternates, []);
   assert.deepEqual(
-    Object.keys(r.sources).filter((key) => key.startsWith("routes.planner.alternate")),
+    Object.keys(r.sources).filter((key) => key.startsWith("agents.planner.alternates")),
     [],
   );
 });
@@ -891,7 +1320,9 @@ test("a rejected candidate inside an accepted route leaves no provenance for it"
 /**
  * Property: `sources` describes the merged config, no more and no less.
  *
- *   (a) every key in `sources` resolves to a value that exists in `config`;
+ *   (a) every key in `sources` resolves to a value that exists in `config`,
+ *       except the special `agents.<name>` removal key, which names an agent
+ *       that is deliberately absent;
  *   (b) every candidate field present in `config` has a `sources` entry.
  *
  * A merge that records provenance for a rejected route or candidate breaks
@@ -900,96 +1331,120 @@ test("a rejected candidate inside an accepted route leaves no provenance for it"
 test("sources never names a value the merged config does not hold", () => {
   const nasty: Array<{ name: string; layers: MergeLayer[] }> = [
     {
-      name: "rejected route (primary null)",
+      name: "rejected new agent (no rail)",
+      layers: [{ source: "project", data: { agents: { newbie: { primary: { model: "claude-bridge/x" } } } } }],
+    },
+    {
+      name: "rejected alternates list (bad element)",
       layers: [
         {
           source: "project",
-          data: { routes: { planner: { primary: null, alternate: { model: "openai-codex/gpt-6-sol", rail: "codex" } } } },
+          data: {
+            agents: {
+              planner: {
+                alternates: [
+                  { model: "openai-codex/gpt-6-sol", rail: "codex" },
+                  { model: "missing-slash" },
+                ],
+              },
+            },
+          },
         },
       ],
     },
     {
-      name: "rejected new route",
-      layers: [{ source: "project", data: { routes: { newbie: { primary: { model: "claude-bridge/x" } } } } }],
-    },
-    {
-      name: "route erased then lower layer's value survives",
-      layers: [
-        { source: "global", data: { routes: { planner: { primary: { model: "claude-bridge/claude-opus-5-6" } } } } },
-        { source: "project", data: { routes: { planner: { primary: null } } } },
-      ],
-    },
-    {
-      name: "candidate erased then model-only replacement rejected",
-      layers: [
-        { source: "global", data: { routes: { planner: { alternate: null } } } },
-        { source: "project", data: { routes: { planner: { alternate: { model: "openai-codex/gpt-6-luna" } } } } },
-      ],
-    },
-    {
-      name: "bad rail",
-      layers: [{ source: "project", data: { routes: { planner: { primary: { rail: "openai" } } } } }],
+      name: "rejected primary (bad rail)",
+      layers: [{ source: "project", data: { agents: { planner: { primary: { rail: "openai" } } } } }],
     },
     {
       name: "no-slash model",
-      layers: [{ source: "project", data: { routes: { planner: { primary: { model: "gpt-6-sol" } } } } }],
+      layers: [{ source: "project", data: { agents: { planner: { primary: { model: "gpt-6-sol" } } } } }],
     },
     {
       name: "path traversal agent name",
       layers: [
-        { source: "project", data: { routes: { "../outside": { primary: { model: "claude-bridge/x", rail: "claude" } } } } },
-      ],
-    },
-    {
-      name: "route named constructor (null)",
-      layers: [{ source: "project", data: { routes: { constructor: null } } }],
-    },
-    {
-      name: "route named constructor (valid)",
-      layers: [
         {
           source: "project",
-          data: { routes: { constructor: { primary: { model: "openai-codex/gpt-6-sol", rail: "codex" } } } },
+          data: { agents: { "../outside": { primary: { model: "claude-bridge/x", rail: "claude" } } } },
         },
       ],
     },
-    { name: "route-level null", layers: [{ source: "project", data: { routes: { implementer: null } } }] },
-    { name: "candidate-level null", layers: [{ source: "project", data: { routes: { planner: { alternate: null } } } }] },
+    {
+      name: "agent named constructor (valid)",
+      layers: [
+        {
+          source: "project",
+          data: { agents: { constructor: { primary: { model: "openai-codex/gpt-6-sol", rail: "codex" } } } },
+        },
+      ],
+    },
+    { name: "route-level null", layers: [{ source: "project", data: { agents: { implementer: null } } }] },
+    { name: "candidate-level null", layers: [{ source: "project", data: { agents: { planner: { primary: null } } } }] },
+    {
+      name: "alternates null element",
+      layers: [{ source: "project", data: { agents: { planner: { alternates: [null] } } } }],
+    },
     {
       name: "model of the wrong type",
-      layers: [{ source: "project", data: { routes: { planner: { primary: { model: 123 } } } } }],
+      layers: [{ source: "project", data: { agents: { planner: { primary: { model: 123 } } } } }],
     },
+    { name: "disable removes an agent", layers: [{ source: "project", data: { agents: { planner: { disable: true } } } }] },
+    { name: "ignore contributes nothing", layers: [{ source: "project", data: { agents: { planner: { ignore: true } } } }] },
   ];
 
   for (const { name, layers } of nasty) {
     const r = mergeConfig(base(), layers);
     for (const key of Object.keys(r.sources)) {
+      if (isDisabledKey(key)) {
+        const agent = key.slice("agents.".length);
+        assert.equal(
+          Object.hasOwn(r.config.agents, agent),
+          false,
+          `${name}: "${key}" marks a removed agent but config still holds it`,
+        );
+        continue;
+      }
       assert.ok(resolveDotted(r.config, key).exists, `${name}: sources has "${key}" but config does not`);
     }
-    for (const [agent, route] of Object.entries(r.config.routes)) {
-      for (const slot of ["primary", "alternate"] as const) {
-        const candidate = route[slot];
-        if (!candidate) continue;
+    for (const [agent, route] of Object.entries(r.config.agents)) {
+      const slots: Array<[string, { model: string; rail: string }]> = [
+        ["primary", route.primary],
+        ...route.alternates.map(
+          (candidate, index): [string, { model: string; rail: string }] => [`alternates[${index}]`, candidate],
+        ),
+      ];
+      for (const [slot, candidate] of slots) {
         for (const field of ["model", "rail"] as const) {
-          const key = `routes.${agent}.${slot}.${field}`;
+          const key = `agents.${agent}.${slot}.${field}`;
           assert.ok(key in r.sources, `${name}: config has ${key} but sources does not`);
+          assert.equal(typeof candidate[field], "string", `${name}: ${key}`);
         }
       }
     }
   }
 });
 
-test("the surviving value from a lower layer keeps its real source in describeConfig", async () => {
+test("the value a rejected override leaves standing keeps its real source in describeConfig", async () => {
   const fs = fakeFs({
-    [GLOBAL_PATH]: JSON.stringify({ routes: { planner: { primary: { model: "claude-bridge/claude-opus-5-6" } } } }),
-    [PROJECT_PATH]: JSON.stringify({ routes: { planner: { primary: null } } }),
+    [GLOBAL_PATH]: JSON.stringify({
+      agents: {
+        planner: { primary: { model: "claude-bridge/claude-opus-5-6", rail: "claude" } },
+      },
+    }),
+    [PROJECT_PATH]: JSON.stringify({ agents: { planner: { primary: { model: 123 } } } }),
   });
-  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
-  assert.equal(loaded.config.routes.planner.primary.model, "claude-bridge/claude-opus-5-6");
-  assert.equal(loaded.sources["routes.planner.primary.model"], "global");
+  const loaded = await loadConfig({
+    agentDir: AGENT_DIR,
+    cwd: CWD,
+    readFile: fs.readFile,
+    warn: () => {},
+    fileExists: () => true,
+  });
+  assert.equal(loaded.config.agents.planner.primary.model, "claude-bridge/claude-opus-5-6");
+  assert.equal(loaded.sources["agents.planner.primary.model"], "global");
 
   const lines = describeConfig(loaded);
-  const line = lines.find((l) => l.includes("routes.planner.primary.model"));
+  const line = lines.find((l) => l.includes("agents.planner.primary.model"));
   assert.ok(line, lines.join("\n"));
   assert.ok(line.includes("claude-bridge/claude-opus-5-6"), line);
   assert.ok(line.includes("[global]"), line);

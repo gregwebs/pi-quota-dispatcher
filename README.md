@@ -16,12 +16,12 @@ deepseek: ok — metered
 
 planner -> claude-bridge/claude-opus-5-5  [unchanged]  (claude ok (session 0%, weekly 27%))
 reviewer -> openai-codex/gpt-6-astra      [unchanged]  (codex ok (session 0%, weekly 64%))
-implementer -> deepseek/deepseek-flash    [unchanged]  (deepseek ok (metered))
 
 config: built-in < global ~/.pi/agent/quota-dispatch.json (present) < project .pi/quota-dispatch.json (absent)
   sessionSwitchAt = 75  [built-in]
   weeklySwitchAt = 80  [global]
-  routes.reviewer.primary.model = claude-bridge/claude-opus-5-5  [global]
+  agents.planner.primary.model = claude-bridge/claude-opus-5-5  [global]
+  agents.planner.alternates[0].model = openai-codex/gpt-6-sol  [global]
   ...
 ```
 
@@ -66,7 +66,7 @@ reviewer on gpt-6-astra?" is answerable without opening three files.
 ## Configuration
 
 Configuration lives in JSON files you own, not in the installed package — so
-`pi install`/update cannot silently revert your routes:
+`pi install`/update cannot silently revert your agent routes:
 
 | Layer | Path |
 |---|---|
@@ -78,13 +78,36 @@ The agent dir comes from `getAgentDir()`, so `PI_CODING_AGENT_DIR` and a
 rebranded distribution's config directory are honoured; the project path is
 built from pi's `CONFIG_DIR_NAME` rather than a hardcoded `.pi`.
 
-**Precedence: built-in < global < project**, deep-merged per route. A file only
+**Nothing is managed until you name it.** `agents` ships `{}` and an agent the
+file does not name is never touched — not routed, not read, not rewritten. That
+is deliberate: this extension writes to agent files, so a shipped table of names
+would edit files you never mentioned and move work onto rails you never chose.
+Copy this into `~/.pi/agent/quota-dispatch.json` and adjust the names and models
+to your own:
+
+```json
+{
+  "agents": {
+    "planner": {
+      "primary": { "model": "claude-bridge/claude-opus-5-5", "rail": "claude" },
+      "alternates": [{ "model": "openai-codex/gpt-6-sol", "rail": "codex" }]
+    }
+  }
+}
+```
+
+Each agent is keyed by its **name** — the filename stem, `<agent dir>/<name>.md`
+— and each route gives a `primary` and an `alternates` list. A candidate is a
+`model` and the `rail` it draws on; state both, because the model's prefix and
+the rail are checked against each other and a mismatch warns.
+
+**Precedence: built-in < global < project**, deep-merged per agent. A file only
 has to state what it changes:
 
 ```json
 {
   "weeklySwitchAt": 80,
-  "routes": {
+  "agents": {
     "reviewer": {
       "primary": { "model": "claude-bridge/claude-opus-5-5", "rail": "claude" }
     }
@@ -92,23 +115,49 @@ has to state what it changes:
 }
 ```
 
-That global file moves `weeklySwitchAt` and reviewer's primary, and leaves the
-other two routes and every other scalar at their built-in values. A project file
-with `{"routes": {"implementer": null}}` drops the implementer route, so a
-project that only uses two agents can say so; `{"alternate": null}` drops a
-single candidate.
+That global file moves `weeklySwitchAt` and `reviewer`'s primary, and leaves
+every other agent and scalar alone. Merging inside a candidate is field-wise, so
+naming only a `model` keeps the `rail` beneath it — usually not what you want
+when you move to a different provider, so state both, as above; the loader warns
+when a model's prefix reads like a rail other than the one declared.
 
-Merging is field-wise, so naming only a `model` keeps the `rail` beneath it.
-That is usually not what you want when you move an agent to a different
-provider — state both, as above — and the loader warns when a model's prefix
-reads like a rail other than the one declared.
+### Adding, removing and parking an agent
+
+An agent entry carries two entry-level **skip instructions**, read while the
+layers are folded and never kept in the effective config:
+
+| Spelling | Effect |
+|---|---|
+| `"disable": true` | Remove the agent, whatever lower layers said, and report it once as `agents.<name> = disabled [<layer>]`. |
+| `"ignore": true` | This copy of the entry contributes nothing and warns nothing; a lower layer's route stands. It wins over `disable`. |
+| `"disable": false` | Inert — the rest of the entry still applies. |
+
+`disable` and `ignore` are how you say "off" and "not this copy" without letting
+a mistyped value do either by accident. There is **no `null`** anywhere: a `null`
+at the agent or candidate level warns and leaves the previous layer's value
+standing — it removes nothing.
+
+`alternates` is a **priority list**, consulted in order, and it replaces whole:
+
+- A layer that mentions `alternates` replaces the entire list, and the list is
+  accepted or rejected as a unit — one unusable element discards the whole list
+  and the previous layer's list stands. Merging element by element would not be
+  what a priority order means.
+- `"alternates": []` (or no `alternates` at all) **pins the agent to its
+  primary**: the primary is then assigned with no readability check and is never
+  held, because there is nothing else the answer could be.
+
+The list is never re-sorted by headroom — the first usable alternate wins —
+because the order is the one piece of intent the numbers cannot express.
+`disable` and `ignore` are entry-level only, a candidate has exactly `model` and
+`rail`, and a lone candidate object is not shorthand for a one-element list.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `routes` | planner / reviewer / implementer | Which agents are managed, and where each moves. Agents not listed are never touched. |
+| `agents` | `{}` — nothing managed | Which agents are managed, and each one's `primary` and `alternates` list. Agents not listed are never touched. |
 | `sessionSwitchAt` | `75` | Used-percent at which the primary's **session** budget is considered tight |
 | `weeklySwitchAt` | `90` | The same for its **weekly** budget, deliberately higher — see [the policy](#the-policy) |
-| `margin` | `10` | The alternate must be **more than** this many points healthier, on the *same* budget |
+| `margin` | `10` | An alternate must be **more than** this many points healthier, on the budget that triggered the move |
 | `ttlMs` | `180000` | How long a quota reading is reused |
 | `pollMs` | `300000` | How often to re-evaluate while a session is open |
 
@@ -120,6 +169,13 @@ paths pi itself owns, derived from `getAgentDir()`, so a file pointing them
 elsewhere would only make the dispatcher edit files nothing reads. Relocate
 them with `PI_CODING_AGENT_DIR`, and note that naming either in a config file
 warns. Both remain fields on the config object for programmatic use and tests.
+
+### Migrating from `routes`
+
+An earlier version spelled the table `routes`; rename it to `agents` and give
+each route an `alternates` list instead of a single `alternate`. The old spelling
+is never read — a file that still says `routes` warns
+`unknown key "routes" (renamed to "agents")`.
 
 ### When something is wrong with it
 
@@ -133,8 +189,13 @@ Bad configuration never stops the dispatcher from starting:
   without a `primary`, an out-of-range number, an invalid agent name, a value
   of the wrong type** — logged, and the previous layer's value stands for that
   key alone. A typo in a project file cannot undo a correct global one. An
-  invalid value never removes a valid one; dropping a route stays explicit
-  (route-level `null`).
+  invalid value never removes a valid one; removing an agent stays explicit
+  (`disable: true`).
+- **A skip flag that is not `true` or `false`, or a `null` anywhere** — logged
+  and treated as absent, so the previous layer's value stands.
+- **A configured agent with no file** at `<agent dir>/<name>.md` — logged at
+  load, with the path to go and create, and the agent stays configured in the
+  meantime.
 
 Agent names are filenames (`<agent dir>/<name>.md`), so they must be lowercase
 letters, digits and dashes, starting with a letter (`planner`,
@@ -171,13 +232,14 @@ are weighed separately:
   so for *days*, so a switch made on it is close to one-way.
 
 1. **Session first.** If the primary's session budget is at or above
-   `sessionSwitchAt`, and the alternate's **session** budget is more than
-   `margin` points healthier, move to the alternate.
-2. **Weekly is a backstop.** The same rule on the weekly budget, with its own
-   `weeklySwitchAt`. Each compares like with like: session against the
-   alternate's session, weekly against its weekly. It runs whether or not the
-   session budget is tight, so a spent week is not masked by a merely tight
-   session.
+   `sessionSwitchAt`, the alternates are walked **in the order you listed them**
+   and the first one whose session budget is more than `margin` points healthier
+   wins.
+2. **Weekly is a backstop.** If the session walk did not switch, the same walk
+   runs on the weekly budget under its own `weeklySwitchAt`. Each comparison is
+   like with like — session against the alternate's session, weekly against its
+   weekly — so a spent week is not masked by a merely tight session: an
+   alternate that is tight on the week is refused by both passes.
 3. **The destination has to be somewhere worth going.** A rail is only a valid
    target if — besides being better on the budget that triggered the move — it
    is **not itself tight on the other budget**. A rail tight on its *other* cap
@@ -185,14 +247,25 @@ are weighed separately:
    another rather than relieving anything. Without this, one pass can move an
    agent *onto* the very rail it moves another agent *off*.
 4. Otherwise stay on the primary.
-5. **Unreadable is not the same as idle.** If either rail cannot be read, or a
-   capped rail fails to report a budget, the dispatcher makes no assignment at
-   all: `Decision` is either an assign or an explicit hold, and a hold carries
-   no model, so there is nothing to write. Every agent file is left exactly as
-   you left it. A failed HTTP call must never move work onto the other plan —
-   least of all back onto the rail that was under pressure. Reading a missing
-   5-hour window as "0% used" is how a rail that was blocked outright once came
-   to look like the roomiest place to send work.
+5. **Unreadable is not idle — but it only holds where it could have changed the
+   answer.** A reading the dispatcher does not have is not evidence of pressure
+   and not evidence of room; it holds only where the missing number could have
+   moved the decision:
+   - the **primary's** rail unreadable, or silent about a budget it should
+     report, holds: that is the number that decides whether to move at all;
+   - a primary that is readable and **below every threshold** is assigned even
+     when an alternate is unreadable, because no alternate could have been
+     chosen;
+   - when the primary is tight, an unreadable alternate holds only if it comes
+     **before** the alternate that would otherwise win, or if none of the
+     readable alternates qualifies — in both cases the missing reading might
+     have won.
+   A hold carries no model, so there is nothing to write and every agent file is
+   left exactly as you left it: `Decision` is either an assign or an explicit
+   hold. A failed HTTP call must never move work onto the other plan — least of
+   all back onto the rail that was under pressure. Reading a missing 5-hour
+   window as "0% used" is how a rail that was blocked outright once came to look
+   like the roomiest place to send work.
 
 A rail is *metered* when it is billed per token rather than quota-capped. That
 is a real reading of zero pressure, not a gap, so unlike everything else in
