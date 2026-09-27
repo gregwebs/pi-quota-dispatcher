@@ -174,6 +174,11 @@ export function checkModels(
       resolves(`agents.${agent}.alternates[${index}].model`, candidate.model),
     );
     agents[agent] = {
+      // The route's own fields ride through untouched: the check is about
+      // candidate model ids, and a route default that fell off here would stop
+      // being written for every agent of the session, leaving each file on
+      // whatever level a past pass happened to leave there.
+      ...(route.thinking !== undefined ? { thinking: route.thinking } : {}),
       primary: { ...route.primary },
       alternates: alternates.map((candidate) => ({ ...candidate })),
     };

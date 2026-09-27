@@ -24,6 +24,27 @@ _Avoid_: route, routing rule, mapping, agent route entry, disabled route
 One model on one rail, considered as a possible destination for an agent.
 _Avoid_: option, target, model entry
 
+**Thinking level**:
+How hard pi tells a model to think before it answers, stated as `thinking:` in
+the agent file and read by pi-subagents at every spawn. One of `off`, `minimal`,
+`low`, `medium`, `high`, `xhigh`, `max`. Whether the model can do the level asked
+for is pi's business, not the config's: pi clamps.
+_Avoid_: thinking budget, reasoning effort, thinking mode, thinking setting
+
+**Model default**:
+The thinking level a model carries wherever a route names it, stated in the
+`models` table. The weakest of the three places a level can be stated — a route
+default and a candidate both outrank it — and inert for a model no route names.
+_Avoid_: model config, per-model setting, model entry
+
+**Resolved level**:
+The one level a write uses: the candidate's, else the route's, else the model's,
+else nothing at all. Nothing means no line is written — never a level of `none`.
+There is no *restore*: a level once written stays until some pass resolves
+another one, so the guarantee is about the pass being made and never about what
+the file used to hold.
+_Avoid_: effective level, final level, thinking default
+
 **Unmanaged**:
 Describes an agent file that no agent route names. The dispatcher never touches
 it, and that is a normal state rather than a fault.

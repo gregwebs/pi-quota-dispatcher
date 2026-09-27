@@ -14,13 +14,15 @@ claude: 5h 0%, 7d 27%
 codex: 5h 0%, 7d 64%
 deepseek: ok — metered
 
-planner -> claude-bridge/claude-opus-5-5  [unchanged]  (claude ok (session 0%, weekly 27%))
+planner -> claude-bridge/claude-opus-5-5 (thinking: high)  [unchanged]  (claude ok (session 0%, weekly 27%))
 reviewer -> openai-codex/gpt-6-astra      [unchanged]  (codex ok (session 0%, weekly 64%))
 
 config: built-in < global ~/.pi/agent/quota-dispatch.json (present) < project .pi/quota-dispatch.json (absent)
   sessionSwitchAt = 75  [built-in]
   weeklySwitchAt = 80  [global]
+  models.openai-codex/gpt-6-sol.thinking = low  [global]
   agents.planner.primary.model = claude-bridge/claude-opus-5-5  [global]
+  agents.planner.primary.thinking = high  [global]
   agents.planner.alternates[0].model = openai-codex/gpt-6-sol  [global]
   ...
 ```
@@ -140,8 +142,12 @@ A fresh install says so and offers a snippet built from the files it found — s
 
 ```json
 {
+  "models": {
+    "openai-codex/gpt-6-sol": { "thinking": "low" }
+  },
   "agents": {
     "planner": {
+      "thinking": "high",
       "primary": { "model": "claude-bridge/claude-opus-5-5", "rail": "claude" },
       "alternates": [{ "model": "openai-codex/gpt-6-sol", "rail": "codex" }]
     }
@@ -152,7 +158,9 @@ A fresh install says so and offers a snippet built from the files it found — s
 Each agent is keyed by its **name** — the filename stem, `<agent dir>/<name>.md`
 — and each route gives a `primary` and an `alternates` list. A candidate is a
 `model` and the `rail` it draws on; state both, because the model's prefix and
-the rail are checked against each other and a mismatch warns.
+the rail are checked against each other and a mismatch warns. A candidate may
+also carry a `thinking` level, and a route or a model may state a default — see
+[Thinking levels](#thinking-levels).
 
 **Precedence: built-in < global < project**, deep-merged per agent. A file only
 has to state what it changes:
@@ -172,7 +180,59 @@ That global file moves `weeklySwitchAt` and `reviewer`'s primary, and leaves
 every other agent and scalar alone. Merging inside a candidate is field-wise, so
 naming only a `model` keeps the `rail` beneath it — usually not what you want
 when you move to a different provider, so state both, as above; the loader warns
-when a model's prefix reads like a rail other than the one declared.
+when a model's prefix reads like a rail other than the one declared. The `models`
+table is deep-merged the same way, per model id, so a project file can change one
+model's level without restating the rest.
+
+### Thinking levels
+
+A **thinking level** is the `thinking:` line pi-subagents reads from an agent
+file when it spawns it (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+`max`). The dispatcher writes it beside the `model:` it chose, because the model
+a budget can afford is often a model that should think differently. Three places
+can state one, and the most specific wins:
+
+| Place | Spelling | Meaning |
+|---|---|---|
+| Candidate | `agents.<name>.primary.thinking` (or `.alternates[i].thinking`) | This destination, whatever route it is on |
+| Route | `agents.<name>.thinking` | The work: "planning thinks hard" |
+| Model | `models.<provider/modelId>.thinking` | The model, wherever a route names it |
+
+```json
+{
+  "models": {
+    "openai-codex/gpt-6-sol": { "thinking": "low" },
+    "claude-bridge/claude-opus-5-5": { "thinking": "high" }
+  },
+  "agents": {
+    "planner": {
+      "thinking": "xhigh",
+      "primary": { "model": "claude-bridge/claude-opus-5-5", "rail": "claude" },
+      "alternates": [{ "model": "openai-codex/gpt-6-sol", "rail": "codex", "thinking": "off" }]
+    }
+  }
+}
+```
+
+Here planner thinks `xhigh` while it sits on Opus; on the codex alternate its own
+`off` wins; any other agent that routes to Opus gets `high` from the model
+table, and one that routes to `gpt-6-sol` thinks `low` unless its route or
+candidate says otherwise. A level nothing states is **not** written: the file's
+`thinking:` line is left as it is.
+
+A level is validated for its *spelling* only. Whether a given model can do it is
+not the config's business — pi clamps the level to what the model supports when
+the agent is spawned, so `xhigh` on a model whose ceiling is `medium` runs at
+`medium` rather than failing.
+
+**The dispatcher makes no promise about that line beyond the pass it is making.**
+It does not remember what your file said before, and it does not put anything
+back. So on a route where only the alternates state a level, the level written on
+the way out is still in the file on the way home: moving an agent back to a
+primary that states none changes its model and leaves its `thinking:` alone. If
+you want a level on the way home, state one — on the candidate, on the route, or
+in the `models` table. Removing the line is yours to do as well; nothing here
+does it.
 
 ### Adding, removing and parking an agent
 
@@ -202,12 +262,14 @@ standing — it removes nothing.
 
 The list is never re-sorted by headroom — the first usable alternate wins —
 because the order is the one piece of intent the numbers cannot express.
-`disable` and `ignore` are entry-level only, a candidate has exactly `model` and
-`rail`, and a lone candidate object is not shorthand for a one-element list.
+`disable` and `ignore` are entry-level only, a candidate carries `model`, `rail`
+and optionally `thinking`, and a lone candidate object is not shorthand for a
+one-element list.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `agents` | `{}` — nothing managed | Which agents are managed, and each one's `primary` and `alternates` list. Agents not listed are never touched. |
+| `models` | `{}` | Per-model defaults, keyed by `provider/modelId`. Only `thinking` is read; an entry for a model no route names is inert and warns nothing. |
 | `sessionSwitchAt` | `75` | Used-percent at which the primary's **session** budget is considered tight |
 | `weeklySwitchAt` | `90` | The same for its **weekly** budget, deliberately higher — see [the policy](#the-policy) |
 | `margin` | `10` | An alternate must be **more than** this many points healthier, on the budget that triggered the move |
@@ -243,12 +305,13 @@ Bad configuration never stops the dispatcher from starting:
 - **Unparseable file** — logged to `console.error` and skipped whole, and the
   layers below it still apply. A half-applied config is harder to reason about
   than the defaults.
-- **Unknown key, malformed `model` (no `/`), unknown `rail`, a route left
-  without a `primary`, an out-of-range number, an invalid agent name, a value
-  of the wrong type** — logged, and the previous layer's value stands for that
-  key alone. A typo in a project file cannot undo a correct global one. An
-  invalid value never removes a valid one; removing an agent stays explicit
-  (`disable: true`).
+- **Unknown key, malformed `model` (no `/`), unknown `rail`, a `thinking` that
+  is not one of the seven levels, a `models` key that is not a
+  `provider/modelId`, a route left without a `primary`, an out-of-range number,
+  an invalid agent name, a value of the wrong type** — logged, and the previous
+  layer's value stands for that key alone. A typo in a project file cannot undo a
+  correct global one. An invalid value never removes a valid one; removing an
+  agent stays explicit (`disable: true`).
 - **A skip flag that is not `true` or `false`, or a `null` anywhere** — logged
   and treated as absent, so the previous layer's value stands.
 - **A configured agent with no file** at `<agent dir>/<name>.md` — logged at
@@ -288,7 +351,10 @@ to configure.
 ## The policy
 
 Deliberately small and stateless — the target model is a pure function of
-current rail headroom, so re-evaluating is idempotent and cannot drift.
+current rail headroom, so re-evaluating is idempotent and the model cannot
+drift. The one thing a file does not converge on is the `thinking:` line, which a
+pass that resolves no level leaves alone; see
+[Thinking levels](#thinking-levels).
 
 Each rail reports **two budgets that move on very different clocks**, and they
 are weighed separately:
@@ -374,9 +440,13 @@ would leave frontmatter without a `model:` and agents would inherit the parent �
 a reviewer quietly downgraded to the session model is a worse outcome than a
 stale-but-sane one.
 
-**It never touches your notes.** Only the uncommented `model:` line is rewritten.
-`# model:` alternatives, `fallbackModels:` blocks, and everything else in the
-frontmatter and body survive byte-for-byte.
+**It never touches your notes.** Only the uncommented `model:` line is rewritten
+— plus the uncommented `thinking:` line, and only when a level actually resolved.
+`# model:` alternatives, `fallbackModels:` blocks, a commented-out `# thinking:`
+note, and everything else in the frontmatter and body survive byte-for-byte. See
+[Thinking levels](#thinking-levels) for the one guarantee that line comes with,
+and ADR
+[0004](docs/adr/0004-thinking-levels.md) for why it is only ever forward.
 
 ## Where the numbers come from
 
@@ -443,6 +513,11 @@ a different account.
 - **Cosmetic duplication.** When the dispatcher selects a model that also appears
   in your commented notes, you get `model: X` alongside `# model: X`. Harmless,
   and deduping would mean deleting your notes.
+- **A written thinking level outlives the assignment.** Nothing restores or
+  removes a `thinking:` line, so an agent that moved to an alternate with a level
+  keeps that level when it moves home, unless the primary states one too. That is
+  the deliberate absence of a guarantee; if you care what an agent thinks at,
+  state a level on every candidate of its route.
 - **The model check is only as fresh as the running pi.** Each configured model
   id is resolved against the pi that is running, so a model a *newer* pi knows
   is reported as unknown by an older one. When a model you expect is reported as

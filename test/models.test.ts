@@ -257,6 +257,29 @@ test("a config whose models are all known produces no warnings and is returned u
   assert.equal(lines.length, 0);
 });
 
+// The check is about candidate model ids. Everything else on a route — a level,
+// most of all — has to come out of the rebuilt table exactly as it went in, or a
+// session's first boot would quietly undo every configured level.
+test("checkModels carries a route's level and the models table through the rebuild", () => {
+  const route: AgentRoute = {
+    thinking: "medium",
+    primary: { ...candidate("claude-bridge/claude-opus-5-5", "claude"), thinking: "xhigh" },
+    alternates: [
+      { ...candidate("openai-codex/gpt-sol-6", "codex"), thinking: "off" }, // unknown
+      { ...candidate("openai-codex/gpt-6-sol", "codex"), thinking: "low" }, // known
+    ],
+  };
+  const cfg = config({ planner: route }, { models: { "openai-codex/gpt-6-sol": { thinking: "minimal" } } });
+
+  const result = checkModels(cfg, lookupFor("claude-bridge/claude-opus-5-5", "openai-codex/gpt-6-sol"));
+
+  assert.equal(result.config.agents.planner.thinking, "medium");
+  assert.equal(result.config.agents.planner.primary.thinking, "xhigh");
+  assert.equal(result.config.agents.planner.alternates.length, 1);
+  assert.equal(result.config.agents.planner.alternates[0].thinking, "low");
+  assert.deepEqual(result.config.models, { "openai-codex/gpt-6-sol": { thinking: "minimal" } });
+});
+
 // ---------------------------------------------------------------- purity
 
 test("checkModels does not mutate the config it is handed", () => {
