@@ -20,8 +20,10 @@ reviewer -> openai-codex/gpt-6-astra      [unchanged]  (codex ok (session 0%, we
 config: built-in < global ~/.pi/agent/quota-dispatch.json (present) < project .pi/quota-dispatch.json (absent)
   sessionSwitchAt = 75  [built-in]
   weeklySwitchAt = 80  [global]
+  models.openai-codex/gpt-6-sol.rail = codex  [global]
   models.openai-codex/gpt-6-sol.thinking = low  [global]
   agents.planner.primary.model = claude-bridge/claude-opus-5-5  [global]
+  agents.planner.primary.rail = claude  [global]
   agents.planner.primary.thinking = high  [global]
   agents.planner.alternates[0].model = openai-codex/gpt-6-sol  [global]
   ...
@@ -65,11 +67,15 @@ Name them in ~/.pi/agent/quota-dispatch.json to start routing.
 For example:
 
 {
+  "models": {
+    "claude-bridge/claude-opus-5-5": {
+      "rail": "claude"
+    }
+  },
   "agents": {
     "planner": {
       "primary": {
-        "model": "claude-bridge/claude-opus-5-5",
-        "rail": "claude"
+        "model": "claude-bridge/claude-opus-5-5"
       }
     }
   }
@@ -83,9 +89,10 @@ Then /reload. Run /quota-dispatch at any time to see what it would do.
 ```
 
 The snippet is built from the model each agent file **already** declares, and
-`rail` is derived from that model's prefix, so it is inert until you paste it.
-A file with no model, or with a model whose prefix is not one of the rails this
-extension reads, is listed but left out rather than guessed at.
+each model's `rail` is derived from its prefix and registered once under
+`models`, so the snippet is inert until you paste it. A file with no model, or
+with a model whose prefix is not one of the rails this extension reads, is
+listed but left out rather than guessed at.
 
 While the table is empty, a footer line (`quota-dispatcher: no agents
 configured`) holds the state, and clears as soon as a route exists. In modes
@@ -143,23 +150,25 @@ A fresh install says so and offers a snippet built from the files it found — s
 ```json
 {
   "models": {
-    "openai-codex/gpt-6-sol": { "thinking": "low" }
+    "claude-bridge/claude-opus-5-5": { "rail": "claude" },
+    "openai-codex/gpt-6-sol": { "rail": "codex", "thinking": "low" }
   },
   "agents": {
     "planner": {
       "thinking": "high",
-      "primary": { "model": "claude-bridge/claude-opus-5-5", "rail": "claude" },
-      "alternates": [{ "model": "openai-codex/gpt-6-sol", "rail": "codex" }]
+      "primary": { "model": "claude-bridge/claude-opus-5-5" },
+      "alternates": [{ "model": "openai-codex/gpt-6-sol" }]
     }
   }
 }
 ```
 
 Each agent is keyed by its **name** — the filename stem, `<agent dir>/<name>.md`
-— and each route gives a `primary` and an `alternates` list. A candidate is a
-`model` and the `rail` it draws on; state both, because the model's prefix and
-the rail are checked against each other and a mismatch warns. A candidate may
-also carry a `thinking` level, and a route or a model may state a default — see
+— and each route gives a `primary` and an `alternates` list. A candidate names a
+`model`; the `rail` it draws on is registered once for that model under
+`models`, so a route never repeats the account. A candidate may still state its
+own `rail` (which outranks the registration) and a `thinking` level, and a route
+or a model may state a thinking default — see [Model rails](#model-rails) and
 [Thinking levels](#thinking-levels).
 
 **Precedence: built-in < global < project**, deep-merged per agent. A file only
@@ -168,21 +177,63 @@ has to state what it changes:
 ```json
 {
   "weeklySwitchAt": 80,
+  "models": {
+    "claude-bridge/claude-opus-5-5": { "rail": "claude" }
+  },
   "agents": {
     "reviewer": {
-      "primary": { "model": "claude-bridge/claude-opus-5-5", "rail": "claude" }
+      "primary": { "model": "claude-bridge/claude-opus-5-5" }
     }
   }
 }
 ```
 
-That global file moves `weeklySwitchAt` and `reviewer`'s primary, and leaves
-every other agent and scalar alone. Merging inside a candidate is field-wise, so
-naming only a `model` keeps the `rail` beneath it — usually not what you want
-when you move to a different provider, so state both, as above; the loader warns
-when a model's prefix reads like a rail other than the one declared. The `models`
-table is deep-merged the same way, per model id, so a project file can change one
-model's level without restating the rest.
+That global file moves `weeklySwitchAt` and `reviewer`'s primary, registers the
+model's rail once, and leaves every other agent and scalar alone. Merging inside
+a candidate is field-wise, so a layer that names only a `thinking` level (or
+only a `rail`) keeps the rest of the candidate beneath it. A layer that names a
+`model` already registered in `models` re-resolves the rail from that model's
+entry, so moving to another provider needs no rail restated; a candidate may
+still state its own `rail`, and the loader warns when that disagrees with the
+model's prefix. The `models` table is deep-merged the same way, per model id, so
+a project file can register one model's rail without restating the rest.
+
+### Model rails
+
+A candidate names a `model`; the rail — the account whose quota that model's
+calls consume — is registered once per model under `models`, keyed by the same
+`provider/modelId` pi uses:
+
+```json
+{
+  "models": {
+    "claude-bridge/claude-opus-5-5": { "rail": "claude" },
+    "openai-codex/gpt-6-sol": { "rail": "codex" }
+  },
+  "agents": {
+    "planner": {
+      "primary": { "model": "claude-bridge/claude-opus-5-5" },
+      "alternates": [{ "model": "openai-codex/gpt-6-sol" }]
+    }
+  }
+}
+```
+
+Registering it once keeps a route from restating the account on every candidate
+that names the model. A candidate may still state its own `rail`, which outranks
+the registered one, and a layer that moves a candidate to another model
+re-resolves the rail from that model's entry rather than gluing the old one to
+the new model. If the new model registers none, the move is rejected — the old
+rail is not carried along and the loader warns to register one — while a rail
+the candidate states itself is kept, field-wise. An invalid `rail` is warned
+about and ignored; it does not block a model change beside it, which still
+re-resolves. Either way a candidate whose model has no registered rail and which
+states none of its own is rejected: there is no account to route to, so the
+loader warns instead of guessing. The
+model's prefix is **not** used as a fallback — the prefix is only checked
+against the registered rail, and a disagreement warns, which is what turns a
+mis-pointed route into a visible mistake rather than a silent route to the
+wrong quota.
 
 ### Thinking levels
 
@@ -201,14 +252,14 @@ can state one, and the most specific wins:
 ```json
 {
   "models": {
-    "openai-codex/gpt-6-sol": { "thinking": "low" },
-    "claude-bridge/claude-opus-5-5": { "thinking": "high" }
+    "openai-codex/gpt-6-sol": { "rail": "codex", "thinking": "low" },
+    "claude-bridge/claude-opus-5-5": { "rail": "claude", "thinking": "high" }
   },
   "agents": {
     "planner": {
       "thinking": "xhigh",
-      "primary": { "model": "claude-bridge/claude-opus-5-5", "rail": "claude" },
-      "alternates": [{ "model": "openai-codex/gpt-6-sol", "rail": "codex", "thinking": "off" }]
+      "primary": { "model": "claude-bridge/claude-opus-5-5" },
+      "alternates": [{ "model": "openai-codex/gpt-6-sol", "thinking": "off" }]
     }
   }
 }
@@ -262,14 +313,14 @@ standing — it removes nothing.
 
 The list is never re-sorted by headroom — the first usable alternate wins —
 because the order is the one piece of intent the numbers cannot express.
-`disable` and `ignore` are entry-level only, a candidate carries `model`, `rail`
-and optionally `thinking`, and a lone candidate object is not shorthand for a
-one-element list.
+`disable` and `ignore` are entry-level only, a candidate carries `model` and
+optionally `rail` and `thinking`, and a lone candidate object is not shorthand
+for a one-element list.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `agents` | `{}` — nothing managed | Which agents are managed, and each one's `primary` and `alternates` list. Agents not listed are never touched. |
-| `models` | `{}` | Per-model defaults, keyed by `provider/modelId`. Only `thinking` is read; an entry for a model no route names is inert and warns nothing. |
+| `models` | `{}` | Per-model defaults, keyed by `provider/modelId`. `rail` and `thinking` are read; an entry for a model no route names is inert, though a `rail` that contradicts the model's prefix is still a wrong registration and warns. |
 | `sessionSwitchAt` | `75` | Used-percent at which the primary's **session** budget is considered tight |
 | `weeklySwitchAt` | `90` | The same for its **weekly** budget, deliberately higher — see [the policy](#the-policy) |
 | `margin` | `10` | An alternate must be **more than** this many points healthier, on the budget that triggered the move |
@@ -305,8 +356,9 @@ Bad configuration never stops the dispatcher from starting:
 - **Unparseable file** — logged to `console.error` and skipped whole, and the
   layers below it still apply. A half-applied config is harder to reason about
   than the defaults.
-- **Unknown key, malformed `model` (no `/`), unknown `rail`, a `thinking` that
-  is not one of the seven levels, a `models` key that is not a
+- **Unknown key, malformed `model` (no `/`), an unknown `rail` (on a candidate
+  or in `models`), a candidate whose model has no registered rail, a `thinking`
+  that is not one of the seven levels, a `models` key that is not a
   `provider/modelId`, a route left without a `primary`, an out-of-range number,
   an invalid agent name, a value of the wrong type** — logged, and the previous
   layer's value stands for that key alone. A typo in a project file cannot undo a

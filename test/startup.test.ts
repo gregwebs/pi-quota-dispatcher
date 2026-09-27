@@ -167,17 +167,24 @@ const SNIPPET_FILES: AgentFile[] = [
   { name: "Bad_Name", file: "/a/Bad_Name.md", model: "openai-codex/gpt-6-sol" },
 ];
 
-test("agentTableSnippet derives each rail from the model prefix", () => {
-  // Paste-ready means the config fragment as it would go in the file, so the
-  // table sits under an `agents` key (see the README's copy-me example).
-  const { agents } = JSON.parse(agentTableSnippet(SNIPPET_FILES).join("\n"));
+test("agentTableSnippet registers each rail once and names only models in the routes", () => {
+  // Paste-ready means the config fragment as it would go in the file: each
+  // model's rail is registered once under `models`, and each route names only
+  // the model it points at.
+  const { models, agents } = JSON.parse(agentTableSnippet(SNIPPET_FILES).join("\n"));
 
-  assert.deepEqual(agents, {
-    planner: { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } },
-    reviewer: { primary: { model: "openai-codex/gpt-6-astra", rail: "codex" } },
+  assert.deepEqual(models, {
+    "claude-bridge/claude-opus-5-5": { rail: "claude" },
+    "openai-codex/gpt-6-astra": { rail: "codex" },
     // Two names for the same rail; both must derive it.
-    writer: { primary: { model: "anthropic/claude-sonnet", rail: "claude" } },
-    rest: { primary: { model: "deepseek/deepseek-flash", rail: "deepseek" } },
+    "anthropic/claude-sonnet": { rail: "claude" },
+    "deepseek/deepseek-flash": { rail: "deepseek" },
+  });
+  assert.deepEqual(agents, {
+    planner: { primary: { model: "claude-bridge/claude-opus-5-5" } },
+    reviewer: { primary: { model: "openai-codex/gpt-6-astra" } },
+    writer: { primary: { model: "anthropic/claude-sonnet" } },
+    rest: { primary: { model: "deepseek/deepseek-flash" } },
   });
 });
 
@@ -217,7 +224,8 @@ test("unconfiguredNotice names the config file, lists the files, and carries the
   assert.ok(text.includes(configPath), text);
   assert.ok(text.includes("planner"), text);
   assert.ok(text.includes("reviewer"), text);
-  // The snippet's candidates: each file's model, with the rail derived.
+  // The snippet's candidates: each file's model, with the rail registered for
+  // it under `models`.
   assert.ok(text.includes("claude-bridge/claude-opus-5-5"), text);
   assert.ok(text.includes("openai-codex/gpt-6-astra"), text);
   assert.match(text, /"rail"\s*:\s*"claude"/, text);
@@ -447,7 +455,7 @@ for (const reason of ["startup", "new", "reload"]) {
       // The files found, including one the snippet cannot build a candidate for.
       assert.ok(text.includes("planner"), text);
       assert.ok(text.includes("reviewer"), text);
-      // The snippet: each file's current model, with the rail derived.
+      // The snippet: each file's current model, with the rail registered for it.
       assert.ok(text.includes("claude-bridge/claude-opus-5-5"), text);
       assert.ok(text.includes("openai-codex/gpt-6-astra"), text);
       assert.match(text, /"rail"\s*:\s*"claude"/, text);

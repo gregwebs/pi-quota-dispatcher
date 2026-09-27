@@ -1745,3 +1745,248 @@ test("describeConfig marks a base level built-in", () => {
   assert.ok(lines.includes("  agents.planner.primary.thinking = xhigh  [built-in]"), lines.join("\n"));
   assert.ok(lines.includes("  models.claude-bridge/claude-opus-5-5.thinking = low  [built-in]"), lines.join("\n"));
 });
+
+// ---------------------------------------------------------------- model rails
+
+test("a candidate that names only a model inherits the rail registered for it", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: {
+        models: { "claude-bridge/claude-opus-5-6": { rail: "claude" } },
+        agents: { planner: { primary: { model: "claude-bridge/claude-opus-5-6" } } },
+      },
+    },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.config.agents.planner.primary.rail, "claude");
+  // The rail is attributed to the layer that registered it, not the route's.
+  assert.equal(r.sources["agents.planner.primary.rail"], "project");
+  assert.equal(r.config.models["claude-bridge/claude-opus-5-6"].rail, "claude");
+  assert.equal(r.sources["models.claude-bridge/claude-opus-5-6.rail"], "project");
+});
+
+test("a rail registered in one layer completes a candidate in another, whatever the order", () => {
+  // The route is global and the registration is project: the models table is
+  // folded first, over every layer, so the two need not live in one file.
+  const r = mergeConfig(base(), [
+    { source: "global", data: { agents: { newbie: { primary: { model: "deepseek/deepseek-v3" } } } } },
+    { source: "project", data: { models: { "deepseek/deepseek-v3": { rail: "deepseek" } } } },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.config.agents.newbie.primary.rail, "deepseek");
+  assert.equal(r.sources["agents.newbie.primary.model"], "global");
+  assert.equal(r.sources["agents.newbie.primary.rail"], "project");
+});
+
+test("a models key written after agents in the same layer still completes the candidate", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: {
+        // JSON preserves this order, and the rail pass runs before any agent.
+        agents: { newbie: { primary: { model: "deepseek/deepseek-v3" } } },
+        models: { "deepseek/deepseek-v3": { rail: "deepseek" } },
+      },
+    },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.config.agents.newbie.primary.rail, "deepseek");
+});
+
+test("a candidate that states its own rail outranks the registered one", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: {
+        models: { "openai-codex/gpt-6-sol": { rail: "codex" } },
+        agents: { planner: { primary: { model: "openai-codex/gpt-6-sol", rail: "claude" } } },
+      },
+    },
+  ]);
+  assert.equal(r.config.agents.planner.primary.rail, "claude");
+  assert.equal(r.sources["agents.planner.primary.rail"], "project");
+  // The stated rail disagrees with the model's prefix, so it warns as before.
+  assert.ok(r.warnings.some((w) => w.toLowerCase().includes("rail")), r.warnings.join("\n"));
+});
+
+test("a layer that moves a candidate to another model re-resolves the registered rail", () => {
+  // The base primary carries the claude rail; moving to a model registered on
+  // codex must take codex rather than dragging claude along.
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: {
+        models: { "openai-codex/gpt-6-sol": { rail: "codex" } },
+        agents: { planner: { primary: { model: "openai-codex/gpt-6-sol" } } },
+      },
+    },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.config.agents.planner.primary.rail, "codex");
+  assert.equal(r.sources["agents.planner.primary.rail"], "project");
+});
+
+test("a layer can register a rail without restating the model's level", () => {
+  const r = mergeConfig(thinkingBase(), [
+    { source: "project", data: { models: { "claude-bridge/claude-opus-5-5": { rail: "claude" } } } },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.config.models["claude-bridge/claude-opus-5-5"].rail, "claude");
+  assert.equal(r.config.models["claude-bridge/claude-opus-5-5"].thinking, "low");
+  assert.equal(r.sources["models.claude-bridge/claude-opus-5-5.thinking"], "built-in");
+  assert.equal(r.sources["models.claude-bridge/claude-opus-5-5.rail"], "project");
+});
+
+test("the models table rejects an unknown rail and keeps the previous entry", () => {
+  const r = mergeConfig(
+    { ...base(), models: { "openai-codex/gpt-6-sol": { rail: "codex" } } },
+    [{ source: "project", data: { models: { "openai-codex/gpt-6-sol": { rail: "openai" } } } }],
+  );
+  assert.equal(r.config.models["openai-codex/gpt-6-sol"].rail, "codex");
+  assert.equal(r.sources["models.openai-codex/gpt-6-sol.rail"], "built-in");
+  assert.ok(
+    r.warnings.some((w) => w.includes('"models.openai-codex/gpt-6-sol.rail" must be one of')),
+    r.warnings.join("\n"),
+  );
+});
+
+test("a registered rail that reads as another account's model warns once, at the entry", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: {
+        models: { "openai-codex/gpt-6-sol": { rail: "claude" } },
+        agents: {
+          planner: { primary: { model: "openai-codex/gpt-6-sol" } },
+          reviewer: { primary: { model: "openai-codex/gpt-6-sol" } },
+        },
+      },
+    },
+  ]);
+  // Both routes name the model, but the mistake is in one place, so it is
+  // reported once there rather than on every candidate that inherits it.
+  const mismatches = r.warnings.filter((w) => w.includes("reads as"));
+  assert.equal(mismatches.length, 1, r.warnings.join("\n"));
+  assert.ok(mismatches[0].includes('"openai-codex/gpt-6-sol"'), mismatches[0]);
+  assert.equal(r.config.agents.planner.primary.rail, "claude");
+  assert.equal(r.config.agents.reviewer.primary.rail, "claude");
+});
+
+test("a candidate with neither its own rail nor a registered one is still rejected", () => {
+  const r = mergeConfig(base(), [
+    { source: "project", data: { agents: { newbie: { primary: { model: "claude-bridge/x" } } } } },
+  ]);
+  assert.equal(Object.hasOwn(r.config.agents, "newbie"), false);
+  const warning = r.warnings.find((w) => w.includes("newbie"));
+  assert.ok(warning, r.warnings.join("\n"));
+  assert.ok(warning.includes("needs a rail"), warning);
+});
+
+test("mergeConfig carries a base model rail through, marked built-in", () => {
+  const b: DispatcherConfig = {
+    ...base(),
+    models: { "claude-bridge/claude-opus-5-5": { rail: "claude" } },
+  };
+  const r = mergeConfig(b, []);
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.sources["models.claude-bridge/claude-opus-5-5.rail"], "built-in");
+});
+
+test("a base model rail that mismatches its key warns built-in", () => {
+  const b: DispatcherConfig = {
+    ...base(),
+    models: { "openai-codex/gpt-6-sol": { rail: "claude" } },
+  };
+  const r = mergeConfig(b, []);
+  assert.ok(
+    r.warnings.some((w) => w.startsWith("built-in: ") && w.includes("reads as")),
+    r.warnings.join("\n"),
+  );
+});
+
+test("describeConfig renders a registered rail with the model and per candidate", async () => {
+  const fs = fakeFs({
+    [GLOBAL_PATH]: JSON.stringify({
+      models: { "claude-bridge/claude-opus-5-6": { rail: "claude" } },
+      agents: { planner: { primary: { model: "claude-bridge/claude-opus-5-6" } } },
+    }),
+  });
+  const loaded = await loadConfig({
+    agentDir: AGENT_DIR,
+    cwd: CWD,
+    readFile: fs.readFile,
+    warn: () => {},
+    fileExists: () => true,
+  });
+
+  const lines = describeConfig(loaded);
+  assert.ok(
+    lines.includes("  models.claude-bridge/claude-opus-5-6.rail = claude  [global]"),
+    lines.join("\n"),
+  );
+  // The candidate's rail names the layer that registered it, where the model
+  // line names the layer that named the route.
+  assert.ok(lines.includes("  agents.planner.primary.rail = claude  [global]"), lines.join("\n"));
+  assert.ok(lines.includes("  agents.planner.primary.model = claude-bridge/claude-opus-5-6  [global]"), lines.join("\n"));
+  assert.ok(
+    lines.indexOf("  models.claude-bridge/claude-opus-5-6.rail = claude  [global]") <
+      lines.indexOf("  agents.planner.primary.rail = claude  [global]"),
+  );
+});
+
+test("an inherited rail is not carried to an unregistered replacement model", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "global",
+      data: {
+        models: { "custom/a": { rail: "claude" } },
+        agents: { newbie: { primary: { model: "custom/a" } } },
+      },
+    },
+    { source: "project", data: { agents: { newbie: { primary: { model: "custom/b" } } } } },
+  ]);
+  // The rail belonged to custom/a, and custom/b registers none, so the move is
+  // rejected rather than silently pointing custom/b at claude.
+  assert.equal(r.config.agents.newbie.primary.model, "custom/a");
+  assert.equal(r.config.agents.newbie.primary.rail, "claude");
+  assert.ok(
+    r.warnings.some((w) => w.includes("needs a rail") && w.includes("custom/b")),
+    r.warnings.join("\n"),
+  );
+});
+
+test("restating the same model keeps a rail the candidate stated itself", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "global",
+      data: {
+        models: { "custom/a": { rail: "codex" } },
+        agents: { planner: { primary: { model: "custom/a", rail: "claude" } } },
+      },
+    },
+    { source: "project", data: { agents: { planner: { primary: { model: "custom/a", thinking: "high" } } } } },
+  ]);
+  // The override survives a layer that restates the same model; only an actual
+  // move re-resolves the rail.
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.config.agents.planner.primary.rail, "claude");
+});
+
+test("a layer that changes only a level does not re-warn a registered mismatch", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "global",
+      data: {
+        models: { "openai-codex/gpt-6-sol": { rail: "claude" } },
+        agents: { planner: { primary: { model: "openai-codex/gpt-6-sol" } } },
+      },
+    },
+    { source: "project", data: { agents: { planner: { primary: { thinking: "high" } } } } },
+  ]);
+  // The mistake is at the models entry, so an unrelated level edit must not
+  // produce a second warning pointing at the project file.
+  const mismatches = r.warnings.filter((w) => w.includes("reads as"));
+  assert.equal(mismatches.length, 1, r.warnings.join("\n"));
+  assert.ok(mismatches[0].startsWith("global: "), mismatches[0]);
+});

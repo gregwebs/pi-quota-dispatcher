@@ -21,7 +21,9 @@ route or is skipped, and a skipped entry names no route at all.
 _Avoid_: route, routing rule, mapping, agent route entry, disabled route
 
 **Candidate**:
-One model on one rail, considered as a possible destination for an agent.
+One model on one rail, considered as a possible destination for an agent. The
+rail comes from the candidate's own `rail` when it states one, otherwise from the
+model's entry in the `models` table; a candidate with neither is rejected.
 _Avoid_: option, target, model entry
 
 **Thinking level**:
@@ -32,9 +34,11 @@ for is pi's business, not the config's: pi clamps.
 _Avoid_: thinking budget, reasoning effort, thinking mode, thinking setting
 
 **Model default**:
-The thinking level a model carries wherever a route names it, stated in the
-`models` table. The weakest of the three places a level can be stated — a route
-default and a candidate both outrank it — and inert for a model no route names.
+The rail and thinking level a model carries wherever a route names it, stated in
+the `models` table. The rail is the recommended place to register a model's
+account, and a candidate may state its own to override it. The level is the
+weakest of the three places one can be stated — a route default and a candidate
+both outrank it. Both are inert for a model no route names.
 _Avoid_: model config, per-model setting, model entry
 
 **Resolved level**:
