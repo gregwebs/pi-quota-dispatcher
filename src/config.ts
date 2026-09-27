@@ -25,9 +25,76 @@ import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export type Rail = "claude" | "codex" | "deepseek";
 
+/**
+ * A thinking level, spelled the way an agent file's `thinking:` line spells it.
+ *
+ * `off` is here because pi's own model-level type has it: an agent can be told
+ * not to think at all, and that is a legitimate thing for a route to ask for.
+ * Whether a given *model* can do a level is deliberately not this seam's
+ * business — pi clamps a level to what the model supports when the agent is
+ * spawned, so a level that is merely ambitious is not a configuration error.
+ */
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/** The permitted levels, in pi's own order. */
+export const THINKING_LEVELS: readonly ThinkingLevel[] = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+/** The levels as a rejection words them, e.g. `"off", "minimal", ...`. */
+const THINKING_LEVEL_LIST = THINKING_LEVELS.map((level) => `"${level}"`).join(", ");
+
+/**
+ * Whether `value` is a level this seam accepts.
+ *
+ * The set is spelled out here rather than taken from pi so that the config seam
+ * keeps its single job: rejecting a typo before it can be written into a file.
+ * A level this list accepts but the running pi does not know is pi's to clamp.
+ */
+export function isThinkingLevel(value: unknown): value is ThinkingLevel {
+  return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
+}
+
+/**
+ * Why `id` cannot key the `models` table, or `undefined` when it can.
+ *
+ * A model is named here the way pi names it and the way a candidate names it —
+ * `provider/modelId` — because that is what the entry is looked up by. An id
+ * with no slash can never match a candidate, so it would be a default that
+ * silently applies to nothing.
+ */
+export function modelIdRejection(id: string): string | undefined {
+  if (id.includes("/")) return undefined;
+  return `model "${id}" is not a provider/model id (needs "/")`;
+}
+
 export interface Candidate {
   model: string;
   rail: Rail;
+  /**
+   * The level this candidate asks for itself, which outranks both the route's
+   * default and the model's.
+   */
+  thinking?: ThinkingLevel;
+}
+
+/**
+ * What the `models` table holds for one model, wherever a route names it.
+ *
+ * Keyed by exact `provider/modelId`. An entry is a *default*: it applies to every
+ * candidate whose model it names, and it is outranked by the route's `thinking`
+ * and by the candidate's own. An entry for a model no route names is inert, and
+ * warns nothing — a table shared across machines and projects is a normal thing
+ * to have.
+ */
+export interface ModelDefault {
+  thinking?: ThinkingLevel;
 }
 
 /**
@@ -51,6 +118,12 @@ export interface Candidate {
  * the answer could be.
  */
 export interface AgentRoute {
+  /**
+   * The level every candidate on this route falls back to when the candidate
+   * itself names none. It outranks a model's own default, so a route can say
+   * "planning work thinks hard" once instead of on every model it might use.
+   */
+  thinking?: ThinkingLevel;
   primary: Candidate;
   alternates: Candidate[];
 }
@@ -101,6 +174,16 @@ export interface DispatcherConfig {
   weeklySwitchAt: number;
   /** ...and only when the alternate is at least this many points healthier. */
   margin: number;
+  /**
+   * Per-model defaults, keyed by `provider/modelId`.
+   *
+   * A model is named here so that every candidate using it inherits a thinking
+   * level without each route restating it. It is the weakest of the three
+   * places a level can be stated — route and candidate both outrank it — and it
+   * ships empty, because a default for a model this user does not use says
+   * nothing.
+   */
+  models: Record<string, ModelDefault>;
   /**
    * The agents this extension manages, keyed by agent name — a name is the
    * filename stem, `<agentDir>/<name>.md`.
@@ -243,11 +326,13 @@ export function railFromModel(model: string): Rail | undefined {
  *   sessionSwitchAt  75
  *   weeklySwitchAt   90
  *   margin           10
+ *   models           {}
  *
- * `agents` is empty, and that is the point. There is no opinion here about
- * which agents exist or where their work should go: a shipped table names files
- * the user never named and routes work to rails they never chose. The README
- * shows the snippet to paste instead.
+ * `models` and `agents` are both empty, and that is the point. There is no
+ * opinion here about which agents exist, where their work should go, or which
+ * model thinks how hard: a shipped table names files the user never named and
+ * routes work to rails they never chose. The README shows the snippet to paste
+ * instead.
  */
 export function defaultConfig(agentDir: string = getAgentDir()): DispatcherConfig {
   return {
@@ -259,6 +344,7 @@ export function defaultConfig(agentDir: string = getAgentDir()): DispatcherConfi
     sessionSwitchAt: 75,
     weeklySwitchAt: 90,
     margin: 10,
+    models: {},
     agents: {},
   };
 }
@@ -474,8 +560,11 @@ export interface MergeResult {
  *     entry (see `AGENT_NAME` and `agentNameRejection`)
  *   - a `model` that is not a string containing `/`
  *   - a `rail` that is not one of the three known rails
+ *   - a `thinking` that is not one of the levels pi accepts
  *   - a `model` whose prefix reads like a different rail's model than the one
  *     declared, which is what a partial override leaves behind
+ *   - a `models` key that is not a `provider/modelId`, or an entry that is not
+ *     an object, or an unrecognised key inside one
  *   - an `alternates` that is not an array, or that holds an element which is
  *     not a usable candidate: the list is accepted or rejected as a unit
  *   - an agent left without a `primary`, which leaves the previous entry for
@@ -525,6 +614,16 @@ function parseCandidate(
       } else {
         warn(`"${dotted}.rail" must be one of "claude", "codex", "deepseek"`);
       }
+    } else if (key === "thinking") {
+      // A level is validated for its *spelling* here and for nothing else. Pi
+      // clamps to what the model supports at spawn time, so an ambitious level
+      // is not an error and this seam has no business guessing at capability.
+      if (isThinkingLevel(fieldValue)) {
+        candidate.thinking = fieldValue;
+        sources.set(`${dotted}.thinking`, source);
+      } else {
+        warn(`"${dotted}.thinking" must be one of ${THINKING_LEVEL_LIST}`);
+      }
     } else {
       warn(`unknown key "${dotted}.${key}"`);
     }
@@ -564,11 +663,27 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       continue;
     }
     agents[agent] = {
+      ...(route.thinking !== undefined ? { thinking: route.thinking } : {}),
       primary: { ...route.primary },
       alternates: route.alternates.map((candidate) => ({ ...candidate })),
     };
   }
-  const config: DispatcherConfig = { ...base, agents };
+  // The `models` table is a base value like `agents`: entries a caller built
+  // programmatically are cloned so a merge cannot mutate the caller's object,
+  // and a key that cannot name a pi model is dropped with the warning a bad key
+  // on a layer would get. A key with a `/` in it can never be `__proto__` or
+  // `constructor`, which is what keeps an unguarded write onto `models` from
+  // reaching an inherited value.
+  const models: Record<string, ModelDefault> = {};
+  for (const [id, entry] of Object.entries(base.models)) {
+    const rejection = modelIdRejection(id);
+    if (rejection) {
+      warnings.push(`built-in: ${rejection}`);
+      continue;
+    }
+    models[id] = { ...entry };
+  }
+  const config: DispatcherConfig = { ...base, models, agents };
   const scalarTarget = config as unknown as Record<ScalarKey, string | number>;
 
   const sources: Record<string, ConfigSource> = {};
@@ -580,12 +695,24 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
   };
 
   for (const key of SCALAR_KEYS) setSource(key, "built-in");
+  for (const [id, entry] of Object.entries(config.models)) {
+    if (entry.thinking !== undefined) setSource(`models.${id}.thinking`, "built-in");
+  }
   for (const [agent, route] of Object.entries(config.agents)) {
     setSource(`agents.${agent}.primary.model`, "built-in");
     setSource(`agents.${agent}.primary.rail`, "built-in");
-    route.alternates.forEach((_, index) => {
+    // A level is only a value where one is actually stated, so only then does it
+    // get a source; there is no `undefined` for provenance to describe.
+    if (route.thinking !== undefined) setSource(`agents.${agent}.thinking`, "built-in");
+    if (route.primary.thinking !== undefined) {
+      setSource(`agents.${agent}.primary.thinking`, "built-in");
+    }
+    route.alternates.forEach((candidate, index) => {
       setSource(`agents.${agent}.alternates[${index}].model`, "built-in");
       setSource(`agents.${agent}.alternates[${index}].rail`, "built-in");
+      if (candidate.thinking !== undefined) {
+        setSource(`agents.${agent}.alternates[${index}].thinking`, "built-in");
+      }
     });
   }
 
@@ -641,7 +768,8 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       return;
     }
 
-    const holders: { primary?: Candidate; alternates?: Candidate[] } = {
+    const holders: { thinking?: ThinkingLevel; primary?: Candidate; alternates?: Candidate[] } = {
+      ...(existing?.thinking !== undefined ? { thinking: existing.thinking } : {}),
       ...(existing ? { primary: { ...existing.primary } } : {}),
       ...(existing ? { alternates: existing.alternates.map((c) => ({ ...c })) } : {}),
     };
@@ -657,6 +785,18 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       if (field === "disable" || field === "ignore") {
         // Already consumed as a skip instruction; a `false` one is valid and
         // inert, so it is not an unknown key.
+        continue;
+      }
+      if (field === "thinking") {
+        // The route's own default, which outranks a model's and is outranked by
+        // a candidate's. Rejecting it leaves the lower layer's level standing,
+        // like every other invalid value.
+        if (!isThinkingLevel(value)) {
+          warn(`"agents.${agent}.thinking" must be one of ${THINKING_LEVEL_LIST}`);
+          continue;
+        }
+        holders.thinking = value;
+        pending.set(`agents.${agent}.thinking`, source);
         continue;
       }
       if (field !== "primary" && field !== "alternates") {
@@ -706,13 +846,18 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       }
       if (!usable) continue;
 
+      // A list replacement replaces every element, so every source the old
+      // list carried is staged for clearing *before* the new list's sources are
+      // staged over it. Clearing only the indices the new list does not reach
+      // left an element it does reach — which inherits nothing, being parsed
+      // fresh — still carrying the old element's `thinking` source, so
+      // provenance named a level the effective config did not hold.
       const previousLength = holders.alternates?.length ?? 0;
       holders.alternates = nextAlternates;
-      // An index the new list does not reach has no value in the effective
-      // config, so it must carry no source: stage a clear for each.
-      for (let index = nextAlternates.length; index < previousLength; index++) {
+      for (let index = 0; index < previousLength; index++) {
         pending.set(`${dotted}[${index}].model`, null);
         pending.set(`${dotted}[${index}].rail`, null);
+        pending.set(`${dotted}[${index}].thinking`, null);
       }
       for (const stage of nextStages) {
         for (const [key, from] of stage) pending.set(key, from);
@@ -727,6 +872,7 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       return;
     }
     config.agents[agent] = {
+      ...(holders.thinking !== undefined ? { thinking: holders.thinking } : {}),
       primary: holders.primary,
       alternates: holders.alternates ?? [],
     };
@@ -777,6 +923,40 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
         continue;
       }
 
+      if (key === "models") {
+        if (!isPlainObject(value)) {
+          warn(`"models" must be an object`);
+          continue;
+        }
+        // Deep-merged per model, like `agents` is per agent, and validated per
+        // entry: an entry is a default several routes may inherit, so a typo in
+        // one model must not take the rest of the table down with it.
+        for (const [id, entryValue] of Object.entries(value)) {
+          const rejection = modelIdRejection(id);
+          if (rejection) {
+            warn(rejection);
+            continue;
+          }
+          if (!isPlainObject(entryValue)) {
+            warn(`model "${id}" must be an object`);
+            continue;
+          }
+          for (const [field, fieldValue] of Object.entries(entryValue)) {
+            if (field !== "thinking") {
+              warn(`unknown key "models.${id}.${field}"`);
+              continue;
+            }
+            if (!isThinkingLevel(fieldValue)) {
+              warn(`"models.${id}.thinking" must be one of ${THINKING_LEVEL_LIST}`);
+              continue;
+            }
+            config.models[id] = { ...config.models[id], thinking: fieldValue };
+            setSource(`models.${id}.thinking`, source);
+          }
+        }
+        continue;
+      }
+
       if (key === "routes") {
         // A hint, not an alias: the old spelling is never read.
         warn(`unknown key "routes" (renamed to "agents")`);
@@ -817,6 +997,42 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
 }
 
 /**
+ * The thinking level a candidate resolves to, or `undefined` when nothing names
+ * one.
+ *
+ * Three places can state a level, and the most specific wins:
+ *
+ *   candidate  the entry's own `thinking`, so one destination can differ from
+ *              its route without the route losing its default
+ *   route      `agents.<name>.thinking`, which says something about the *work*
+ *              — "planning thinks hard" — rather than about a model
+ *   model      `models.<provider/modelId>.thinking`, the weakest, because it
+ *              knows nothing about what the model is being asked to do
+ *
+ * `undefined` is a real answer, not a missing one: it means no layer had an
+ * opinion, and the agent file's own `thinking:` line is then left alone. Only a
+ * level that actually resolved is written, and the dispatcher keeps no record of
+ * what it wrote — see `upsertThinking` in `index.ts` for why there is no
+ * restore.
+ *
+ * A model entry is looked up with `Object.hasOwn`, so a candidate naming a model
+ * the table does not have cannot read an inherited value as a default. Model ids
+ * always contain a `/` (the seam rejects the rest), which already rules out the
+ * `Object.prototype` names.
+ */
+export function thinkingFor(
+  cfg: DispatcherConfig,
+  route: AgentRoute,
+  candidate: Candidate,
+): ThinkingLevel | undefined {
+  if (candidate.thinking !== undefined) return candidate.thinking;
+  if (route.thinking !== undefined) return route.thinking;
+  return Object.hasOwn(cfg.models, candidate.model)
+    ? cfg.models[candidate.model].thinking
+    : undefined;
+}
+
+/**
  * Provenance block for `/quota-dispatch`, so "where did this value come from?"
  * is answerable without opening three files.
  *
@@ -824,17 +1040,21 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
  *
  *   `config: built-in < global <path> (present|absent) < project <path> (present|absent)`
  *
- * Then one line per effective value, scalars in a fixed order followed by the
- * agents sorted by name, each rendered `<dotted-key> = <value>  [<source>]`:
+ * Then one line per effective value, scalars in a fixed order, then the
+ * `models` table sorted by model id, then the agents sorted by name, each
+ * rendered `<dotted-key> = <value>  [<source>]`:
  *
  *   `  sessionSwitchAt = 75  [built-in]`
  *
  * An agent renders one `.model`/`.rail` pair per candidate, `primary` first and
  * then each `alternates[<index>]` in priority order, so the list reads the way
- * it is consulted. An agent a layer disabled is not in the effective config and
- * has no candidates to render; it appears as the single line
- * `  agents.<name> = disabled  [<source>]`, which is what makes "why is this
- * agent not managed?" answerable from the same block.
+ * it is consulted. A level is rendered only where something actually states one
+ * — a route's `thinking`, a candidate's, and a model's — because "no level" is
+ * the absence of a value rather than a value of `undefined`, and a line for
+ * every model a route happens to use would be noise. An agent a layer disabled
+ * is not in the effective config and has no candidates to render; it appears as
+ * the single line `  agents.<name> = disabled  [<source>]`, which is what makes
+ * "why is this agent not managed?" answerable from the same block.
  *
  * Finally one `  warning: <text>` line per warning, if any.
  */
@@ -850,6 +1070,15 @@ export function describeConfig(loaded: LoadedConfig): string[] {
 
   for (const key of SCALAR_KEYS) {
     lines.push(`  ${key} = ${String(loaded.config[key])}  [${sourceOf(key)}]`);
+  }
+
+  // The `models` table is the user's own, and an entry no route names is inert
+  // rather than wrong, so every stated default is listed — including one
+  // nothing currently reads.
+  for (const id of Object.keys(loaded.config.models).sort()) {
+    const thinking = loaded.config.models[id].thinking;
+    if (thinking === undefined) continue;
+    lines.push(`  models.${id}.thinking = ${thinking}  [${sourceOf(`models.${id}.thinking`)}]`);
   }
 
   // A disabled agent is absent from `loaded.config.agents` by construction, so
@@ -876,10 +1105,18 @@ export function describeConfig(loaded: LoadedConfig): string[] {
         (candidate, index): [string, Candidate] => [`alternates[${index}]`, candidate],
       ),
     ];
+    // The route's default first, so the block reads weakest-to-strongest down
+    // to the candidates that may override it.
+    if (route.thinking !== undefined) {
+      lines.push(`  agents.${agent}.thinking = ${route.thinking}  [${sourceOf(`agents.${agent}.thinking`)}]`);
+    }
     for (const [slot, candidate] of slots) {
       const dotted = `agents.${agent}.${slot}`;
       lines.push(`  ${dotted}.model = ${candidate.model}  [${sourceOf(`${dotted}.model`)}]`);
       lines.push(`  ${dotted}.rail = ${candidate.rail}  [${sourceOf(`${dotted}.rail`)}]`);
+      if (candidate.thinking !== undefined) {
+        lines.push(`  ${dotted}.thinking = ${candidate.thinking}  [${sourceOf(`${dotted}.thinking`)}]`);
+      }
     }
   }
 

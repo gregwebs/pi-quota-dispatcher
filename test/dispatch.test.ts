@@ -11,15 +11,18 @@ import {
   type Rail,
   type RailState,
   type RailWindow,
+  type ThinkingLevel,
   DEFAULT_CONFIG,
   applyDecision,
   budgetUsed,
   createDispatcher,
   decide,
+  describeDecision,
   describeDecisionLines,
   parseClaudeUsage,
   parseCodexUsage,
   upsertModel,
+  upsertThinking,
 } from "../src/index.ts";
 
 // ---------------------------------------------------------------- parsing
@@ -219,7 +222,7 @@ test("applyDecision reports unchanged, and writes nothing, when only the quoting
   const src = `---\nname: agent\nmodel: 'claude-bridge/claude-opus-5-5'\n---\n\nBody.\n`;
   await writeFile(file, src, "utf8");
 
-  assert.equal(await applyDecision(file, "claude-bridge/claude-opus-5-5", false), "unchanged");
+  assert.equal(await applyDecision(file, "claude-bridge/claude-opus-5-5", undefined, false), "unchanged");
   assert.equal(await readFile(file, "utf8"), src, "an unchanged pass must not touch the file");
 });
 
@@ -231,7 +234,7 @@ test("applyDecision leaves a commented model line alone", async () => {
   const src = `---\nname: agent\nmodel: claude-bridge/claude-opus-5-5 # pinned\n---\n\nBody.\n`;
   await writeFile(file, src, "utf8");
 
-  assert.equal(await applyDecision(file, "claude-bridge/claude-opus-5-5", false), "unchanged");
+  assert.equal(await applyDecision(file, "claude-bridge/claude-opus-5-5", undefined, false), "unchanged");
   assert.equal(await readFile(file, "utf8"), src, "a commented line already naming the model must not change");
 });
 
@@ -241,8 +244,105 @@ test("applyDecision reports would-write on a dry run when the model differs", as
   const src = `---\nname: agent\nmodel: "claude-bridge/claude-opus-5-5"\n---\n\nBody.\n`;
   await writeFile(file, src, "utf8");
 
-  assert.equal(await applyDecision(file, "openai-codex/gpt-6-sol", true), "would-write");
+  assert.equal(await applyDecision(file, "openai-codex/gpt-6-sol", undefined, true), "would-write");
   assert.equal(await readFile(file, "utf8"), src);
+});
+
+// ---------------------------------------------------------------- thinking
+
+test("upsertThinking puts the level beside the model line", () => {
+  const src = `---\nname: x\nmodel: "a/b"\ntools: read\n---\n\nBody.\n`;
+  assert.equal(
+    upsertThinking(src, "high"),
+    `---\nname: x\nmodel: "a/b"\nthinking: high\ntools: read\n---\n\nBody.\n`,
+  );
+});
+
+test("upsertThinking replaces the active level and leaves a commented one alone", () => {
+  const src = `---\nname: x\n# thinking: low\nthinking: minimal\n---\n`;
+  assert.equal(upsertThinking(src, "high"), `---\nname: x\n# thinking: low\nthinking: high\n---\n`);
+});
+
+test("upsertThinking writes nothing when no layer stated a level", () => {
+  const src = `---\nname: x\nmodel: "a/b"\nthinking: low\n---\n\nBody.\n`;
+  assert.equal(upsertThinking(src, undefined), src);
+});
+
+test("upsertThinking is idempotent and respects quoting it did not write", () => {
+  const once = upsertThinking(`---\nname: x\n---\n`, "high");
+  assert.equal(upsertThinking(once, "high"), once);
+  // `thinking: "high"` names the same level, so the punctuation is left as it is
+  // rather than rewritten into a change the pass would then report.
+  const quoted = `---\nname: x\nthinking: "high"\n---\n`;
+  assert.equal(upsertThinking(quoted, "high"), quoted);
+});
+
+test("upsertThinking leaves a `thinking:` in the body alone", () => {
+  const src = `---\nname: x\nmodel: "a/b"\n---\n\nthinking: low in the body\n`;
+  const out = upsertThinking(src, "high");
+  assert.match(out, /^thinking: high$/m);
+  assert.match(out, /thinking: low in the body/);
+  assert.equal((out.match(/thinking:/g) ?? []).length, 2);
+});
+
+test("upsertThinking has nothing to write without usable frontmatter", () => {
+  assert.equal(upsertThinking("no frontmatter here", "high"), "no frontmatter here");
+  assert.equal(upsertThinking("---\nother: 1\n---\n", "high"), "---\nother: 1\n---\n");
+});
+
+test("applyDecision writes the model and its level together", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pqd-thinking-"));
+  const file = join(dir, "agent.md");
+  await writeFile(file, `---\nname: agent\nmodel: "a/b"\nthinking: low\n---\n\nBody.\n`, "utf8");
+
+  assert.equal(await applyDecision(file, "openai-codex/gpt-6-sol", "high", false), "written");
+  const after = await readFile(file, "utf8");
+  assert.match(after, /^model: "openai-codex\/gpt-6-sol"$/m);
+  assert.match(after, /^thinking: high$/m);
+  assert.match(after, /Body\./);
+});
+
+test("applyDecision is unchanged when the file already says both", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pqd-thinking-"));
+  const file = join(dir, "agent.md");
+  const src = `---\nname: agent\nmodel: "a/b"\nthinking: high\n---\n\nBody.\n`;
+  await writeFile(file, src, "utf8");
+
+  assert.equal(await applyDecision(file, "a/b", "high", false), "unchanged");
+  assert.equal(await readFile(file, "utf8"), src);
+  // The same pass with no level resolves writes nothing either — including for
+  // an agent whose file already states one, which is the whole of the "no
+  // restore" contract: the dispatcher has no opinion, so it does not remove it.
+  assert.equal(await applyDecision(file, "a/b", undefined, false), "unchanged");
+  assert.equal(await readFile(file, "utf8"), src);
+});
+
+test("a level already in the file survives a pass that resolves none", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pqd-thinking-"));
+  const file = join(dir, "agent.md");
+  await writeFile(file, `---\nname: agent\nmodel: "a/b"\n---\n\nBody.\n`, "utf8");
+
+  assert.equal(await applyDecision(file, "a/b", "low", false), "written");
+  assert.match(await readFile(file, "utf8"), /^thinking: low$/m);
+  // A pass with no level to resolve changes the model and leaves the line where
+  // it was — the one case where the file does not converge on the decision.
+  // Deliberate, and documented: only a forward guarantee is made.
+  assert.equal(await applyDecision(file, "c/d", undefined, false), "written");
+  const after = await readFile(file, "utf8");
+  assert.match(after, /^model: "c\/d"$/m);
+  assert.match(after, /^thinking: low$/m);
+});
+
+test("a level that has to be inserted lands beside the model line", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pqd-thinking-"));
+  const file = join(dir, "agent.md");
+  await writeFile(file, `---\nname: agent\nmodel: "a/b"\ntools: read\n---\n\nBody.\n`, "utf8");
+
+  assert.equal(await applyDecision(file, "c/d", "max", true), "would-write");
+  assert.equal(await applyDecision(file, "c/d", "max", false), "written");
+  const after = await readFile(file, "utf8");
+  assert.match(after, /^model: "c\/d"\nthinking: max$/m);
+  assert.match(after, /^tools: read$/m);
 });
 
 // ---------------------------------------------------------------- decision rendering
@@ -275,6 +375,26 @@ test("describeDecisionLines drops no passed-over candidate or reason", () => {
   assert.ok(text.includes("weekly 100% is itself tight"), text);
   assert.ok(text.includes("gpt-5.6-luna"), text);
   assert.ok(text.includes("not consulted"), text);
+});
+
+// The rendering a reader actually sees: the level a write will use is named on
+// the decision line, beside the model it applies to.
+test("describeDecision names the level it will write", () => {
+  const assign = (thinking?: ThinkingLevel): Decision => ({
+    agent: "planner",
+    file: "/a/planner.md",
+    kind: "assign",
+    model: "claude-bridge/claude-opus-5-5",
+    ...(thinking !== undefined ? { thinking } : {}),
+    why: "claude ok (session 0%, weekly 0%)",
+  });
+
+  assert.equal(describeDecision(assign("high")), "planner -> claude-bridge/claude-opus-5-5 (thinking: high)");
+  // No level is not rendered as one: the line stays what it always was.
+  assert.equal(describeDecision(assign()), "planner -> claude-bridge/claude-opus-5-5");
+
+  const hold: Decision = { agent: "planner", file: "/a/planner.md", kind: "hold", why: "claude unreadable — holding" };
+  assert.equal(describeDecision(hold), "planner -> (left as is)");
 });
 
 test("describeDecisionLines renders a hold as a headline plus its reasoning", () => {
@@ -415,6 +535,55 @@ test("decide assigns the primary while both rails have headroom", () => {
   const d = plannerDecision({ session: 0, weekly: 27 }, { session: 0, weekly: 64 });
   assert.equal(d.kind, "assign");
   assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
+});
+
+/**
+ * Narrow an assign-decision to its level, failing loudly if the dispatcher held.
+ * Whether the key is present at all is asserted separately, because "no opinion"
+ * is the absence of the key rather than a value of `undefined`.
+ */
+function assignedThinking(d: Decision): ThinkingLevel | undefined {
+  assert.equal(d.kind, "assign", `expected an assignment, got a hold: ${d.why}`);
+  return d.kind === "assign" ? d.thinking : undefined;
+}
+
+test("an assignment carries no level when no layer states one", () => {
+  const d = plannerDecision({ session: 0, weekly: 0 }, { session: 0, weekly: 0 });
+  assert.equal(d.kind === "assign" && Object.hasOwn(d, "thinking"), false);
+});
+
+// The three places a level can be stated, resolved against the same decision: a
+// model default is the weakest, so a route that says something about the *work*
+// overrides it, and a candidate overrides both.
+test("decide resolves the candidate over the route over the model", () => {
+  const route: AgentRoute = {
+    thinking: "medium",
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex", thinking: "off" }],
+  };
+  const withModelDefault: DispatcherConfig = {
+    ...cfg,
+    models: { "claude-bridge/claude-opus-5-5": { thinking: "low" } },
+  };
+  const headroom = rails({ session: 0, weekly: 0 }, { session: 0, weekly: 0 });
+  const tight = rails({ session: 95, weekly: 0 }, { session: 0, weekly: 0 });
+
+  assert.equal(assignedThinking(decide("planner", route, headroom, withModelDefault)), "medium");
+  assert.equal(assignedThinking(decide("planner", route, tight, withModelDefault)), "off");
+
+  // With no route default, the model's own entry is what is left.
+  const modelOnly: AgentRoute = { ...route, thinking: undefined };
+  assert.equal(assignedThinking(decide("planner", modelOnly, headroom, withModelDefault)), "low");
+
+  // And the pinned-to-primary case resolves it the same way, with no reading.
+  const pinned: AgentRoute = { thinking: "max", primary: route.primary, alternates: [] };
+  assert.equal(assignedThinking(decide("planner", pinned, headroom, cfg)), "max");
+});
+
+test("a hold carries no level to write", () => {
+  const d = decide("planner", AGENT_ROUTES.planner, rails({ ok: false, note: "HTTP 500" }, { session: 0, weekly: 0 }), cfg);
+  assert.equal(d.kind, "hold");
+  assert.equal(Object.hasOwn(d, "thinking"), false);
 });
 
 test("decide moves planner off claude when the session budget is tight", () => {
