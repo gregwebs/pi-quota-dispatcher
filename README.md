@@ -49,11 +49,62 @@ pi -e git:github.com/gregwebs/pi-quota-dispatcher
 
 Then `/reload`, and run `/quota-dispatch` to confirm it registered.
 
+## First run: it says what it needs
+
+Nothing is managed until you name it, so a fresh install fetches no quota and
+writes no file. What it does instead is say so. On `startup`, `new` and
+`reload` — not on `resume` or `fork`, which pick up work already in progress —
+it raises a warning naming the config file to edit, listing the agent files it
+found, and carrying a snippet you can paste:
+
+```
+quota-dispatcher: no agents are configured, so nothing is managed yet.
+Name them in ~/.pi/agent/quota-dispatch.json to start routing.
+For example:
+
+{
+  "agents": {
+    "planner": {
+      "primary": {
+        "model": "claude-bridge/claude-opus-5-5",
+        "rail": "claude"
+      }
+    }
+  }
+}
+
+Agent files found in ~/.pi/agent/agents:
+  planner.md — model: claude-bridge/claude-opus-5-5
+  writer.md — model: (none)
+
+Then /reload. Run /quota-dispatch at any time to see what it would do.
+```
+
+The snippet is built from the model each agent file **already** declares, and
+`rail` is derived from that model's prefix, so it is inert until you paste it.
+A file with no model, or with a model whose prefix is not one of the rails this
+extension reads, is listed but left out rather than guessed at.
+
+While the table is empty, a footer line (`quota-dispatcher: no agents
+configured`) holds the state, and clears as soon as a route exists. In modes
+with no footer there is nothing to render, so neither the ask nor the status is
+shown.
+
+`/quota-dispatch` still works while unconfigured: it prints one line per rail,
+which is the diagnostic you want when the quotas are what you came for. It is
+also where **unmanaged** files are reported — any `<agent dir>/<name>.md` that no
+route names is listed by the plain and `refresh` forms. The startup ask mentions
+them only while the table is empty; a configured install does not narrate the
+files it deliberately does not manage.
+
+Config is read once per extension load, so `/reload` is what picks up a new
+route — and what stops the ask.
+
 ## Commands
 
 | Command | Effect |
 |---|---|
-| `/quota-dispatch` | Show rail budgets and the current decision per agent. Read-only. |
+| `/quota-dispatch` | Show rail budgets and the current decision per agent, plus any agent files no route names. Read-only. |
 | `/quota-dispatch refresh` | Force a re-fetch, then show. Read-only. |
 | `/quota-dispatch apply` | Write the decisions out now. The only form that touches a file. |
 
@@ -79,11 +130,13 @@ rebranded distribution's config directory are honoured; the project path is
 built from pi's `CONFIG_DIR_NAME` rather than a hardcoded `.pi`.
 
 **Nothing is managed until you name it.** `agents` ships `{}` and an agent the
-file does not name is never touched — not routed, not read, not rewritten. That
-is deliberate: this extension writes to agent files, so a shipped table of names
-would edit files you never mentioned and move work onto rails you never chose.
-Copy this into `~/.pi/agent/quota-dispatch.json` and adjust the names and models
-to your own:
+file does not name is never touched — not routed, not rewritten, and read only
+for its `model:` when a report lists it as unmanaged. That is deliberate: this
+extension writes to agent files, so a shipped table of names would edit files
+you never mentioned and move work onto rails you never chose.
+A fresh install says so and offers a snippet built from the files it found — see
+[First run](#first-run-it-says-what-it-needs). Copy this into
+`~/.pi/agent/quota-dispatch.json` and adjust the names and models to your own:
 
 ```json
 {

@@ -25,10 +25,10 @@
  * Quota is read from two undocumented-but-stable endpoints the vendors' own
  * clients use. No credentials are ever logged.
  */
-import { existsSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { existsSync, type Stats } from "node:fs";
+import { open, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_CONFIG,
   type AgentRoute,
@@ -36,8 +36,11 @@ import {
   type DispatcherConfig,
   type LoadedConfig,
   type Rail,
+  agentNameRejection,
   describeConfig,
+  globalConfigPath,
   loadConfig,
+  railFromModel,
 } from "./config.ts";
 
 // Config is a separate module because it is read from disk at run time; it is
@@ -52,6 +55,7 @@ export {
   loadConfig,
   mergeConfig,
   projectConfigPath,
+  railFromModel,
 } from "./config.ts";
 export type {
   AgentRoute,
@@ -126,6 +130,11 @@ export type Outcome =
  * agent a previous evaluation had moved onto the alternate — dragging work back
  * onto the very rail that was under pressure. A hold has no model; the type now
  * says so, and callers cannot read one out by accident.
+ *
+ * `why` is human text, and it may span lines: the priority walk reports one note
+ * per candidate it passed over, so a route with several alternates puts each on
+ * its own line rather than joining them into one long sentence. Notes are never
+ * dropped for brevity — the rendered layout is `describeDecisionLines`'s job.
  */
 export type Decision =
   | { agent: string; file: string; kind: "assign"; model: string; why: string }
@@ -209,6 +218,19 @@ const OTHER_BUDGET: Record<Budget, Budget> = { session: "weekly", weekly: "sessi
 
 function thresholdFor(budget: Budget, cfg: DispatcherConfig): number {
   return budget === "session" ? cfg.sessionSwitchAt : cfg.weeklySwitchAt;
+}
+
+/**
+ * A headline with one line per note.
+ *
+ * The priority walk can pass over several alternates — some rejected on a
+ * reading, some never consulted because an earlier one won — and naming them all
+ * in one sentence produced a single unreadably long line. The notes are kept in
+ * full and separated by a newline; `describeDecisionLines` is what renders the
+ * layout.
+ */
+function withNotes(headline: string, notes: string[]): string {
+  return notes.length ? `${headline}\n${notes.join("\n")}` : headline;
 }
 
 /** Percentages arrive fractional and are only ever read to the point. */
@@ -410,14 +432,18 @@ export function decide(
     for (let index = 0; index < route.alternates.length; index++) {
       const candidate = route.alternates[index];
       const state = rails.get(candidate.rail);
+      // Named by model, not by rail alone: two alternates can share a rail, and
+      // "codex unreadable" twice would not say which readings were missing.
       if (!state || !state.ok) {
-        missing.push(`${candidate.rail} unreadable (${state?.note ?? "unknown"})`);
+        missing.push(
+          `${candidate.model} on ${candidate.rail} unreadable (${state?.note ?? "unknown"})`,
+        );
         continue;
       }
       const absent = absentBudgets(state);
       if (absent.length) {
         missing.push(
-          `${candidate.rail} did not report its ${absent.join(" and ")} budget (${budgetSummary(state)})`,
+          `${candidate.model} on ${candidate.rail} did not report its ${absent.join(" and ")} budget (${budgetSummary(state)})`,
         );
         continue;
       }
@@ -448,6 +474,15 @@ export function decide(
     }
 
     if (winner) {
+      // Everything after the winner lost its place rather than losing on health,
+      // and everything an earlier budget pass rejected is still part of the
+      // story: the reader asked "why this model?", so the notes carry every
+      // candidate the walk did not take, in the order it met them.
+      const notConsulted = route.alternates
+        .slice(winnerIndex + 1)
+        .map((c) => `${c.model} on ${c.rail} not consulted (lower priority than the winner)`);
+      const notes = [...reasons, ...rejected, ...notConsulted];
+
       // We stop at the first usable candidate, so one we could not read that
       // came earlier in order may have been that candidate. The missing reading
       // could have changed the answer, so we hold rather than guess past it.
@@ -456,24 +491,21 @@ export function decide(
           agent,
           file,
           kind: "hold",
-          why: `${missing.join("; ")} could have won before ${winner.model} on ${winner.rail} — holding`,
+          why: withNotes(
+            `an unreadable candidate could have won before ${winner.model} on ${winner.rail} — holding`,
+            [...missing, ...notes],
+          ),
         };
       }
-      // The walk stopped at the winner, so anything after it in priority order
-      // was never read. They lost their place to the winner rather than being
-      // rejected on health, and the line says so; a user asking "why not my
-      // second alternate?" sees the answer here.
-      const notConsulted = route.alternates
-        .slice(winnerIndex + 1)
-        .map((c) => `${c.model} on ${c.rail} not consulted (lower priority than the winner)`);
-      const notes = [...rejected, ...notConsulted];
-      const notesText = notes.length ? `; ${notes.join("; ")}` : "";
       return {
         agent,
         file,
         kind: "assign",
         model: winner.model,
-        why: `${primary.rail} ${budget} ${pct(used)} >= ${pct(threshold)}, choosing ${winner.model} on ${winner.rail} (${budget} ${pct(winnerUsed)})${notesText}`,
+        why: withNotes(
+          `${primary.rail} ${budget} ${pct(used)} >= ${pct(threshold)}, choosing ${winner.model} on ${winner.rail} (${budget} ${pct(winnerUsed)})`,
+          notes,
+        ),
       };
     }
 
@@ -485,7 +517,10 @@ export function decide(
         agent,
         file,
         kind: "hold",
-        why: `${missing.join("; ")} could have won on ${budget} (${primary.rail} ${pct(used)} >= ${pct(threshold)}) — holding`,
+        why: withNotes(
+          `an unreadable candidate could have won on ${budget} (${primary.rail} ${pct(used)} >= ${pct(threshold)}) — holding`,
+          [...missing, ...reasons, ...rejected],
+        ),
       };
     }
     reasons.push(...rejected);
@@ -496,11 +531,94 @@ export function decide(
     file,
     kind: "assign",
     model: route.primary.model,
-    why: reasons.length ? reasons.join("; ") : `${primary.rail} ok (${budgetSummary(primary)})`,
+    why: reasons.length
+      ? withNotes(
+          `${primary.rail} tight on ${tightBudgets.join(" and ")} (${budgetSummary(primary)}) and no alternate won`,
+          reasons,
+        )
+      : `${primary.rail} ok (${budgetSummary(primary)})`,
   };
 }
 
 // ---------------------------------------------------------------- frontmatter
+
+/**
+ * The frontmatter block of `src` — everything before the closing `---` line —
+ * or `undefined` when the file has no usable frontmatter.
+ */
+function frontmatter(src: string): string | undefined {
+  if (!src.startsWith("---")) return undefined;
+  const end = src.indexOf("\n---", 3);
+  if (end === -1) return undefined;
+  return src.slice(0, end);
+}
+
+/** The uncommented `model:` line, capturing everything after the colon. */
+const MODEL_LINE = /^model:[ \t]*(.*?)[ \t]*$/m;
+
+/**
+ * Strip one layer of quoting and any trailing comment, so the value read here is
+ * the model the file actually declares rather than the bytes around it.
+ *
+ * The value is read in order to be *compared* with the model the policy chose,
+ * and `model: X`, `model: "X"` and `model: X  # note` all name the same model.
+ * Discovery reads it through the same function, so the startup snippet proposes
+ * a model id rather than a model id with someone's comment glued to it.
+ *
+ * Anything ambiguous — an unterminated quote, an escape JSON does not accept —
+ * falls back to the raw text, which then fails the comparison and the line gets
+ * rewritten. Guessing the other way would be worse: it could report `unchanged`
+ * for a model that is not the one on disk.
+ */
+function decodeScalar(text: string): string {
+  const value = stripComment(text).trim();
+  const quote = value[0];
+  if (value.length >= 2 && value.endsWith(quote) && quote === '"') {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (typeof parsed === "string") return parsed;
+    } catch {
+      // Not a JSON string after all; the raw text cannot match a real model, so
+      // the line is rewritten.
+    }
+    return value;
+  }
+  if (value.length >= 2 && value.endsWith(quote) && quote === "'") {
+    // YAML escapes a single quote by doubling it, and has no other escapes.
+    return value.slice(1, -1).replaceAll("''", "'");
+  }
+  return value;
+}
+
+/**
+ * Drop a trailing YAML comment from a scalar. A `#` starts one only at the start
+ * of a line or after whitespace, and not inside quotes, so `a#b` stays whole.
+ */
+function stripComment(text: string): string {
+  let quote: string | undefined;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"') i++;
+      else if (ch === quote) quote = undefined;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "#" && (i === 0 || /\s/.test(text[i - 1]))) return text.slice(0, i);
+  }
+  return text;
+}
+
+/**
+ * The model the uncommented `model:` line declares, decoded, if any.
+ */
+function activeModel(head: string): string | undefined {
+  const match = MODEL_LINE.exec(head);
+  return match ? decodeScalar(match[1]) : undefined;
+}
 
 /**
  * Set the uncommented `model:` line inside the frontmatter block.
@@ -508,23 +626,211 @@ export function decide(
  * Commented alternatives (`# model:`) and unrelated keys (`fallbackModels:`)
  * are left untouched. If no uncommented line exists, one is inserted after
  * `name:`. Returns null when the file has no usable frontmatter.
+ *
+ * A file that already names the model returns `src` byte-for-byte, so a pass
+ * that changes nothing about where the agent points writes nothing and reports
+ * `unchanged`. Canonicalising the punctuation instead would rewrite — and report
+ * as `written` — a file whose effective model was already correct, which makes
+ * every pass look like it did something. The comparison is on the decoded
+ * value, so `model: X`, `model: "X"` and `model: X  # note` are all the same
+ * model; an undecodable line is rewritten rather than assumed equal.
  */
 export function upsertModel(src: string, model: string): string | null {
-  if (!src.startsWith("---")) return null;
-  const fmEnd = src.indexOf("\n---", 3);
-  if (fmEnd === -1) return null;
-
+  const head = frontmatter(src);
+  if (head === undefined) return null;
+  const tail = src.slice(head.length);
   const line = `model: ${JSON.stringify(model)}`;
-  const head = src.slice(0, fmEnd);
-  const tail = src.slice(fmEnd);
 
-  if (/^model:[^\n]*$/m.test(head)) {
-    return head.replace(/^model:[^\n]*$/m, line) + tail;
+  if (MODEL_LINE.test(head)) {
+    if (activeModel(head) === model) return src;
+    return head.replace(MODEL_LINE, line) + tail;
   }
   if (/^name:[^\n]*$/m.test(head)) {
     return head.replace(/^name:[^\n]*$/m, (l) => `${l}\n${line}`) + tail;
   }
   return null;
+}
+
+/**
+ * One `<agentDir>/<name>.md` file found on disk, with the model its frontmatter
+ * currently declares.
+ *
+ * `model` is the value of the uncommented `model:` line, decoded — the same
+ * value `upsertModel` compares against — and is absent when the file has no
+ * usable frontmatter or declares no model. A file is listed without one all the
+ * same: the ask names every file it found, including the ones it could not build
+ * a candidate from.
+ */
+export interface AgentFile {
+  name: string;
+  file: string;
+  model?: string;
+  /**
+   * The file is there but its frontmatter could not be read. Distinct from a
+   * file that declares no model: one is a fact about the file, the other is a
+   * fact about us, and the listing says which.
+   */
+  unreadable?: boolean;
+}
+
+/**
+ * Only the frontmatter is ever read, and it sits at the top of the file, so a
+ * bounded prefix is enough. Reading whole files would make every session start
+ * and every `/quota-dispatch` wait on the largest markdown file someone happens
+ * to keep in their agent directory.
+ */
+const FRONTMATTER_LIMIT = 64 * 1024;
+
+/** The first `FRONTMATTER_LIMIT` bytes of `file`, as text. */
+async function readPrefix(file: string): Promise<string> {
+  const handle = await open(file, "r");
+  try {
+    const buffer = Buffer.alloc(FRONTMATTER_LIMIT);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return buffer.toString("utf8", 0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Every agent definition in `agentDir`, sorted by name.
+ *
+ * A directory that is not there reads as no files: on a fresh install it usually
+ * is not there yet, and that is the state the ask is for. Reading never throws,
+ * and every name found is listed — a file we cannot read is still a file the
+ * user has, and "which of my files does this ignore?" is a question about what
+ * is on disk.
+ *
+ * Discovery is deliberately not a directory listing. `stat` is used rather than
+ * `readdir`'s file type because it follows symlinks (an agent file may well be
+ * one) and, unlike opening the file, cannot block on a FIFO; a file that is not
+ * a regular file is not an agent definition and is skipped.
+ */
+export async function readAgentFiles(agentDir: string): Promise<AgentFile[]> {
+  let names: string[];
+  try {
+    names = await readdir(agentDir);
+  } catch {
+    return [];
+  }
+
+  const files: AgentFile[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".md")) continue;
+    const file = join(agentDir, name);
+
+    let info: Stats;
+    try {
+      info = await stat(file);
+    } catch {
+      // A dangling symlink resolves to nothing, so there is no file to report.
+      continue;
+    }
+    if (!info.isFile()) continue;
+
+    const entry: AgentFile = { name: name.slice(0, -".md".length), file };
+    try {
+      const head = frontmatter(await readPrefix(file));
+      const model = head === undefined ? undefined : activeModel(head);
+      if (model !== undefined) entry.model = model;
+    } catch {
+      entry.unreadable = true;
+    }
+    files.push(entry);
+  }
+
+  return files.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+/**
+ * The candidates a startup snippet can derive from `files`, keyed by agent name.
+ *
+ * Shared by the snippet and the check for whether there is anything to paste, so
+ * the two cannot disagree about what counts as derivable. A file is left out —
+ * not guessed at — when it declares no model, when its prefix names a rail we do
+ * not know, or when the config seam would reject its name; every one of those
+ * would produce a table that warns the moment it is pasted.
+ */
+function derivableCandidates(files: AgentFile[]): Array<[string, Candidate]> {
+  const candidates: Array<[string, Candidate]> = [];
+  for (const file of files) {
+    if (file.model === undefined) continue;
+    if (agentNameRejection(file.name) !== undefined) continue;
+    const rail = railFromModel(file.model);
+    if (rail === undefined) continue;
+    candidates.push([file.name, { model: file.model, rail }]);
+  }
+  return candidates;
+}
+
+/**
+ * A paste-ready `agents` table built from the agent files found: each file's
+ * current `model:` becomes one primary, and `rail` is derived from the model's
+ * prefix.
+ *
+ * A file whose model has no recognised prefix contributes nothing — inventing a
+ * rail would be a guess the user then pastes and the loader then warns about —
+ * and neither does a file that declares no model at all. Returns the lines of a
+ * JSON object, so the caller can indent it into a message.
+ */
+export function agentTableSnippet(files: AgentFile[]): string[] {
+  const agents: Record<string, { primary: Candidate }> = {};
+  for (const [name, candidate] of derivableCandidates(files)) {
+    agents[name] = { primary: candidate };
+  }
+  return JSON.stringify({ agents }, null, 2).split("\n");
+}
+
+/**
+ * One line per agent file found, with the model it declares, so a reader can
+ * see which names exist and which of them are already pinned somewhere.
+ */
+export function describeAgentFiles(files: AgentFile[]): string[] {
+  return files.map((file) =>
+    file.unreadable
+      ? `  ${file.name}.md — unreadable`
+      : `  ${file.name}.md — model: ${file.model ?? "(none)"}`,
+  );
+}
+
+/**
+ * What a fresh, unconfigured install has to say for itself: which file to
+ * configure, a paste-ready snippet built from the agent files it found, and the
+ * list of those files.
+ *
+ * Pure, and separate from the UI call, so the wording is testable without a
+ * terminal. Unlike `describeAgentFiles` this is not a report — it exists to be
+ * read once, by someone who has just installed the extension.
+ */
+export function unconfiguredNotice(
+  configPath: string,
+  agentDir: string,
+  files: AgentFile[],
+): string[] {
+  const lines = [
+    "quota-dispatcher: no agents are configured, so nothing is managed yet.",
+    `Name them in ${configPath} to start routing.`,
+  ];
+
+  if (derivableCandidates(files).length) {
+    lines.push("For example:", "", ...agentTableSnippet(files));
+  } else if (files.length) {
+    // A snippet of `{"agents": {}}` would configure nothing, so say why there
+    // is nothing to paste rather than print it.
+    lines.push(
+      "None of the agent files below declares a model whose rail can be derived, so there is no snippet to paste yet.",
+    );
+  }
+
+  if (files.length) {
+    lines.push("", `Agent files found in ${agentDir}:`, ...describeAgentFiles(files));
+  } else {
+    lines.push("", `No agent files were found in ${agentDir}.`);
+  }
+
+  lines.push("", "Then /reload. Run /quota-dispatch at any time to see what it would do.");
+  return lines;
 }
 
 export async function applyDecision(
@@ -547,6 +853,24 @@ export function describeDecision(decision: Decision): string {
   return decision.kind === "hold"
     ? `${decision.agent} -> (left as is)`
     : `${decision.agent} -> ${decision.model}`;
+}
+
+/**
+ * One decision as the lines a report prints: the decision and its outcome, then
+ * the reasoning — one indented line per note.
+ *
+ * `why` already carries a newline between notes, because a route with several
+ * alternates names one rejected or never-consulted candidate each and joining
+ * them into a sentence produces a single unreadably long line. Splitting here
+ * keeps the note text itself untouched and puts the layout in one place, shared
+ * by the report and the `apply` output.
+ */
+export function describeDecisionLines(decision: Decision, outcome: Outcome): string[] {
+  const [headline, ...notes] = decision.why.split("\n");
+  return [
+    `${describeDecision(decision)}  [${outcome}]  (${headline})`,
+    ...notes.map((note) => `  ${note}`),
+  ];
 }
 
 // ---------------------------------------------------------------- rails
@@ -727,7 +1051,22 @@ export function createDispatcher(
     }
     lines.push("");
     for (const { decision, outcome } of await decideAll(rails, true)) {
-      lines.push(`${describeDecision(decision)}  [${outcome}]  (${decision.why})`);
+      lines.push(...describeDecisionLines(decision, outcome));
+    }
+
+    // Unlike the startup ask, this form reports unmanaged files whenever there
+    // are any. It is the diagnostic, and "which of my files is this ignoring?"
+    // is a question a configured install asks too; the ask stays quiet about
+    // them because a configured install deliberately does not manage them.
+    const unmanaged = (await readAgentFiles(cfg.agentDir)).filter(
+      (file) => !Object.hasOwn(cfg.agents, file.name),
+    );
+    if (unmanaged.length) {
+      lines.push(
+        "",
+        `unmanaged agent files in ${cfg.agentDir} (no route names them):`,
+        ...describeAgentFiles(unmanaged),
+      );
     }
     return lines;
   }
@@ -736,6 +1075,61 @@ export function createDispatcher(
 }
 
 // ---------------------------------------------------------------- extension
+
+/** Footer status key, so the line can be replaced and later cleared. */
+const STATUS_KEY = "quota-dispatch";
+
+/** The footer line an unconfigured install carries until its table is filled. */
+const STATUS_TEXT = "quota-dispatcher: no agents configured";
+
+/**
+ * The session reasons a fresh, unconfigured install asks for configuration on.
+ *
+ * `resume` and `fork` are deliberately not among them: they continue work the
+ * user is already in the middle of, and a setup warning is noise at that moment.
+ * The footer status still reports the state on those reasons, because that is a
+ * standing fact rather than an interruption.
+ */
+const ASK_REASONS: ReadonlySet<SessionStartEvent["reason"]> = new Set(["startup", "new", "reload"]);
+
+/**
+ * Nothing is managed until the table names something. An empty table means no
+ * quota request, no poll interval and no evaluation — the extension has no
+ * opinion about files the user never named, and must not spend an HTTP call
+ * discovering that.
+ */
+function managesNothing(cfg: DispatcherConfig): boolean {
+  return Object.keys(cfg.agents).length === 0;
+}
+
+/**
+ * Footer status is a rendering, so it obeys `hasUI` exactly as the notify does:
+ * in print and JSON modes there is no footer to hold a line.
+ */
+function setFooterStatus(ctx: ExtensionContext, text: string | undefined): void {
+  if (!ctx.hasUI) return;
+  ctx.ui.setStatus(STATUS_KEY, text);
+}
+
+/**
+ * The ask, and the status that holds the state between asks. Split out so the
+ * handler reads as the decision it is making — configured or not — rather than
+ * as UI plumbing.
+ */
+async function announceUnconfigured(
+  loaded: LoadedConfig,
+  ctx: ExtensionContext,
+  reason: SessionStartEvent["reason"],
+): Promise<void> {
+  setFooterStatus(ctx, STATUS_TEXT);
+  if (!ctx.hasUI || !ASK_REASONS.has(reason)) return;
+
+  const { agentDir } = loaded.config;
+  const configPath =
+    loaded.files.find((file) => file.source === "global")?.path ?? globalConfigPath();
+  const files = await readAgentFiles(agentDir);
+  ctx.ui.notify(unconfiguredNotice(configPath, agentDir, files).join("\n"), "warning");
+}
 
 export default function (pi: ExtensionAPI) {
   /**
@@ -766,9 +1160,7 @@ export default function (pi: ExtensionAPI) {
         const rows = await dispatcher.evaluate({ force: true });
         lines = [
           "[applied]",
-          ...rows.map(
-            (r) => `${describeDecision(r.decision)}  [${r.outcome}]  (${r.decision.why})`,
-          ),
+          ...rows.flatMap((r) => describeDecisionLines(r.decision, r.outcome)),
         ];
       } else {
         const force = a.includes("refresh");
@@ -786,24 +1178,40 @@ export default function (pi: ExtensionAPI) {
   // Awaited on purpose, so the first spawn of the session already sees current
   // frontmatter. Note that neither quota request sets a timeout yet, so a
   // stalled endpoint can delay session start — see the README limitations.
-  pi.on("session_start", async () => {
-    const { dispatcher } = await bootOnce();
+  //
+  // An unconfigured install evaluates nothing: with no agents there is nothing
+  // to write, and asking two vendors for quota to then decide about no files is
+  // a request the user never asked for. It says so instead.
+  pi.on("session_start", async (event, ctx) => {
+    const { loaded, dispatcher } = await bootOnce();
+
+    if (managesNothing(loaded.config)) {
+      await announceUnconfigured(loaded, ctx, event.reason);
+      return;
+    }
+
+    // Clears the footer line the state carried while the table was empty. The
+    // table is read once per extension load, so this is the same session that
+    // set it whenever it was set at all.
+    setFooterStatus(ctx, undefined);
     await dispatcher.evaluate().catch(() => {});
   });
 
   // Periodic re-evaluation so workflow and mention spawns, which bypass the
   // Agent tool, still see current frontmatter. Starts only once the config has
-  // been read, because the cadence is one of the things it configures.
+  // been read, because the cadence is one of the things it configures, and only
+  // when there is something to evaluate.
   void bootOnce().then(({ loaded, dispatcher }) => {
-    if (stopped) return;
+    if (stopped || managesNothing(loaded.config)) return;
     timer = setInterval(() => {
       void dispatcher.evaluate().catch(() => {});
     }, loaded.config.pollMs);
     timer.unref?.();
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     stopped = true;
     if (timer) clearInterval(timer);
+    setFooterStatus(ctx, undefined);
   });
 }
