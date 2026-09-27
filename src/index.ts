@@ -79,6 +79,13 @@ export type {
   SkipFlag,
 } from "./config.ts";
 
+import { checkModels, modelLookup } from "./models.ts";
+
+// The models module is where a config's model ids are resolved against the pi
+// that is running; re-exported here for the same reason as the config module.
+export { checkModels, modelLookup } from "./models.ts";
+export type { ModelCheckResult, ModelLookup, ModelRegistryLike } from "./models.ts";
+
 // ---------------------------------------------------------------- types
 
 /**
@@ -545,6 +552,27 @@ export function decide(
           reasons,
         )
       : `${primary.rail} ok (${budgetSummary(primary)})`,
+  };
+}
+
+/**
+ * The decision for an agent whose primary this pi cannot spawn.
+ *
+ * A hold, and a different kind of hold from the ones `decide` returns. Those are
+ * about a *reading* that is missing and could have changed the answer; this one
+ * is about a model that is known bad, where no reading could change anything.
+ * The distinction matters to a reader: "unreadable" is worth retrying, and an
+ * unknown model id needs the config edited.
+ *
+ * Pure, and a decision like any other, so the report and the `apply` output
+ * render it without a special case: `agent -> (left as is)  [held]  (...)`.
+ */
+export function heldDecision(agent: string, cfg: DispatcherConfig, model: string): Decision {
+  return {
+    agent,
+    file: join(cfg.agentDir, `${agent}.md`),
+    kind: "hold",
+    why: `this pi does not know model ${model} — a newer pi may; holding`,
   };
 }
 
@@ -1109,6 +1137,16 @@ export interface DispatcherDeps {
   fetchImpl?: typeof fetch;
   now?: () => number;
   /**
+   * Agents whose primary this pi cannot spawn, by agent name, each carrying the
+   * model id it did not recognise — the `held` record `checkModels` returns.
+   *
+   * They are held rather than evaluated: a model that cannot be spawned is known
+   * bad, so no quota reading could change the answer, and the agent's file is
+   * left exactly as the user left it. Absent or empty, every configured agent is
+   * decided the ordinary way.
+   */
+  held?: Readonly<Record<string, string>>;
+  /**
    * Fallback credential store for the Claude rail. Left unset, production takes
    * whichever one this platform has; tests inject a fake so that they never
    * read, or prompt for, the keychain of the machine they run on. An injected
@@ -1220,7 +1258,9 @@ export function createDispatcher(
     dry: boolean,
   ): Promise<Array<{ decision: Decision; outcome: Outcome }>> {
     const decisions = Object.entries(cfg.agents).map(([agent, route]) =>
-      decide(agent, route, rails, cfg),
+      deps.held && Object.hasOwn(deps.held, agent)
+        ? heldDecision(agent, cfg, deps.held[agent])
+        : decide(agent, route, rails, cfg),
     );
     return Promise.all(
       decisions.map(async (decision) => ({
@@ -1353,13 +1393,46 @@ export default function (pi: ExtensionAPI) {
    * layer every value came from. `/reload` is what picks up an edit, which is
    * the same deal as any other pi config file and keeps the polling cadence
    * from changing underfoot mid-session.
+   *
+   * Loading is separate from booting because the model check needs the
+   * `ExtensionContext`, and the module-load timer below is the one caller with
+   * none. It only needs the cadence, so it reads the config directly; every
+   * caller that can supply a context goes through `bootOnce`.
+   */
+  let loadedPromise: Promise<LoadedConfig> | undefined;
+  const loadedOnce = () => (loadedPromise ??= loadConfig());
+
+  /**
+   * Boot the extension against a context, once per extension load.
+   *
+   * Booting is where the running pi's model registry is consulted:
+   * `checkModels` drops candidates this pi cannot spawn before any decision is
+   * made. Its warnings ride along with the load warnings, so `/quota-dispatch`
+   * prints them in the same provenance block, and its `held` record is what
+   * makes an unresolvable primary hold rather than be written.
+   *
+   * This is why a boot needs the context, and why the timer reads the cached
+   * `boot` rather than starting one of its own: a boot without a registry skips
+   * the check silently, which would pin agents to models this pi cannot spawn.
+   * `session_start` always precedes the first tick, so the cache is warm by
+   * then; a tick before any session is a no-op rather than a ctx-less boot.
    */
   let boot: Promise<{ loaded: LoadedConfig; dispatcher: Dispatcher }> | undefined;
-  const bootOnce = () =>
-    (boot ??= loadConfig().then((loaded) => ({
-      loaded,
-      dispatcher: createDispatcher(loaded.config),
-    })));
+  const bootOnce = (ctx: ExtensionContext) =>
+    (boot ??= loadedOnce().then((base) => {
+      const checked = checkModels(base.config, modelLookup(ctx));
+      return {
+        // The checked config is the effective one, and the model warnings join
+        // the load warnings; `sources` still describe the config that resulted,
+        // because the check only drops candidates it cannot spawn.
+        loaded: {
+          ...base,
+          config: checked.config,
+          warnings: [...base.warnings, ...checked.warnings],
+        },
+        dispatcher: createDispatcher(checked.config, { held: checked.held }),
+      };
+    }));
 
   let timer: ReturnType<typeof setInterval> | undefined;
   let stopped = false;
@@ -1368,7 +1441,7 @@ export default function (pi: ExtensionAPI) {
     description: "Show subscription headroom and which model each agent is dispatched to",
     handler: async (args, ctx) => {
       const a = (args ?? "").trim();
-      const { loaded, dispatcher } = await bootOnce();
+      const { loaded, dispatcher } = await bootOnce(ctx);
 
       // Only this form writes. The plain and `refresh` forms are read-only.
       let lines: string[];
@@ -1399,7 +1472,7 @@ export default function (pi: ExtensionAPI) {
   // to write, and asking two vendors for quota to then decide about no files is
   // a request the user never asked for. It says so instead.
   pi.on("session_start", async (event, ctx) => {
-    const { loaded, dispatcher } = await bootOnce();
+    const { loaded, dispatcher } = await bootOnce(ctx);
 
     if (managesNothing(loaded.config)) {
       await announceUnconfigured(loaded, ctx, event.reason);
@@ -1417,10 +1490,16 @@ export default function (pi: ExtensionAPI) {
   // Agent tool, still see current frontmatter. Starts only once the config has
   // been read, because the cadence is one of the things it configures, and only
   // when there is something to evaluate.
-  void bootOnce().then(({ loaded, dispatcher }) => {
+  //
+  // This reads the config directly and does not boot: a boot needs a context to
+  // run the model check, and this is the one caller without one. Each tick
+  // therefore reuses the cached boot a session has already built, and does
+  // nothing at all if no session has started yet. Starting a boot here would
+  // skip the check silently, which is the failure this whole change is about.
+  void loadedOnce().then((loaded) => {
     if (stopped || managesNothing(loaded.config)) return;
     timer = setInterval(() => {
-      void dispatcher.evaluate().catch(() => {});
+      boot?.then(({ dispatcher }) => dispatcher.evaluate()).catch(() => {});
     }, loaded.config.pollMs);
     timer.unref?.();
   });

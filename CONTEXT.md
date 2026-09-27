@@ -73,5 +73,8 @@ _Avoid_: failover, migration, rotation
 **Hold**:
 A decision to assign nothing, leaving an agent's file exactly as the user left
 it. What the dispatcher does when a reading it does not have could have changed
-the answer — an unreadable rail, or a budget that was not reported.
+the answer — an unreadable rail, or a budget that was not reported. It is also
+the decision for an agent whose **primary** this pi cannot spawn: there the
+model is *known bad* rather than *unknown*, no reading could change the answer,
+and it is dropped from consideration instead of waited on.
 _Avoid_: skip, no-op, hold-off, fall back
