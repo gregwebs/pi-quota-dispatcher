@@ -24,9 +24,17 @@
  *
  * Quota is read from two undocumented-but-stable endpoints the vendors' own
  * clients use. No credentials are ever logged.
+ *
+ * The Claude credential is read from the file Claude Code writes, falling back
+ * to the macOS login keychain — which is the store Claude Code actually
+ * refreshes, and so the one that is current on a machine driven through a
+ * bridge rather than through `claude` directly. See
+ * docs/adr/0003-claude-credential-stores.md.
  */
+import { execFile } from "node:child_process";
 import { existsSync, type Stats } from "node:fs";
 import { open, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { userInfo } from "node:os";
 import { join, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import {
@@ -889,24 +897,226 @@ function deepseekState(): RailState {
   return { rail: "deepseek", ok: true, windows: [], metered: true, note: "metered" };
 }
 
-async function readClaudeToken(path: string): Promise<{ token: string } | { error: string }> {
-  if (!existsSync(path)) return { error: "no claude credentials file" };
+// ---------------------------------------------------------------- credentials
+
+/**
+ * One credential store's answer: the text it held, or why it could not be read.
+ *
+ * A store is read for its *text* rather than for a parsed token because the
+ * credential file and the login keychain hold the same JSON shape, so both are
+ * judged by the same parser instead of by two that could disagree.
+ */
+export type CredentialRead = { text: string } | { error: string };
+
+/**
+ * The raw JSON text of the macOS login keychain item Claude Code keeps its
+ * subscription credential in.
+ */
+export type KeychainRead = () => Promise<CredentialRead>;
+
+/**
+ * Runs one command and resolves its stdout as text, or the reason it failed.
+ * The seam `keychainReader` needs so that the argv it passes to `security` can
+ * be tested without a keychain on the machine running the tests.
+ */
+export type CommandRunner = (file: string, args: string[]) => Promise<CredentialRead>;
+
+/** The keychain item Claude Code writes its subscription credential to. */
+export const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
+
+/**
+ * Whether the login keychain belongs to the credential file at this path.
+ *
+ * The keychain holds the credential of the *default* Claude Code profile only:
+ * a `CLAUDE_CONFIG_DIR` profile keeps its credential in its own file and never
+ * writes the keychain. A `claudeCredsPath` naming anything but the default file
+ * therefore belongs to a different account, and the keychain must not answer
+ * for it — reporting one account's headroom while work draws on another is
+ * worse than reporting nothing.
+ */
+export function isDefaultClaudeCredsPath(path: string): boolean {
+  return path === DEFAULT_CONFIG.claudeCredsPath;
+}
+
+/**
+ * The macOS login keychain reader, or `undefined` on a platform that has no
+ * such store — so that no caller can consult one that does not exist, and a
+ * Linux install pays neither a subprocess nor an error line for it.
+ *
+ * On darwin it runs `security find-generic-password -a $USER -w -s "Claude
+ * Code-credentials"`: the same call Claude Code and the Agent SDK make, against
+ * the same item they write. `run` exists so that this argv is testable; the
+ * real runner passes `security` a timeout, because a wedged keychain must not
+ * stall the session start this is awaited from.
+ */
+export function keychainReader(
+  platform: NodeJS.Platform = process.platform,
+  run: CommandRunner = execFileRead,
+): KeychainRead | undefined {
+  if (platform !== "darwin") return undefined;
+  return () => run("security", keychainArgs());
+}
+
+/**
+ * `security find-generic-password -a <user> -w -s "Claude Code-credentials"`,
+ * the call that reads back what Claude Code wrote. `-a` is omitted only when
+ * the user cannot be determined at all, in which case searching by service
+ * alone is still the right guess; the keychain is per-user either way.
+ */
+function keychainArgs(): string[] {
+  const account = currentUser();
+  return [
+    "find-generic-password",
+    ...(account ? ["-a", account] : []),
+    "-w",
+    "-s",
+    CLAUDE_KEYCHAIN_SERVICE,
+  ];
+}
+
+/** `$USER` first, as the SDK does, then the passwd entry — which can be absent. */
+function currentUser(): string | undefined {
   try {
-    const oauth = JSON.parse(await readFile(path, "utf8"))?.claudeAiOauth;
-    if (!oauth?.accessToken) return { error: "no claudeAiOauth.accessToken" };
-    // Claude Code refreshes this on use; we only read it.
-    if (typeof oauth.expiresAt === "number" && oauth.expiresAt < Date.now()) {
-      return { error: "claude token expired (run Claude Code to refresh)" };
-    }
-    return { token: oauth.accessToken };
+    return process.env.USER || userInfo().username;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A stalled keychain must not stall the session start this read is awaited
+ * from, so the read is bounded the way the vendors' own clients bound it.
+ */
+const CLAUDE_KEYCHAIN_TIMEOUT_MS = 5_000;
+
+/**
+ * The real runner. Its stdout is the keychain item's password — the credential
+ * JSON — and its failures are reported as the one line a reader can act on:
+ * what `security` said, its exit code when it said nothing, or the reason the
+ * process never ran.
+ */
+const execFileRead: CommandRunner = (file, args) =>
+  new Promise((resolve) => {
+    execFile(
+      file,
+      args,
+      { encoding: "utf8", timeout: CLAUDE_KEYCHAIN_TIMEOUT_MS, windowsHide: true },
+      (err, stdout, stderr) => {
+        if (!err) return resolve({ text: stdout.trim() });
+        resolve({ error: failureDetail(err, stderr) });
+      },
+    );
+  });
+
+/**
+ * One line, because this ends up in a one-line report: `security`'s own
+ * message when it printed one, otherwise the spawn failure's.
+ */
+function failureDetail(err: Error, stderr: string): string {
+  if ((err as { killed?: boolean }).killed) return `timed out after ${CLAUDE_KEYCHAIN_TIMEOUT_MS}ms`;
+  const said = firstLine(stderr) ?? firstLine(err.message);
+  const code = (err as { code?: unknown }).code;
+  return said ?? (typeof code === "number" ? `exit ${code}` : "failed");
+}
+
+function firstLine(text: string): string | undefined {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+}
+
+/**
+ * Pulls `claudeAiOauth.accessToken` out of one store's JSON text.
+ *
+ * `now` is a parameter rather than a call to `Date.now()` so that the expiry
+ * comparison stays a pure function of its inputs. A token carrying no
+ * `expiresAt` is used: the shaping Claude Code writes always carries one, and a
+ * missing field is not evidence of expiry.
+ */
+export function parseClaudeToken(text: string, now: number): { token: string } | { error: string } {
+  let oauth: any;
+  try {
+    oauth = JSON.parse(text)?.claudeAiOauth;
   } catch (err) {
     return { error: `unreadable claude credentials: ${(err as Error).message}` };
   }
+  if (!oauth?.accessToken) return { error: "no claudeAiOauth.accessToken" };
+  // Claude Code refreshes this on use; we only read it.
+  if (typeof oauth.expiresAt === "number" && oauth.expiresAt < now) {
+    return { error: "claude token expired (run Claude Code to refresh)" };
+  }
+  return { token: oauth.accessToken };
+}
+
+export interface ClaudeTokenDeps {
+  /**
+   * Fallback store, consulted only when the file yields no usable token.
+   *
+   * On macOS the file is the store Claude Code *used* to write: the live token
+   * lives in the login keychain, and only Claude Code refreshes it there. A file
+   * that has gone stale is therefore the normal state for a machine driven
+   * through a bridge rather than through `claude` directly.
+   */
+  keychain?: KeychainRead;
+  /** Epoch milliseconds for the expiry comparison. Defaults to `Date.now()`. */
+  now?: number;
+}
+
+/**
+ * The Claude rail's token, or why no store could supply one.
+ *
+ * The credential file is read first, so a healthy file behaves exactly as it
+ * did before the keychain was consulted at all and an install with no keychain
+ * pays nothing for it. Only when the file cannot answer — absent, unreadable,
+ * shapeless, or holding an expired token — is the fallback read, and either
+ * store's token wins on equal terms: the first one that yields an unexpired
+ * token is the answer.
+ *
+ * When neither yields a token the error names both reasons, the file's first
+ * and the keychain's as `; keychain: <reason>`, because "why can't the Claude
+ * rail be read" is only answerable if the user learns that both stores were
+ * tried and how each failed. With no fallback the note is the file's reason
+ * alone.
+ */
+export async function readClaudeToken(
+  path: string,
+  deps: ClaudeTokenDeps = {},
+): Promise<{ token: string } | { error: string }> {
+  const now = deps.now ?? Date.now();
+
+  let file: CredentialRead;
+  if (!existsSync(path)) {
+    file = { error: "no claude credentials file" };
+  } else {
+    try {
+      file = { text: await readFile(path, "utf8") };
+    } catch (err) {
+      file = { error: `unreadable claude credentials: ${(err as Error).message}` };
+    }
+  }
+  const fromFile = "text" in file ? parseClaudeToken(file.text, now) : file;
+  if ("token" in fromFile) return fromFile;
+  if (!deps.keychain) return fromFile;
+
+  const read = await deps.keychain();
+  const fromKeychain = "text" in read ? parseClaudeToken(read.text, now) : read;
+  if ("token" in fromKeychain) return fromKeychain;
+  return { error: `${fromFile.error}; keychain: ${fromKeychain.error}` };
 }
 
 export interface DispatcherDeps {
   fetchImpl?: typeof fetch;
   now?: () => number;
+  /**
+   * Fallback credential store for the Claude rail. Left unset, production takes
+   * whichever one this platform has; tests inject a fake so that they never
+   * read, or prompt for, the keychain of the machine they run on. An injected
+   * reader is used whatever `claudeCredsPath` names — the default-path
+   * restriction is about which profile the *platform's* keychain belongs to,
+   * and an injected reader is a statement about that already.
+   */
+  readKeychain?: KeychainRead;
 }
 
 export interface Dispatcher {
@@ -923,9 +1133,15 @@ export function createDispatcher(
   const doFetch = deps.fetchImpl ?? fetch;
   const now = deps.now ?? (() => Date.now());
   const cache = new Map<Rail, { at: number; state: RailState }>();
+  // A `claudeCredsPath` naming anything but the default file belongs to another
+  // profile, whose credential the login keychain never holds — so the fallback
+  // is not offered to it.
+  const keychain =
+    deps.readKeychain ??
+    (isDefaultClaudeCredsPath(cfg.claudeCredsPath) ? keychainReader() : undefined);
 
   async function fetchClaude(): Promise<RailState> {
-    const cred = await readClaudeToken(cfg.claudeCredsPath);
+    const cred = await readClaudeToken(cfg.claudeCredsPath, { keychain, now: now() });
     if ("error" in cred) return unavailable("claude", cred.error);
 
     const res = await doFetch("https://api.anthropic.com/api/oauth/usage", {

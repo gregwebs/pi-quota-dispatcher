@@ -216,8 +216,13 @@ because the order is the one piece of intent the numbers cannot express.
 
 `claudeCredsPath` is settable too, defaulting to
 `~/.claude/.credentials.json`; choosing a different Claude profile is a real
-use. `agentDir` and `piAuthPath` (defaults `<agent dir>/agents` and
-`<agent dir>/auth.json`) are deliberately **not** settable from JSON: they are
+use. Naming **any other path** is a statement that the credential lives in that
+file and nowhere else, which also turns off the [macOS keychain
+fallback](#where-the-numbers-come-from): that keychain holds the default
+profile's credential, and reporting its headroom while a different profile runs
+would be worse than reporting nothing. `agentDir` and `piAuthPath` (defaults
+`<agent dir>/agents` and `<agent dir>/auth.json`) are deliberately **not**
+settable from JSON: they are
 paths pi itself owns, derived from `getAgentDir()`, so a file pointing them
 elsewhere would only make the dispatcher edit files nothing reads. Relocate
 them with `PI_CODING_AGENT_DIR`, and note that naming either in a config file
@@ -366,19 +371,44 @@ they change or move.
 
 | Rail | Credential | Endpoint |
 |---|---|---|
-| Claude | `~/.claude/.credentials.json` → `claudeAiOauth.accessToken` | `api.anthropic.com/api/oauth/usage` |
+| Claude | the macOS login keychain (`Claude Code-credentials`), falling back to `~/.claude/.credentials.json` → `claudeAiOauth.accessToken` | `api.anthropic.com/api/oauth/usage` |
 | Codex | `<agent dir>/auth.json` (normally `~/.pi/agent/auth.json`) → `openai-codex.access` + `accountId` | `chatgpt.com/backend-api/wham/usage` |
 
 Credentials are read, never logged, and never transmitted anywhere except to the
 provider that issued them.
 
+The Claude credential has two possible homes because Claude Code has two. On
+macOS the one it actually refreshes is the login keychain; the
+`~/.claude/.credentials.json` file is the store it used to write and now keeps
+as a plaintext fallback, so on a machine driven through a bridge rather than
+through `claude` directly the file sits there stale and expired while the
+keychain stays current. The file is therefore read first — a healthy file must
+not cost a subprocess, and macOS asks for keychain permission at most once —
+and the keychain is consulted only when that file yields no usable token, via
+`security find-generic-password -a $USER -w -s "Claude Code-credentials"`: the
+same call Claude Code and the Agent SDK make against the item Claude Code
+writes. When neither store can supply a token the note names both reasons, the
+file's first and the keychain's after `; keychain: `.
+
+The keychain is consulted only when `claudeCredsPath` still names the default
+file, because a `CLAUDE_CONFIG_DIR` profile keeps its credential in its own file
+and never writes the keychain: for any other path the keychain would answer for
+a different account.
+
 ## Caveats
 
 - **The Claude token expires** (typically within hours). Claude Code refreshes it
-  on use; this extension only reads it. Once it lapses, the Claude rail reports
-  unavailable and the dispatcher holds, leaving every agent file untouched. If
-  you stop using Claude Code the Claude side goes dormant — but nothing gets
-  moved onto the other plan to compensate, so the failure is quiet.
+  on use; this extension only reads it. Once *both* stores lapse — the file and,
+  on macOS, the keychain — the Claude rail reports unavailable and the dispatcher
+  holds, leaving every agent file untouched. If you stop using Claude Code the
+  Claude side goes dormant — but nothing gets moved onto the other plan to
+  compensate, so the failure is quiet.
+- **The macOS keychain read can ask for permission.** `security` is a different
+  process from the one that created the item, so macOS may prompt the first time
+  and remember your answer; choose *Always Allow* if you want the poll to stay
+  silent. A denied or wedged keychain is not fatal: the read is abandoned after
+  5s and the rail degrades to the file alone, exactly the behaviour it had before
+  the fallback existed.
 - **Global state.** The agent files are shared across all sessions and projects,
   exactly as they are when you edit them by hand. A project override therefore
   changes the model written into a file that every project reads; the project
