@@ -336,6 +336,41 @@ test("disable: true with nothing to remove removes nothing and records nothing",
   assert.equal(r.warnings.some((w) => w.includes("ghost")), false, r.warnings.join("\n"));
 });
 
+test("a higher layer re-adding a disabled agent clears the removal marker", () => {
+  // Reachable only through a caller-supplied base now that the built-ins ship
+  // no agents, but `mergeConfig` is exported and the invariant is about the
+  // effective config, not about which layer happened to supply the base.
+  const r = mergeConfig(base(), [
+    { source: "global", data: { agents: { planner: { disable: true } } } },
+    {
+      source: "project",
+      data: {
+        agents: {
+          planner: { primary: { model: "deepseek/deepseek-flash", rail: "deepseek" } },
+        },
+      },
+    },
+  ]);
+
+  assert.equal(r.config.agents.planner.primary.model, "deepseek/deepseek-flash");
+  assert.equal(r.sources["agents.planner.primary.model"], "project");
+  assert.deepEqual(r.warnings, []);
+  // The marker is a claim about the effective config, so it must not outlive
+  // the removal it records: an agent that is managed cannot also be reported as
+  // disabled, which is what a stale `agents.planner` key would render.
+  assert.equal("agents.planner" in r.sources, false);
+  const lines = describeConfig({ config: r.config, files: [], sources: r.sources, warnings: r.warnings });
+  assert.equal(
+    lines.some((l) => l.includes("agents.planner = disabled")),
+    false,
+    lines.join("\n"),
+  );
+  assert.ok(
+    lines.some((l) => l.includes("agents.planner.primary.model = deepseek/deepseek-flash")),
+    lines.join("\n"),
+  );
+});
+
 test("ignore: true contributes nothing, warns nothing and is absent from provenance", () => {
   const r = mergeConfig(base(), [
     {
