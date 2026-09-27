@@ -30,7 +30,8 @@
  * past passes. See docs/adr/0004-thinking-levels.md.
  *
  * Quota is read from two undocumented-but-stable endpoints the vendors' own
- * clients use. No credentials are ever logged.
+ * clients use. No credentials are ever logged, and every read is bounded and
+ * retried before a rail is called unreadable — see `QuotaReadPacing`.
  *
  * The Claude credential is read from the file Claude Code writes, falling back
  * to the macOS login keychain — which is the store Claude Code actually
@@ -140,6 +141,13 @@ export interface RailState {
    * reading the policy must not guess at.
    */
   metered?: boolean;
+  /**
+   * Free text: why a failed read failed, or a display-only qualifier such as
+   * `limit_reached=true`. A failed read that was given up on says how many
+   * attempts it cost (`HTTP 500 after 2 attempts`); a failure another request
+   * would not have fixed is reported as that failure alone — see
+   * `afterAttempts`.
+   */
   note?: string;
 }
 
@@ -590,8 +598,9 @@ export function decide(
  * A hold, and a different kind of hold from the ones `decide` returns. Those are
  * about a *reading* that is missing and could have changed the answer; this one
  * is about a model that is known bad, where no reading could change anything.
- * The distinction matters to a reader: "unreadable" is worth retrying, and an
- * unknown model id needs the config edited.
+ * The distinction matters to a reader: an unreadable rail is a reading that
+ * failed and may well succeed later, and an unknown model id needs the config
+ * edited.
  *
  * Pure, and a decision like any other, so the report and the `apply` output
  * render it without a special case: `agent -> (left as is)  [held]  (...)`.
@@ -1024,6 +1033,97 @@ function unavailable(rail: Rail, note: string): RailState {
 }
 
 /**
+ * How long one quota read may stall, and how many times it is asked again
+ * before the rail reads as unreadable.
+ *
+ * Both numbers are small on purpose. The read is awaited by `session_start`, so
+ * the point of the bound is that a vendor which has gone quiet costs a session
+ * a few seconds rather than the rest of the session. The retry is the other
+ * half: without it a single dropped connection reads as an outage and holds
+ * every agent on the route, which is a decision made on evidence a second
+ * request would have supplied.
+ *
+ * They are a seam rather than config-file keys: how long to wait for a socket
+ * is a fact about this network, not a routing preference, and the two timings
+ * only mean anything together.
+ *
+ * See docs/adr/0006-bounded-quota-reads.md for why the retry does not soften the
+ * hold rule.
+ */
+export interface QuotaReadPacing {
+  /** One attempt is abandoned after this long, signal and all. */
+  timeoutMs: number;
+  /** Attempts per rail, the first one included. */
+  attempts: number;
+  /** Wait between attempts. */
+  backoffMs: number;
+}
+
+/** The shipped timings — see `QuotaReadPacing`. */
+export const DEFAULT_QUOTA_READ: QuotaReadPacing = {
+  timeoutMs: 5_000,
+  attempts: 2,
+  backoffMs: 250,
+};
+
+/** Waits `ms`, for the pause between two attempts at the same endpoint. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * What one failed attempt is reported as, in the single line a note has room
+ * for.
+ *
+ * A timeout is reported by its budget rather than by the exception's own text
+ * ("The operation was aborted due to timeout"), because the number is the
+ * actionable part — it is the one the pacing chose and the one someone would
+ * change. A body that is not JSON is named as such: a reply truncated without
+ * framing and a captive portal both arrive looking like this, and the parser's
+ * message is the only thing that can hint at which one it was.
+ *
+ * A failed request is reported by the code its cause carries — `ECONNREFUSED`,
+ * `ENOTFOUND`, a TLS failure — and never by its message. undici flattens a
+ * network failure to a bare "fetch failed" anyway, while an error thrown while
+ * *building* the request quotes the header value it rejected — and one of those
+ * headers is the credential. Not repeating what a request error says about
+ * itself is how this file keeps its promise that no credential is ever logged.
+ */
+function attemptFailure(err: unknown, timeoutMs: number): string {
+  if ((err as { name?: unknown } | null)?.name === "TimeoutError") {
+    return `no answer within ${timeoutMs}ms`;
+  }
+  if (err instanceof SyntaxError) return `unreadable body (${err.message})`;
+  const cause = err instanceof Error ? (err.cause as { code?: unknown } | undefined) : undefined;
+  const code = typeof cause?.code === "string" ? cause.code : undefined;
+  return code ? `request failed (${code})` : "request failed";
+}
+
+/**
+ * Whether asking again could get a different answer. A 4xx is the endpoint's
+ * reply — an expired token stays expired and a moved endpoint stays moved — so
+ * only a server-side failure is worth a second request. A 429 is deliberately
+ * not on this list: it says "too many requests", and asking again 250ms later
+ * without honouring `Retry-After` is the thing it is asking us not to do.
+ */
+function retryableStatus(status: number): boolean {
+  return status >= 500;
+}
+
+/**
+ * The note a rail reads as when a failure worth retrying outlived its attempts.
+ *
+ * The count is said out loud only when there was more than one, so the report
+ * separates the two failures `unreadable` used to cover: a reading another
+ * request would not have fixed — a 401, a 429, a credential store with nothing
+ * to give — from one that was asked again and given up on. Both hold, but only
+ * the second is about the request rather than about what the endpoint said.
+ */
+function afterAttempts(note: string, attempts: number): string {
+  return attempts > 1 ? `${note} after ${attempts} attempts` : note;
+}
+
+/**
  * DeepSeek is metered per token rather than quota-capped, so it never blocks a
  * switch. Reported with no windows — "uncapped" rather than "unknown" — so the
  * policy can rest there without evidence to the contrary. `budgetUsed` reads
@@ -1263,6 +1363,13 @@ export interface DispatcherDeps {
    * and an injected reader is a statement about that already.
    */
   readKeychain?: KeychainRead;
+  /**
+   * Timings for the two bounded quota reads, overriding `DEFAULT_QUOTA_READ`
+   * field by field. Tests inject small ones so the timeout and retry paths can
+   * be exercised without waiting out the shipped timings, which is also why
+   * they are a seam here rather than config-file keys — see `QuotaReadPacing`.
+   */
+  quotaRead?: Partial<QuotaReadPacing>;
 }
 
 export interface Dispatcher {
@@ -1278,6 +1385,14 @@ export function createDispatcher(
 ): Dispatcher {
   const doFetch = deps.fetchImpl ?? fetch;
   const now = deps.now ?? (() => Date.now());
+  // Merged field by field rather than spread, so an injected `undefined` reads
+  // as "not stated" instead of replacing a shipped timing with one that has no
+  // value at all.
+  const pacing: QuotaReadPacing = {
+    timeoutMs: deps.quotaRead?.timeoutMs ?? DEFAULT_QUOTA_READ.timeoutMs,
+    attempts: deps.quotaRead?.attempts ?? DEFAULT_QUOTA_READ.attempts,
+    backoffMs: deps.quotaRead?.backoffMs ?? DEFAULT_QUOTA_READ.backoffMs,
+  };
   const cache = new Map<Rail, { at: number; state: RailState }>();
   // A `claudeCredsPath` naming anything but the default file belongs to another
   // profile, whose credential the login keychain never holds — so the fallback
@@ -1286,20 +1401,71 @@ export function createDispatcher(
     deps.readKeychain ??
     (isDefaultClaudeCredsPath(cfg.claudeCredsPath) ? keychainReader() : undefined);
 
+  /**
+   * A vendor's usage document, read under a timeout and retried while the
+   * failure is one another attempt could fix.
+   *
+   * Every attempt carries its own `AbortSignal.timeout`, because a stalled
+   * endpoint is the worst case rather than a mild one: a request that never
+   * answers is not a request that failed, so without the bound it would hold
+   * the evaluation that `session_start` awaits for as long as the vendor felt
+   * like staying quiet.
+   *
+   * The body read is inside the attempt on purpose. The signal stays attached
+   * to the response, so a body that stalls mid-stream is abandoned by the same
+   * deadline instead of hanging past it.
+   *
+   * What comes back is either the parsed document or the note the rail is
+   * unreadable for. The note carries an attempt count only when the read was
+   * given up on: an answer another request would only repeat — a 4xx, a 429 —
+   * is reported as that answer alone. The shape problem ("no usage windows
+   * returned") is left to the caller, because a well-formed answer we cannot use
+   * is still an answer.
+   */
+  async function readUsage(
+    url: string,
+    init: RequestInit,
+  ): Promise<{ json: unknown } | { note: string }> {
+    for (let attempt = 1; ; attempt++) {
+      if (attempt > 1) await sleep(pacing.backoffMs);
+      let note: string;
+      let retry: boolean;
+      try {
+        const res = await doFetch(url, {
+          ...init,
+          signal: AbortSignal.timeout(pacing.timeoutMs),
+        });
+        if (res.ok) return { json: await res.json() };
+        note = `HTTP ${res.status}`;
+        retry = retryableStatus(res.status);
+      } catch (err) {
+        // Everything thrown here is a failure of the request or of its payload:
+        // a dropped connection, a timeout — the signal stays attached to the
+        // response, so even a body that stalls mid-stream is abandoned by the
+        // same deadline — or a body that is not JSON at all, which is what a
+        // truncated reply and a captive portal both look like.
+        note = attemptFailure(err, pacing.timeoutMs);
+        retry = true;
+      }
+      if (!retry) return { note };
+      if (attempt >= pacing.attempts) return { note: afterAttempts(note, attempt) };
+    }
+  }
+
   async function fetchClaude(): Promise<RailState> {
     const cred = await readClaudeToken(cfg.claudeCredsPath, { keychain, now: now() });
     if ("error" in cred) return unavailable("claude", cred.error);
 
-    const res = await doFetch("https://api.anthropic.com/api/oauth/usage", {
+    const read = await readUsage("https://api.anthropic.com/api/oauth/usage", {
       headers: {
         Authorization: `Bearer ${cred.token}`,
         "anthropic-beta": "oauth-2025-04-20",
         Accept: "application/json",
       },
     });
-    if (!res.ok) return unavailable("claude", `HTTP ${res.status}`);
+    if ("note" in read) return unavailable("claude", read.note);
 
-    const windows = parseClaudeUsage(await res.json());
+    const windows = parseClaudeUsage(read.json);
     if (!windows.length) return unavailable("claude", "no usage windows returned");
     return { rail: "claude", ok: true, windows };
   }
@@ -1315,7 +1481,7 @@ export function createDispatcher(
     if (!cred?.access) return unavailable("codex", "no openai-codex.access");
     if (!cred?.accountId) return unavailable("codex", "no openai-codex.accountId");
 
-    const res = await doFetch("https://chatgpt.com/backend-api/wham/usage", {
+    const read = await readUsage("https://chatgpt.com/backend-api/wham/usage", {
       headers: {
         Authorization: `Bearer ${cred.access}`,
         "ChatGPT-Account-Id": cred.accountId,
@@ -1325,9 +1491,9 @@ export function createDispatcher(
         "User-Agent": "Mozilla/5.0",
       },
     });
-    if (!res.ok) return unavailable("codex", `HTTP ${res.status}`);
+    if ("note" in read) return unavailable("codex", read.note);
 
-    const { windows, limited } = parseCodexUsage(await res.json());
+    const { windows, limited } = parseCodexUsage(read.json);
     if (!windows.length) return unavailable("codex", "no rate_limit windows returned");
     if (!limited) return { rail: "codex", ok: true, windows };
     // `limit_reached` means blocked outright, not merely close, so every budget
@@ -1573,8 +1739,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Awaited on purpose, so the first spawn of the session already sees current
-  // frontmatter. Note that neither quota request sets a timeout yet, so a
-  // stalled endpoint can delay session start — see the README limitations.
+  // frontmatter. Each quota request is bounded and retried, so the worst a
+  // stalled endpoint can cost is `DEFAULT_QUOTA_READ`'s two attempts — see the
+  // README caveats.
   //
   // An unconfigured install evaluates nothing: with no agents there is nothing
   // to write, and asking two vendors for quota to then decide about no files is

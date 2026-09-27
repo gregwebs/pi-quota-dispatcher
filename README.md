@@ -453,6 +453,18 @@ are weighed separately:
    window as "0% used" is how a rail that was blocked outright once came to look
    like the roomiest place to send work.
 
+   A rail is only called unreadable once the reading was given a real chance:
+   every request is bounded by a timeout and a request that failed for a reason
+   another one could fix is asked again (see [Where the numbers come
+   from](#where-the-numbers-come-from)). What the reading cannot tell apart, the
+   note does. A note with no count is a reading that asking again would not have
+   fixed: the endpoint's answer, however unhelpful — `HTTP 401`, a rate limit
+   asking us to slow down, a 200 carrying none of the windows this rail reports —
+   or a local store that had nothing to give. `HTTP 500 after 2 attempts` is the
+   other kind: a rail that was asked twice and given up on. Both hold — the
+   reading is missing either way — but a hold that says which one it was is
+   explainable rather than looking like a refusal.
+
 A model this pi cannot spawn is the opposite case: it is *known bad*, not a
 missing reading, so it is dropped from consideration — a primary that cannot be
 spawned holds, and an unknown alternate is skipped — because no reading could
@@ -532,6 +544,24 @@ file, because a `CLAUDE_CONFIG_DIR` profile keeps its credential in its own file
 and never writes the keychain: for any other path the keychain would answer for
 a different account.
 
+Both reads are **bounded**, because the evaluation that `session_start` awaits
+depends on them. Each attempt is abandoned by a 5s timeout, and a failed attempt
+is retried once after 250ms; a rail still unreadable after that is a missing
+reading like any other, so it holds rather than falling through to a later
+alternate.
+
+Anything that goes wrong while making the request is retried — a 5xx, DNS, TLS, a
+dropped connection, a body that stalled mid-stream, or a body that is not the
+JSON this endpoint promises, since a reply truncated without framing and a
+captive portal arrive looking the same. What is *not* retried is an answer the
+endpoint will simply repeat: a 4xx (an expired token, a moved endpoint), a 429
+asking us to slow down, or a 200 whose payload carries none of the windows this
+rail reports. The report distinguishes the two: a failure with no attempt count
+is not one another request would have changed, and a counted one is a request
+that was still being tried when the read stopped. The timings are deliberately
+not config-file keys: how long to wait for a socket is a fact about this network,
+not a routing preference. See [0006](docs/adr/0006-bounded-quota-reads.md).
+
 ## Caveats
 
 - **The Claude token expires** (typically within hours). Claude Code refreshes it
@@ -559,9 +589,19 @@ a different account.
   to. So when a budget hovers around its threshold — primary session at 90,
   alternate oscillating either side of 80 — an agent can alternate between rails
   on successive polls. Making the policy stateful is a known open improvement.
-- **Quota requests have no timeout yet.** Neither fetch sets an abort signal, so
-  a stalled endpoint delays the evaluation that `session_start` awaits. The
-  practical effect is a slow session start, not lost data.
+- **A stalled endpoint delays session start, but only briefly.** Each quota read
+  is abandoned after 5s and retried once after 250ms, so a vendor that has gone
+  quiet costs a session about 10s — a few seconds more on macOS, where a Claude
+  credential that has to fall back to the keychain waits out its own 5s first,
+  since the two rails are read in parallel. The agents whose route depends on
+  that reading then *hold*, exactly as they do for any other missing reading,
+  rather than being switched to an alternate chosen on evidence nobody read; rule
+  5 of [the policy](#the-policy) says which routes those are.
+- **A failed reading is cached like a successful one.** A rail that is still down
+  after both attempts stays unreadable until its cached reading lapses (`ttlMs`):
+  a plain `/quota-dispatch` run, or another `session_start` inside that window,
+  reports the same failed reading instead of trying again. `/quota-dispatch
+  refresh` (and `apply`) is what forces a fresh read.
 - **Cosmetic duplication.** When the dispatcher selects a model that also appears
   in your commented notes, you get `model: X` alongside `# model: X`. Harmless,
   and deduping would mean deleting your notes.
