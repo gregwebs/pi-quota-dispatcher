@@ -254,6 +254,16 @@ Bad configuration never stops the dispatcher from starting:
 - **A configured agent with no file** at `<agent dir>/<name>.md` — logged at
   load, with the path to go and create, and the agent stays configured in the
   meantime.
+- **A model id this pi does not know** — a config can outlive the pi that
+  validated it: an id renamed upstream, a typo, a config copied from another
+  machine. Every configured candidate is resolved at boot against the running
+  pi's registry, and each miss is logged once per occurrence, naming the key it
+  came from (`agents.reviewer.primary.model: this pi does not know model
+  openai-codex/gpt-astra-6 — a newer pi may`). An agent whose **primary** is
+  unknown is **held**, so its file is left exactly as it is; an **alternate**
+  that is unknown is skipped, and the alternates after it stay eligible. If
+  every alternate on a route is skipped, the route is left with none — the same
+  as `alternates: []` — so the agent stays pinned to its primary.
 
 Agent names are filenames (`<agent dir>/<name>.md`), so they must be lowercase
 letters, digits and dashes, starting with a letter (`planner`,
@@ -324,6 +334,11 @@ are weighed separately:
    all back onto the rail that was under pressure. Reading a missing 5-hour
    window as "0% used" is how a rail that was blocked outright once came to look
    like the roomiest place to send work.
+
+A model this pi cannot spawn is the opposite case: it is *known bad*, not a
+missing reading, so it is dropped from consideration — a primary that cannot be
+spawned holds, and an unknown alternate is skipped — because no reading could
+make it spawnable.
 
 A rail is *metered* when it is billed per token rather than quota-capped. That
 is a real reading of zero pressure, not a gap, so unlike everything else in
@@ -428,6 +443,11 @@ a different account.
 - **Cosmetic duplication.** When the dispatcher selects a model that also appears
   in your commented notes, you get `model: X` alongside `# model: X`. Harmless,
   and deduping would mean deleting your notes.
+- **The model check is only as fresh as the running pi.** Each configured model
+  id is resolved against the pi that is running, so a model a *newer* pi knows
+  is reported as unknown by an older one. When a model you expect is reported as
+  unknown, either upgrade pi — a newer pi may know it — or correct the id;
+  `pi --list-models` lists what this pi knows.
 
 ## Development
 

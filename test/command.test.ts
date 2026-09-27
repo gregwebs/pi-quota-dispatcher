@@ -145,13 +145,31 @@ interface Ui {
   setStatus: (key: string, text?: string) => void;
 }
 
-type CommandHandler = (args: string, ctx: { hasUI: boolean; ui: Ui }) => Promise<void>;
-type EventHandler = (event: { reason: string }, ctx: { hasUI: boolean; ui: Ui }) => Promise<void>;
+/** The one piece of the real `ExtensionContext` this extension reads. */
+interface ModelRegistryLike {
+  find(provider: string, modelId: string): unknown;
+}
+
+/**
+ * The slice of pi's extension context the handlers see. `modelRegistry` is
+ * real pi's; a test opts into it so every existing test keeps exercising a
+ * context that has none (the feature-detected, unchanged path).
+ */
+interface Ctx {
+  hasUI: boolean;
+  ui: Ui;
+  modelRegistry?: ModelRegistryLike;
+}
+
+type CommandHandler = (args: string, ctx: Ctx) => Promise<void>;
+type EventHandler = (event: { reason: string }, ctx: Ctx) => Promise<void>;
 
 /** What a test can drive once the extension is installed. */
 interface Harness {
   /** Run the `quota-dispatch` command and return the text it notified. */
   run: (args: string) => Promise<string>;
+  /** As `run`, but every notification in order — a warning may be its own. */
+  runAll: (args: string) => Promise<string[]>;
   /** Fire the `session_start` handler the extension registered. */
   sessionStart: (reason?: string) => Promise<void>;
   /** Everything the extension pushed to the UI, in order. */
@@ -168,7 +186,7 @@ async function withExtension(
   fx: Fixture,
   body: (h: Harness) => Promise<void>,
   fetchFactory: () => typeof fetch = stubFetch,
-  opts: { hasUI?: boolean } = {},
+  opts: { hasUI?: boolean; modelRegistry?: ModelRegistryLike } = {},
 ): Promise<void> {
   const previousEnv = process.env[ENV_AGENT_DIR];
   const previousCwd = process.cwd();
@@ -184,12 +202,13 @@ async function withExtension(
   const eventHandlers: Record<string, EventHandler> = {};
   let command: CommandHandler | undefined;
 
-  const makeCtx = (): { hasUI: boolean; ui: Ui } => ({
+  const makeCtx = (): Ctx => ({
     hasUI,
     ui: {
       notify: (text: string, level?: string) => notifications.push({ text, level: level ?? "" }),
       setStatus: (key: string, text?: string) => statuses.push({ key, text }),
     },
+    ...(opts.modelRegistry ? { modelRegistry: opts.modelRegistry } : {}),
   });
 
   const api = {
@@ -214,6 +233,11 @@ async function withExtension(
         await handler(args, makeCtx());
         assert.equal(notifications.length, 1, "the command should notify exactly once");
         return notifications[0].text;
+      },
+      runAll: async (args: string) => {
+        notifications.length = 0;
+        await handler(args, makeCtx());
+        return notifications.map((n) => n.text);
       },
       sessionStart: async (reason = "startup") => {
         await eventHandlers.session_start?.({ reason }, makeCtx());
@@ -550,4 +574,117 @@ test("an empty table still reports one line per rail and writes nothing", async 
   });
 
   assert.equal(await readFile(fx.plannerFile, "utf8"), before, "the diagnostic must be read-only");
+});
+
+// ---------------------------------------------------------------- model registry (issue #14)
+
+/**
+ * The running pi's model registry. `find` is the only method this extension
+ * reads: it answers the model, or undefined when this pi cannot spawn it.
+ */
+function registry(known: Record<string, string[]>): ModelRegistryLike {
+  return {
+    find: (provider, modelId) => (known[provider]?.includes(modelId) ? { provider, id: modelId } : undefined),
+  };
+}
+
+/**
+ * A route whose primary this pi does not know. The fixture's `planner.md` stays
+ * on the claude primary, so the plain report has something concrete to hold
+ * over: claude session 90 would otherwise switch to the codex alternate.
+ */
+const UNKNOWN_PRIMARY_AGENTS = {
+  planner: {
+    primary: { model: "claude-bridge/claude-sol-9", rail: "claude" },
+    alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
+  },
+};
+
+test("an unknown primary is held, and named in the command output", async () => {
+  const fx = await fixture(2_147_483_647, UNKNOWN_PRIMARY_AGENTS);
+
+  await withExtension(
+    fx,
+    async ({ runAll }) => {
+      const text = (await runAll("")).join("\n");
+      assert.ok(text.includes("planner -> (left as is)"), text);
+      assert.ok(text.includes("[held]"), text);
+      assert.ok(text.includes("this pi does not know model claude-bridge/claude-sol-9"), text);
+    },
+    stubFetch,
+    { modelRegistry: registry({ "openai-codex": ["gpt-6-sol"] }) },
+  );
+});
+
+// The other half of feature detection, end to end: with no registry on the
+// context the same install is decided exactly as it was before this ticket.
+test("without a model registry the same install still reports the switch", async () => {
+  const fx = await fixture(2_147_483_647, UNKNOWN_PRIMARY_AGENTS);
+
+  await withExtension(fx, async ({ runAll }) => {
+    const text = (await runAll("")).join("\n");
+    assert.ok(text.includes("planner -> openai-codex/gpt-6-sol"), text);
+    assert.ok(!text.includes("this pi does not know model"), text);
+  });
+});
+
+/**
+ * A route whose *alternate* this pi does not know. The primary is fine, so the
+ * check must thread the cleaned config: dropping the unknown alternate and
+ * letting the next one win. If the extension used only the `held` record and
+ * ignored `result.config`, `session_start` would select and *write* the model
+ * this pi cannot spawn — the exact regression issue #14 is about.
+ */
+const SKIPPED_ALTERNATE_AGENTS = {
+  planner: {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [
+      { model: "openai-codex/gpt-sol-6", rail: "codex" }, // unknown to this pi
+      { model: "openai-codex/gpt-6-sol", rail: "codex" }, // known
+    ],
+  },
+};
+
+test("session_start never writes an unknown alternate: the next alternate wins", async () => {
+  const fx = await fixture(2_147_483_647, SKIPPED_ALTERNATE_AGENTS);
+  assert.match(
+    await readFile(fx.plannerFile, "utf8"),
+    /^model: "claude-bridge\/claude-opus-5-5"$/m,
+    "precondition: the fixture starts on the known claude primary",
+  );
+
+  await withExtension(
+    fx,
+    async ({ sessionStart }) => {
+      await sessionStart();
+    },
+    stubFetch,
+    {
+      modelRegistry: registry({
+        "claude-bridge": ["claude-opus-5-5"],
+        "openai-codex": ["gpt-6-sol"],
+      }),
+    },
+  );
+
+  const after = await readFile(fx.plannerFile, "utf8");
+  assert.ok(!after.includes("gpt-sol-6"), `the unknown model must never be written:\n${after}`);
+  assert.match(after, /^model: "openai-codex\/gpt-6-sol"$/m, after);
+});
+
+test("session_start with a registry holds an unknown primary, leaving the file alone", async () => {
+  const fx = await fixture(2_147_483_647, UNKNOWN_PRIMARY_AGENTS);
+  const before = await readFile(fx.plannerFile, "utf8");
+
+  await withExtension(
+    fx,
+    async ({ sessionStart }) => {
+      await sessionStart();
+      assert.equal(await readFile(fx.plannerFile, "utf8"), before, "a held primary must not be written");
+    },
+    stubFetch,
+    { modelRegistry: registry({ "openai-codex": ["gpt-6-sol"] }) },
+  );
+
+  assert.equal(await readFile(fx.plannerFile, "utf8"), before, "a held primary must not be written");
 });
