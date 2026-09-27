@@ -351,6 +351,31 @@ test("decide walks alternates in priority order and takes the first usable one",
   assert.ok(d.why.includes("deepseek/deepseek-flash"), d.why);
 });
 
+test("two alternates on one rail are told apart by model, not just rail", () => {
+  // Both candidates draw on codex, so they see the same reading. Rail-only text
+  // would print the same sentence twice, or name a rail the winner also sits on,
+  // and the reader could not tell which candidate was passed over — which is why
+  // rejections and "not consulted" notes name the model.
+  const sameRail: AgentRoute = {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [
+      { model: "openai-codex/gpt-6-sol", rail: "codex" },
+      { model: "openai-codex/gpt-5.6-luna", rail: "codex" },
+    ],
+  };
+  const d = decide(
+    "planner",
+    sameRail,
+    railMap(
+      railState("claude", { session: 90, weekly: 0 }),
+      railState("codex", { session: 20, weekly: 0 }),
+    ),
+    cfg,
+  );
+  assert.equal(assignedModel(d), "openai-codex/gpt-6-sol");
+  assert.ok(d.why.includes("openai-codex/gpt-5.6-luna on codex not consulted"), d.why);
+});
+
 test("an alternate within margin is passed over for a later usable one", () => {
   const d = decide(
     "planner",
