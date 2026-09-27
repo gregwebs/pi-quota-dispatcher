@@ -50,6 +50,7 @@ import {
   type Candidate,
   type DispatcherConfig,
   type LoadedConfig,
+  type ModelDefault,
   type Rail,
   type ThinkingLevel,
   agentNameRejection,
@@ -893,9 +894,10 @@ function derivableCandidates(files: AgentFile[]): Array<[string, Candidate]> {
 }
 
 /**
- * A paste-ready `agents` table built from the agent files found: each file's
- * current `model:` becomes one primary, and `rail` is derived from the model's
- * prefix.
+ * A paste-ready config fragment built from the agent files found: each file's
+ * current `model:` becomes one primary, and the rail derived from that model's
+ * prefix is registered once in the `models` table, so the candidates themselves
+ * name only a model.
  *
  * A file whose model has no recognised prefix contributes nothing — inventing a
  * rail would be a guess the user then pastes and the loader then warns about —
@@ -903,11 +905,13 @@ function derivableCandidates(files: AgentFile[]): Array<[string, Candidate]> {
  * JSON object, so the caller can indent it into a message.
  */
 export function agentTableSnippet(files: AgentFile[]): string[] {
-  const agents: Record<string, { primary: Candidate }> = {};
+  const models: Record<string, ModelDefault> = {};
+  const agents: Record<string, { primary: { model: string } }> = {};
   for (const [name, candidate] of derivableCandidates(files)) {
-    agents[name] = { primary: candidate };
+    models[candidate.model] = { rail: candidate.rail };
+    agents[name] = { primary: { model: candidate.model } };
   }
-  return JSON.stringify({ agents }, null, 2).split("\n");
+  return JSON.stringify({ models, agents }, null, 2).split("\n");
 }
 
 /**

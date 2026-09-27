@@ -89,11 +89,22 @@ export interface Candidate {
  *
  * Keyed by exact `provider/modelId`. An entry is a *default*: it applies to every
  * candidate whose model it names, and it is outranked by the route's `thinking`
- * and by the candidate's own. An entry for a model no route names is inert, and
- * warns nothing — a table shared across machines and projects is a normal thing
- * to have.
+ * and by the candidate's own. An entry for a model no route names is inert — a
+ * table shared across machines and projects is a normal thing to have — except
+ * that a `rail` contradicting the model's own prefix is a wrong registration
+ * whether or not anything routes to it, and warns.
  */
 export interface ModelDefault {
+  /**
+   * The rail this model draws on, wherever a route names it.
+   *
+   * The place to register a rail: a model belongs to one account, so stating it
+   * here keeps every candidate that names the model from repeating it. A
+   * candidate may still state its own rail, which outranks this one, and a
+   * layer that moves a candidate to another model re-resolves the rail from
+   * this table rather than gluing the old one to the new model.
+   */
+  rail?: Rail;
   thinking?: ThinkingLevel;
 }
 
@@ -177,11 +188,12 @@ export interface DispatcherConfig {
   /**
    * Per-model defaults, keyed by `provider/modelId`.
    *
-   * A model is named here so that every candidate using it inherits a thinking
-   * level without each route restating it. It is the weakest of the three
-   * places a level can be stated — route and candidate both outrank it — and it
-   * ships empty, because a default for a model this user does not use says
-   * nothing.
+   * A model is named here so that every candidate using it inherits its rail
+   * and its thinking level without each route restating them. The rail is the
+   * recommended place to register the account a model draws on; the level is
+   * the weakest of the three places one can be stated — route and candidate
+   * both outrank it. The table ships empty, because a default for a model this
+   * user does not use says nothing.
    */
   models: Record<string, ModelDefault>;
   /**
@@ -305,6 +317,19 @@ export function railFromModel(model: string): Rail | undefined {
   if (model.startsWith("openai-codex/")) return "codex";
   if (model.startsWith("deepseek/")) return "deepseek";
   return undefined;
+}
+
+/**
+ * The rail `model`'s prefix implies when that disagrees with `rail`, or
+ * `undefined` when the prefix names no rail we know or agrees with `rail`.
+ *
+ * A prefix that names no rail is not evidence of a mistake, so it never warns;
+ * this only answers "does this stated rail contradict the model id?", which is
+ * asked wherever a rail is stated — on a candidate and in the `models` table.
+ */
+function mismatchedRail(model: string, rail: Rail): Rail | undefined {
+  const implied = railFromModel(model);
+  return implied !== undefined && implied !== rail ? implied : undefined;
 }
 
 /**
@@ -534,11 +559,16 @@ export interface MergeResult {
 /**
  * Fold parsed layers over `base`, validating as it goes.
  *
- * Deep per agent: a layer that names one agent only touches that agent, and a
- * candidate that names only `model` keeps the base `rail`. Two things are not
- * deep, and both are deliberate. `alternates` is replaced as a whole whenever a
- * layer mentions it (see `AgentRoute`), and the skip flags act on the entry as a
- * unit (see `SkipFlag`).
+ * Deep per agent: a layer that names one agent only touches that agent. The
+ * `models` table is folded first, over every layer, before any agent is read: a
+ * candidate that states no rail of its own resolves the rail against the fully
+ * merged table, so the model and the route that names it can live in different
+ * layers. A layer that moves a candidate to another model re-resolves that
+ * model's registered rail; a layer that states a rail, or changes no model,
+ * keeps the rail beneath it, field-wise. Two things about agents are not deep,
+ * and both are deliberate. `alternates` is replaced as a whole whenever a layer
+ * mentions it (see `AgentRoute`), and the skip flags act on the entry as a unit
+ * (see `SkipFlag`).
  *
  * There is no `null`. It used to mean "remove this", which made one mistyped
  * value silently delete a route. Removal is now `disable: true`, which says what
@@ -561,10 +591,14 @@ export interface MergeResult {
  *   - a `model` that is not a string containing `/`
  *   - a `rail` that is not one of the three known rails
  *   - a `thinking` that is not one of the levels pi accepts
+ *   - a `models` key that is not a `provider/modelId`, or an entry that is not
+ *     an object, or an unrecognised key inside one, or a `rail` that is not one
+ *     of the three known rails, or a registered rail that reads like a
+ *     different account's model than its key
+ *   - a candidate left with no rail: one that states none and whose model has
+ *     no registered rail cannot name an account to route to
  *   - a `model` whose prefix reads like a different rail's model than the one
  *     declared, which is what a partial override leaves behind
- *   - a `models` key that is not a `provider/modelId`, or an entry that is not
- *     an object, or an unrecognised key inside one
  *   - an `alternates` that is not an array, or that holds an element which is
  *     not a usable candidate: the list is accepted or rejected as a unit
  *   - an agent left without a `primary`, which leaves the previous entry for
@@ -584,6 +618,22 @@ export interface MergeResult {
  * warned; the caller then leaves the value it already holds standing. The staged
  * sources are returned rather than written, so a candidate that is rejected
  * after being partly read leaves provenance untouched.
+ *
+ * A candidate may state a `rail`, or leave it to the `models` table. The table
+ * is the recommended single place for it, so a layer that *moves* the candidate
+ * to another model re-resolves the rail from that model's entry rather than
+ * keeping the rail the old model carried; if the new model registers none, an
+ * inherited rail is dropped and the candidate rejected, because that rail
+ * belonged to the model being left. A rail a candidate stated itself is kept
+ * across a model change, field-wise, like every other candidate field. A layer
+ * that states a rail, or restates the same model, leaves the lower value
+ * standing. A candidate with neither a rail of its own nor a registered one is
+ * rejected.
+ *
+ * `registeredRail` is the *fully merged* table (see `mergeConfig`), so a rail
+ * registered in any layer can complete a candidate in any other. `inheritedRail`
+ * records which candidates already carry a table rail, so the distinction
+ * survives the field-wise clone of a lower layer's candidate.
  */
 function parseCandidate(
   value: unknown,
@@ -591,6 +641,8 @@ function parseCandidate(
   current: Candidate | undefined,
   source: ConfigSource,
   warn: (message: string) => void,
+  registeredRail: (model: string) => { rail: Rail; source: ConfigSource } | undefined,
+  inheritedRail: WeakSet<Candidate>,
 ): { candidate: Candidate; sources: Map<string, ConfigSource> } | undefined {
   if (!isPlainObject(value)) {
     warn(`"${dotted}" must be an object`);
@@ -599,10 +651,20 @@ function parseCandidate(
 
   const candidate: Partial<Candidate> = current ? { ...current } : {};
   const sources = new Map<string, ConfigSource>();
+  // Whether the rail we start from came from the models table rather than a
+  // statement on a candidate. It decides two things: a table rail is checked
+  // where it is registered rather than here, and a layer that moves the
+  // candidate to an unregistered model must not drag it along.
+  const currentFromTable = current !== undefined && inheritedRail.has(current);
+  // Whether this layer states the field itself. A stated rail outranks the
+  // model's; a stated model moves the candidate and re-resolves its rail.
+  let statedModel = false;
+  let statedRail = false;
   for (const [key, fieldValue] of Object.entries(value)) {
     if (key === "model") {
       if (typeof fieldValue === "string" && fieldValue.includes("/")) {
         candidate.model = fieldValue;
+        statedModel = true;
         sources.set(`${dotted}.model`, source);
       } else {
         warn(`"${dotted}.model" must be a string containing "/"`);
@@ -610,6 +672,7 @@ function parseCandidate(
     } else if (key === "rail") {
       if (isRail(fieldValue)) {
         candidate.rail = fieldValue;
+        statedRail = true;
         sources.set(`${dotted}.rail`, source);
       } else {
         warn(`"${dotted}.rail" must be one of "claude", "codex", "deepseek"`);
@@ -629,21 +692,58 @@ function parseCandidate(
     }
   }
 
+  // The rail follows the model it names, but only when the model actually
+  // changes: restating the same model must not throw away a rail the candidate
+  // itself stated.
+  let fromTable = false;
+  if (statedRail) {
+    // The candidate states its own rail, which outranks the table's.
+  } else if (statedModel && candidate.model !== current?.model) {
+    const registered = candidate.model === undefined ? undefined : registeredRail(candidate.model);
+    if (registered) {
+      candidate.rail = registered.rail;
+      sources.set(`${dotted}.rail`, registered.source);
+      fromTable = true;
+    } else if (currentFromTable) {
+      // The rail belonged to the model being left, and the new model registers
+      // none, so there is nothing to carry: dropping it makes the candidate
+      // incomplete and the layer is rejected rather than pointing an
+      // unregistered model at another model's account.
+      delete candidate.rail;
+    }
+  } else {
+    // No model change, so the rail beneath it — stated by a lower layer, or
+    // registered for this same model — stands.
+    fromTable = currentFromTable;
+  }
+
   if (candidate.model !== undefined && candidate.rail !== undefined) {
     const resolved = candidate as Candidate;
-    const implied = railFromModel(resolved.model);
-    if (implied !== undefined && implied !== resolved.rail) {
-      warn(
-        `"${dotted}.model" "${resolved.model}" reads as the ${implied} rail but rail is "${resolved.rail}"`,
-      );
+    // A rail the models table supplied is checked once, at the entry that stated
+    // it, so it does not warn again on every candidate that names the model —
+    // or on a layer that only changes the level beside it.
+    if (!fromTable) {
+      const implied = mismatchedRail(resolved.model, resolved.rail);
+      if (implied !== undefined) {
+        warn(
+          `"${dotted}.model" "${resolved.model}" reads as the ${implied} rail but rail is "${resolved.rail}"`,
+        );
+      }
     }
+    if (fromTable) inheritedRail.add(resolved);
     return { candidate: resolved, sources };
   }
 
-  if (candidate.model !== undefined || candidate.rail !== undefined) {
+  if (candidate.model !== undefined) {
+    // The model is named but no rail is stated anywhere, so this candidate
+    // cannot name an account to route to.
+    warn(
+      `"${dotted}" needs a rail (state one here or register one for "${candidate.model}" under "models")`,
+    );
+  } else if (candidate.rail !== undefined) {
     // Only ever reached for a candidate a layer introduces: an existing one
     // already carries both fields, so a partial override completes it.
-    warn(`"${dotted}" needs both "model" and "rail"`);
+    warn(`"${dotted}" needs a "model"`);
   }
   return undefined;
 }
@@ -681,6 +781,14 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       warnings.push(`built-in: ${rejection}`);
       continue;
     }
+    if (entry.rail !== undefined) {
+      const implied = mismatchedRail(id, entry.rail);
+      if (implied !== undefined) {
+        warnings.push(
+          `built-in: model "${id}" reads as the ${implied} rail but its registered rail is "${entry.rail}"`,
+        );
+      }
+    }
     models[id] = { ...entry };
   }
   const config: DispatcherConfig = { ...base, models, agents };
@@ -696,6 +804,7 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
 
   for (const key of SCALAR_KEYS) setSource(key, "built-in");
   for (const [id, entry] of Object.entries(config.models)) {
+    if (entry.rail !== undefined) setSource(`models.${id}.rail`, "built-in");
     if (entry.thinking !== undefined) setSource(`models.${id}.thinking`, "built-in");
   }
   for (const [agent, route] of Object.entries(config.agents)) {
@@ -715,6 +824,35 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       }
     });
   }
+
+  /**
+   * The rail registered for `model`, with the layer that supplied it, or
+   * `undefined` when the table does not register one.
+   *
+   * Read through `Object.hasOwn`, so a candidate naming a model the table does
+   * not have cannot resolve to an inherited value. A model id always contains a
+   * `/` (the seam rejects the rest), which already rules out the
+   * `Object.prototype` names.
+   */
+  const registeredRail = (model: string): { rail: Rail; source: ConfigSource } | undefined => {
+    if (!Object.hasOwn(config.models, model)) return undefined;
+    const rail = config.models[model].rail;
+    if (rail === undefined) return undefined;
+    return { rail, source: sources[`models.${model}.rail`] ?? "built-in" };
+  };
+
+  /**
+   * Candidates whose rail came from the `models` table rather than from a
+   * statement on the candidate itself.
+   *
+   * The distinction is invisible in the effective config — a rail is a rail —
+   * but it decides what a later layer may do with it: a layer that moves the
+   * candidate to an unregistered model must drop an inherited rail rather than
+   * point the new model at the old model's account, while a rail the candidate
+   * stated itself is kept field-wise. Tracked by identity, because the merge
+   * hands each layer a fresh clone of the candidate it is editing.
+   */
+  const inheritedRail = new WeakSet<Candidate>();
 
   /** Forget every value `agent` contributed, including every list index. */
   const clearAgentSources = (agent: string): void => {
@@ -768,9 +906,13 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       return;
     }
 
+    // `primary` is aliased rather than copied so that a candidate whose rail
+    // came from the `models` table keeps its identity in `inheritedRail`; the
+    // candidate a layer builds is a fresh object either way, so nothing here
+    // mutates the lower layer's entry.
     const holders: { thinking?: ThinkingLevel; primary?: Candidate; alternates?: Candidate[] } = {
       ...(existing?.thinking !== undefined ? { thinking: existing.thinking } : {}),
-      ...(existing ? { primary: { ...existing.primary } } : {}),
+      ...(existing ? { primary: existing.primary } : {}),
       ...(existing ? { alternates: existing.alternates.map((c) => ({ ...c })) } : {}),
     };
 
@@ -813,7 +955,15 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
           warn(`"${dotted}" is null; a route needs a primary (to remove the agent use disable: true)`);
           continue;
         }
-        const parsed = parseCandidate(value, dotted, holders.primary, source, warn);
+        const parsed = parseCandidate(
+          value,
+          dotted,
+          holders.primary,
+          source,
+          warn,
+          registeredRail,
+          inheritedRail,
+        );
         if (!parsed) continue;
         holders.primary = parsed.candidate;
         for (const [key, from] of parsed.sources) pending.set(key, from);
@@ -836,7 +986,15 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       const nextStages: Array<Map<string, ConfigSource>> = [];
       let usable = true;
       for (let index = 0; index < value.length; index++) {
-        const parsed = parseCandidate(value[index], `${dotted}[${index}]`, undefined, source, warn);
+        const parsed = parseCandidate(
+          value[index],
+          `${dotted}[${index}]`,
+          undefined,
+          source,
+          warn,
+          registeredRail,
+          inheritedRail,
+        );
         if (!parsed) {
           usable = false;
           continue;
@@ -885,12 +1043,76 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
     }
   };
 
-  for (const layer of layers) {
-    const { source } = layer;
-    const label = layer.label ?? source;
-    const warn = (message: string) => {
+  const labelWarn = (layer: MergeLayer): ((message: string) => void) => {
+    const label = layer.label ?? layer.source;
+    return (message: string) => {
       warnings.push(`${label}: ${message}`);
     };
+  };
+
+  // The `models` table is merged first, over every layer, so a candidate in any
+  // layer can inherit a rail registered in any layer — a route and the model it
+  // names need not live in the same file. It is also what lets a layer that
+  // changes only a model re-resolve the rail that model registers, which a
+  // single ordered pass could not do when the `models` key came after `agents`
+  // or in a higher layer.
+  for (const layer of layers) {
+    if (!isPlainObject(layer.data)) continue;
+    const modelsValue = layer.data.models;
+    if (modelsValue === undefined) continue;
+    const { source } = layer;
+    const warn = labelWarn(layer);
+    if (!isPlainObject(modelsValue)) {
+      warn(`"models" must be an object`);
+      continue;
+    }
+    // Deep-merged per model, like `agents` is per agent, and validated per
+    // entry: an entry is a default several routes may inherit, so a typo in one
+    // model must not take the rest of the table down with it.
+    for (const [id, entryValue] of Object.entries(modelsValue)) {
+      const rejection = modelIdRejection(id);
+      if (rejection) {
+        warn(rejection);
+        continue;
+      }
+      if (!isPlainObject(entryValue)) {
+        warn(`model "${id}" must be an object`);
+        continue;
+      }
+      for (const [field, fieldValue] of Object.entries(entryValue)) {
+        if (field === "rail") {
+          if (!isRail(fieldValue)) {
+            warn(`"models.${id}.rail" must be one of "claude", "codex", "deepseek"`);
+            continue;
+          }
+          config.models[id] = { ...config.models[id], rail: fieldValue };
+          setSource(`models.${id}.rail`, source);
+          // A rail that reads like a different account's model is the same
+          // partial-override mistake a candidate-level rail can make, so it
+          // gets the same warning here, once, where the rail is stated.
+          const implied = mismatchedRail(id, fieldValue);
+          if (implied !== undefined) {
+            warn(`model "${id}" reads as the ${implied} rail but its registered rail is "${fieldValue}"`);
+          }
+          continue;
+        }
+        if (field !== "thinking") {
+          warn(`unknown key "models.${id}.${field}"`);
+          continue;
+        }
+        if (!isThinkingLevel(fieldValue)) {
+          warn(`"models.${id}.thinking" must be one of ${THINKING_LEVEL_LIST}`);
+          continue;
+        }
+        config.models[id] = { ...config.models[id], thinking: fieldValue };
+        setSource(`models.${id}.thinking`, source);
+      }
+    }
+  }
+
+  for (const layer of layers) {
+    const { source } = layer;
+    const warn = labelWarn(layer);
 
     if (!isPlainObject(layer.data)) {
       warn("config must be a JSON object");
@@ -924,36 +1146,8 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       }
 
       if (key === "models") {
-        if (!isPlainObject(value)) {
-          warn(`"models" must be an object`);
-          continue;
-        }
-        // Deep-merged per model, like `agents` is per agent, and validated per
-        // entry: an entry is a default several routes may inherit, so a typo in
-        // one model must not take the rest of the table down with it.
-        for (const [id, entryValue] of Object.entries(value)) {
-          const rejection = modelIdRejection(id);
-          if (rejection) {
-            warn(rejection);
-            continue;
-          }
-          if (!isPlainObject(entryValue)) {
-            warn(`model "${id}" must be an object`);
-            continue;
-          }
-          for (const [field, fieldValue] of Object.entries(entryValue)) {
-            if (field !== "thinking") {
-              warn(`unknown key "models.${id}.${field}"`);
-              continue;
-            }
-            if (!isThinkingLevel(fieldValue)) {
-              warn(`"models.${id}.thinking" must be one of ${THINKING_LEVEL_LIST}`);
-              continue;
-            }
-            config.models[id] = { ...config.models[id], thinking: fieldValue };
-            setSource(`models.${id}.thinking`, source);
-          }
-        }
+        // Merged in the pass above, before any agent, so a candidate in any
+        // layer can inherit a rail registered in any layer.
         continue;
       }
 
@@ -1041,7 +1235,8 @@ export function thinkingFor(
  *   `config: built-in < global <path> (present|absent) < project <path> (present|absent)`
  *
  * Then one line per effective value, scalars in a fixed order, then the
- * `models` table sorted by model id, then the agents sorted by name, each
+ * `models` table sorted by model id — each entry's `rail` before its `thinking`
+ * — then the agents sorted by name, each
  * rendered `<dotted-key> = <value>  [<source>]`:
  *
  *   `  sessionSwitchAt = 75  [built-in]`
@@ -1076,9 +1271,15 @@ export function describeConfig(loaded: LoadedConfig): string[] {
   // rather than wrong, so every stated default is listed — including one
   // nothing currently reads.
   for (const id of Object.keys(loaded.config.models).sort()) {
-    const thinking = loaded.config.models[id].thinking;
-    if (thinking === undefined) continue;
-    lines.push(`  models.${id}.thinking = ${thinking}  [${sourceOf(`models.${id}.thinking`)}]`);
+    const entry = loaded.config.models[id];
+    // The rail first: it is what makes the model a destination at all, and the
+    // level beside it is a property of the work that draws on the account.
+    if (entry.rail !== undefined) {
+      lines.push(`  models.${id}.rail = ${entry.rail}  [${sourceOf(`models.${id}.rail`)}]`);
+    }
+    if (entry.thinking !== undefined) {
+      lines.push(`  models.${id}.thinking = ${entry.thinking}  [${sourceOf(`models.${id}.thinking`)}]`);
+    }
   }
 
   // A disabled agent is absent from `loaded.config.agents` by construction, so
