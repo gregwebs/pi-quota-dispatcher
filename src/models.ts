@@ -13,16 +13,16 @@
  * The asymmetry is the design, not an oversight. A registry miss is *known
  * bad*, so the model is dropped from consideration: an agent whose **primary**
  * was dropped is held — its file is left exactly as the user left it — and a
- * dropped **alternate** is skipped, leaving the alternates behind it eligible.
- * An unreadable rail is *unknown* instead, and unknown holds (see `decide` in
- * `index.ts`); conflating the two would either guess past a model that cannot
- * be spawned or hold an agent over a quota reading that merely failed.
+ * dropped **alternate** leaves the alternates behind it eligible. An unreadable
+ * rail is *unknown* instead, and unknown holds (see `decide` in `index.ts`);
+ * conflating the two would either guess past a model that cannot be spawned or
+ * hold an agent over a quota reading that merely failed.
  *
  * This module is deliberately free of the pi runtime. The lookup is a parameter
  * and the registry is a structural type, so the check is exercised without a
  * registry, a session or a terminal.
  */
-import type { AgentRoute, DispatcherConfig } from "./config.ts";
+import type { AgentRoute, Candidate, DispatcherConfig } from "./config.ts";
 
 /**
  * The one thing this extension needs from the running pi's model registry:
@@ -46,6 +46,38 @@ export interface ModelRegistryLike {
 export type ModelLookup = (provider: string, modelId: string) => boolean;
 
 /**
+ * One alternate dropped because this pi cannot spawn it, with the config key the
+ * warning named it by.
+ *
+ * Carried out of the check rather than only reported, because a route whose
+ * alternates were all dropped reaches `decide` looking exactly like one the user
+ * pinned with `[]` — and those two need opposite explanations. The key rides
+ * along so the decision can say it in the warning's own words, which name the
+ * line the reader has to go and fix.
+ */
+export interface DroppedAlternate {
+  /**
+   * Provenance key, `agents.<name>.alternates[<n>].model`, indexed in the
+   * alternates list as the user wrote it — before any dropping, so the key
+   * still names the right element of a route that kept some of its list.
+   */
+  key: string;
+  model: string;
+}
+
+/**
+ * The one wording for a model this pi does not know, shared by the boot warning
+ * and by the decision note that explains a route left with no alternates.
+ *
+ * Two spellings of one fact drift, and the reader is meant to recognise the
+ * warning's line in the report: naming the dotted config key is what makes it an
+ * instruction rather than a diagnosis.
+ */
+export function unknownModelNote(key: string, model: string): string {
+  return `${key}: this pi does not know model ${model} — a newer pi may`;
+}
+
+/**
  * Where a candidate resolved, how it did not, and what that costs.
  *
  * `config` is a value, not a mutation: the routes the caller passed are left
@@ -63,9 +95,23 @@ export interface ModelCheckResult {
    *
    * A route whose alternates are all dropped therefore ends up with `[]`, and
    * the policy already treats an empty list as pinned to the primary, so such an
-   * agent is assigned its primary with no readability check.
+   * agent is assigned its primary with no readability check. Which is why
+   * `droppedAlternates` travels with this: an empty list arrived at from the
+   * config and an empty list arrived at by dropping call for opposite
+   * explanations, and only the check knows which one this is.
    */
   config: DispatcherConfig;
+  /**
+   * The alternates that were dropped, by agent name, each carrying the key the
+   * warning named it by. An agent absent from this record had every candidate it
+   * wrote kept; an agent whose route is absent from `config` altogether was
+   * never in the table to begin with.
+   *
+   * The whole set is kept, not only the routes left with `[]`: the decision is
+   * free to ignore it, and "what did boot drop from this route?" is a question
+   * only this step can answer.
+   */
+  droppedAlternates: Record<string, DroppedAlternate[]>;
   /**
    * The agents to hold, by agent name, each carrying the primary model id this
    * pi does not know.
@@ -133,9 +179,10 @@ export function checkModels(
   lookup: ModelLookup | undefined,
   warn: (message: string) => void = console.error,
 ): ModelCheckResult {
-  if (!lookup) return { config, held: {}, warnings: [] };
+  if (!lookup) return { config, held: {}, droppedAlternates: {}, warnings: [] };
 
   const held: Record<string, string> = {};
+  const droppedAlternates: Record<string, DroppedAlternate[]> = {};
   const warnings: string[] = [];
 
   /**
@@ -148,7 +195,7 @@ export function checkModels(
     const slash = model.indexOf("/");
     if (slash !== -1 && lookup(model.slice(0, slash), model.slice(slash + 1))) return true;
 
-    const line = `${dotted}: this pi does not know model ${model} — a newer pi may`;
+    const line = unknownModelNote(dotted, model);
     try {
       warn(line);
     } catch {
@@ -169,10 +216,16 @@ export function checkModels(
       held[agent] = route.primary.model;
     }
     // The alternates after a dropped one keep their order; the index in the
-    // warning is the one in the config the user wrote, before any dropping.
-    const alternates = route.alternates.filter((candidate, index) =>
-      resolves(`agents.${agent}.alternates[${index}].model`, candidate.model),
-    );
+    // warning is the one in the config the user wrote, before any dropping, and
+    // it is kept so the decision can name the same key the warning did.
+    const alternates: Candidate[] = [];
+    const dropped: DroppedAlternate[] = [];
+    for (const [index, candidate] of route.alternates.entries()) {
+      const key = `agents.${agent}.alternates[${index}].model`;
+      if (resolves(key, candidate.model)) alternates.push({ ...candidate });
+      else dropped.push({ key, model: candidate.model });
+    }
+    if (dropped.length) droppedAlternates[agent] = dropped;
     agents[agent] = {
       // The route's own fields ride through untouched: the check is about
       // candidate model ids, and a route default that fell off here would stop
@@ -180,9 +233,9 @@ export function checkModels(
       // whatever level a past pass happened to leave there.
       ...(route.thinking !== undefined ? { thinking: route.thinking } : {}),
       primary: { ...route.primary },
-      alternates: alternates.map((candidate) => ({ ...candidate })),
+      alternates,
     };
   }
 
-  return { config: { ...config, agents }, held, warnings };
+  return { config: { ...config, agents }, held, droppedAlternates, warnings };
 }

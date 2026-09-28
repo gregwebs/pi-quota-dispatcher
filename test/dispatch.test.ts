@@ -8,6 +8,7 @@ import {
   type AgentRoute,
   type Decision,
   type DispatcherConfig,
+  type DroppedAlternate,
   type Rail,
   type RailState,
   type RailWindow,
@@ -795,6 +796,110 @@ test("an empty alternates list pins the agent to its primary with no readability
   const d = decide("planner", pinned, railMap(railState("claude", { ok: false, note: "HTTP 500" })), cfg);
   assert.equal(d.kind, "assign");
   assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
+  assert.equal(d.why, "no alternate configured", "a route the user pinned still says so, in so many words");
+});
+
+// The other way a route arrives with no alternates to walk: boot dropped all of
+// them because this pi cannot spawn them. Same empty list, opposite
+// explanation — and the report is where a user lands when asking why nothing is
+// switching, so the note has to be the one that names the models to fix.
+test("a route whose alternates were all dropped explains the drop, not a missing configuration", () => {
+  const pinned: AgentRoute = {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [],
+  };
+  const dropped: DroppedAlternate[] = [
+    { key: "agents.planner.alternates[0].model", model: "openai-codex/gpt-sol-6" },
+    { key: "agents.planner.alternates[1].model", model: "openai-codex/gpt-astra-6" },
+    { key: "agents.planner.alternates[2].model", model: "deepseek/deepseek-nope" },
+  ];
+
+  // An unreadable primary as well, so the pinning rule is exercised at the same
+  // time: a dropped alternate is known bad, not an unknown reading, and the
+  // route is still assigned rather than held.
+  const decision = decide(
+    "planner",
+    pinned,
+    railMap(railState("claude", { ok: false, note: "HTTP 500" })),
+    cfg,
+    dropped,
+  );
+  assert.equal(decision.kind, "assign");
+  assert.equal(assignedModel(decision), "claude-bridge/claude-opus-5-5");
+  assert.ok(!decision.why.includes("no alternate configured"), decision.why);
+
+  // One line per dropped alternate, each carrying the warning's own wording and
+  // the config key to go and fix — three dropped alternates are three lines, not
+  // one long one (the rule #13 settled). The notes are pinned whole, so one that
+  // lost its key, its reason or its wording fails here instead of in a terminal.
+  const lines = describeDecisionLines(decision, "unchanged");
+  assert.deepEqual(
+    lines.slice(1),
+    dropped.map((drop) => `  ${drop.key}: this pi does not know model ${drop.model} — a newer pi may`),
+  );
+  assert.ok(lines[0].includes("every alternate was dropped"), lines[0]);
+});
+
+// The dropped set explains a route left with nothing to walk, and no other
+// answer. Naming those models on a route that kept an alternate, or on a hold
+// that is about a missing reading, would be noise about a candidate that had no
+// part in the decision. So each shape of answer a route with an alternate can
+// give is checked here: a healthy primary, a switch, a tight primary nothing
+// won on, and a hold.
+test("dropped models are named for a route left with none, and on no other path", () => {
+  const route: AgentRoute = {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
+  };
+  const dropped: DroppedAlternate[] = [
+    { key: "agents.planner.alternates[0].model", model: "openai-codex/gpt-sol-6" },
+  ];
+
+  // The primary is healthy, so no alternate is consulted at all.
+  const healthy = decide(
+    "planner",
+    route,
+    rails({ session: 10, weekly: 0 }, { session: 10, weekly: 0 }),
+    cfg,
+    dropped,
+  );
+  assert.equal(assignedModel(healthy), "claude-bridge/claude-opus-5-5");
+  assert.ok(!healthy.why.includes("gpt-sol-6"), healthy.why);
+
+  // The primary is tight and the surviving alternate wins.
+  const switched = decide(
+    "planner",
+    route,
+    rails({ session: 90, weekly: 0 }, { session: 10, weekly: 0 }),
+    cfg,
+    dropped,
+  );
+  assert.equal(assignedModel(switched), "openai-codex/gpt-6-sol");
+  assert.ok(!switched.why.includes("gpt-sol-6"), switched.why);
+
+  // The primary is tight and the surviving alternate is too close to it on the
+  // same budget, so the route stays put and says why.
+  const stayed = decide(
+    "planner",
+    route,
+    rails({ session: 90, weekly: 0 }, { session: 85, weekly: 0 }),
+    cfg,
+    dropped,
+  );
+  assert.equal(assignedModel(stayed), "claude-bridge/claude-opus-5-5");
+  assert.ok(stayed.why.includes("no alternate won"), stayed.why);
+  assert.ok(!stayed.why.includes("gpt-sol-6"), stayed.why);
+
+  // The primary cannot be read, which holds whatever the alternates say.
+  const held = decide(
+    "planner",
+    route,
+    railMap(railState("claude", { ok: false, note: "HTTP 500" })),
+    cfg,
+    dropped,
+  );
+  assert.equal(held.kind, "hold");
+  assert.ok(!held.why.includes("gpt-sol-6"), held.why);
 });
 
 test("an empty alternates list assigns the primary even when no rail was read at all", () => {
