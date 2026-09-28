@@ -369,8 +369,8 @@ Bad configuration never stops the dispatcher from starting:
 - **A skip flag that is not `true` or `false`, or a `null` anywhere** — logged
   and treated as absent, so the previous layer's value stands.
 - **A configured agent with no file** at `<agent dir>/<name>.md` — logged at
-  load, with the path to go and create, and the agent stays configured in the
-  meantime.
+  load, naming the path that has to exist and the `/agents` command that creates
+  one, and the agent stays configured in the meantime.
 - **A model id this pi does not know** — a config can outlive the pi that
   validated it: an id renamed upstream, a typo, a config copied from another
   machine. Every configured candidate is resolved at boot against the running
