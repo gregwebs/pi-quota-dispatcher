@@ -59,6 +59,8 @@ import {
   agentNameRejection,
   configFilesFor,
   describeConfig,
+  describeConfigLayers,
+  describeConfigWarnings,
   globalConfigPath,
   loadConfig,
   railFromModel,
@@ -76,6 +78,8 @@ export {
   configFilesFor,
   defaultConfig,
   describeConfig,
+  describeConfigLayers,
+  describeConfigWarnings,
   globalConfigPath,
   isClaudeRefreshMode,
   isThinkingLevel,
@@ -1037,9 +1041,9 @@ const UNKNOWN_MODEL_SUMMARY = "quota-dispatcher: a configured model is unknown t
  * edit.
  *
  * The miss lines are `unknownModelNote`'s, verbatim, so the reader meets the
- * same sentence here as in the log and in `/quota-dispatch`'s provenance block —
- * the startup warning is a shortcut to that record, not a third telling of the
- * same fact. Pure, and separate from the UI call, for the same reason
+ * same sentence here as in the log and in the report's warning tail — the
+ * startup warning is a shortcut to that record, not a third telling of the same
+ * fact. Pure, and separate from the UI call, for the same reason
  * `unconfiguredNotice` is.
  */
 export function unknownModelsNotice(misses: ModelMiss[], configPaths: string[]): string[] {
@@ -2312,8 +2316,11 @@ export function createDispatcher(
         lines.push(`${rail}: ${windows}${s.note === undefined ? "" : ` — ${s.note}`}`);
       }
     }
-    lines.push("");
-    for (const { decision, outcome } of await decideAll(rails, true)) {
+    const decisions = await decideAll(rails, true);
+    // No separator without decisions: an unconfigured install has nothing
+    // between the rail lines and whatever the caller appends.
+    if (decisions.length) lines.push("");
+    for (const { decision, outcome } of decisions) {
       lines.push(...describeDecisionLines(decision, outcome));
     }
 
@@ -2453,8 +2460,8 @@ export default function (pi: ExtensionAPI) {
    * Booting is where the running pi's model registry is consulted:
    * `checkModels` drops candidates this pi cannot spawn before any decision is
    * made. Its warnings ride along with the load warnings, so `/quota-dispatch`
-   * prints them in the same provenance block, and its `held` record is what
-   * makes an unresolvable primary hold rather than be written.
+   * prints them whichever form was run, and its `held` record is what makes an
+   * unresolvable primary hold rather than be written.
    *
    * This is why a boot needs the context, and why the timer reads the cached
    * `boot` rather than starting one of its own: a boot without a registry skips
@@ -2497,7 +2504,9 @@ export default function (pi: ExtensionAPI) {
       const a = (args ?? "").trim();
       const { loaded, dispatcher } = await bootOnce(ctx);
 
-      // Only this form writes. The plain and `refresh` forms are read-only.
+      // Three forms. Only `apply` writes, and only `config` skips the quota
+      // read: it is about the files on this machine, so it answers without
+      // costing a request.
       let lines: string[];
       if (a.includes("apply")) {
         const rows = await dispatcher.evaluate({ force: true });
@@ -2505,15 +2514,23 @@ export default function (pi: ExtensionAPI) {
           "[applied]",
           ...rows.flatMap((r) => describeDecisionLines(r.decision, r.outcome)),
         ];
+      } else if (a.includes("config")) {
+        lines = describeConfig(loaded);
       } else {
         const force = a.includes("refresh");
-        lines = await dispatcher.report({ force });
+        // The report carries the install's shape and its warnings, not where
+        // each value came from: provenance is a question asked deliberately,
+        // and `config` is the form that answers it. The warnings stay because a
+        // config that is not doing what the user meant has to say so on the run
+        // that read it, whichever form that was.
+        lines = [
+          ...(await dispatcher.report({ force })),
+          "",
+          describeConfigLayers(loaded),
+          ...describeConfigWarnings(loaded),
+        ];
       }
 
-      // Every form ends with the provenance block, so "where did this value
-      // come from?" is answerable from whichever one you ran. Both branches
-      // build the body first and share this tail rather than duplicating it.
-      lines.push("", ...describeConfig(loaded));
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });

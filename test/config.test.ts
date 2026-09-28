@@ -19,6 +19,8 @@ import {
   configFilesFor,
   defaultConfig,
   describeConfig,
+  describeConfigLayers,
+  describeConfigWarnings,
   globalConfigPath,
   loadConfig,
   mergeConfig,
@@ -1217,14 +1219,37 @@ async function loadedWithAgents(): Promise<LoadedConfig> {
   });
 }
 
-test("describeConfig's first line names the layers and both files' presence", async () => {
+/**
+ * The layers line and the warnings are the two pieces the report carries in
+ * place of the block — "which files am I reading?" and "what went wrong?" —
+ * so they are named apart from it and pinned on their own. `describeConfig`
+ * composes them; a change that dropped one from the block would otherwise fail
+ * only the block's tests.
+ */
+test("describeConfigLayers names the layers and both files' presence, and opens the block", async () => {
   const loaded = await loadedWithProjectOverride();
-  const lines = describeConfig(loaded);
-  const first = lines[0];
-  assert.ok(first.startsWith("config:"), first);
-  assert.ok(first.includes("built-in"), first);
-  assert.ok(first.includes(`global ${GLOBAL_PATH} (absent)`), first);
-  assert.ok(first.includes(`project ${PROJECT_PATH} (present)`), first);
+  const line = describeConfigLayers(loaded);
+
+  assert.ok(line.startsWith("config:"), line);
+  assert.ok(line.includes("built-in"), line);
+  assert.ok(line.includes(`global ${GLOBAL_PATH} (absent)`), line);
+  assert.ok(line.includes(`project ${PROJECT_PATH} (present)`), line);
+  assert.equal(describeConfig(loaded)[0], line, "the block must open with the same line");
+});
+
+test("describeConfigWarnings renders one prefixed line per warning and none when there are none", async () => {
+  const clean = await loadedWithProjectOverride();
+  assert.deepEqual(describeConfigWarnings(clean), []);
+
+  const fs = fakeFs({ [GLOBAL_PATH]: "{ broken" });
+  const dirty = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
+  assert.ok(dirty.warnings.length >= 1);
+  assert.deepEqual(
+    describeConfigWarnings(dirty),
+    dirty.warnings.map((warning) => `  warning: ${warning}`),
+  );
+  // The block reproduces them rather than wording them a second time.
+  for (const line of describeConfigWarnings(dirty)) assert.ok(describeConfig(dirty).includes(line), line);
 });
 
 test("describeConfig renders one sourced line per value and marks the project override", async () => {

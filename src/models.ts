@@ -189,10 +189,10 @@ export function modelLookup(ctx: { modelRegistry?: ModelRegistryLike }): ModelLo
  *
  * `warn` is called as each miss is found and the same lines come back in
  * `warnings`, the way `loadConfig` reports: the sink is for the log, the return
- * value is for `/quota-dispatch`, which prints them in its provenance block. The
- * occurrences come back as `misses` too, because each miss's key is what
- * resolves to the config file to edit — data a list of finished sentences no
- * longer carries.
+ * value is for `/quota-dispatch`, which prints them on every form — the report
+ * as its warning tail, `config` as the tail of its block. The occurrences come
+ * back as `misses` too, because each miss's key is what resolves to the config
+ * file to edit — data a list of finished sentences no longer carries.
  *
  * Without a lookup the check is skipped silently and `config` comes back
  * unchanged, which is how a pi with no registry is handled.
