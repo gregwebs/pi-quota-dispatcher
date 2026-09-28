@@ -101,12 +101,17 @@ export type {
   ThinkingLevel,
 } from "./config.ts";
 
-import { checkModels, modelLookup } from "./models.ts";
+import { checkModels, modelLookup, type DroppedAlternate, unknownModelNote } from "./models.ts";
 
 // The models module is where a config's model ids are resolved against the pi
 // that is running; re-exported here for the same reason as the config module.
 export { checkModels, modelLookup } from "./models.ts";
-export type { ModelCheckResult, ModelLookup, ModelRegistryLike } from "./models.ts";
+export type {
+  DroppedAlternate,
+  ModelCheckResult,
+  ModelLookup,
+  ModelRegistryLike,
+} from "./models.ts";
 
 // ---------------------------------------------------------------- types
 
@@ -394,12 +399,18 @@ function isInside(dir: string, file: string): boolean {
  * that a write lands inside `agentDir`; the regex upstream only makes a name
  * conventional. A name that resolves outside holds rather than assigning,
  * because a hold writes nothing and the file stays as the user left it.
+ *
+ * `droppedAlternates` is the one fact `route` cannot carry: boot may have
+ * removed alternates this pi cannot spawn, and the route it handed over is
+ * indistinguishable from one the user wrote with no alternates. Absent means
+ * nothing was dropped, so an empty `alternates` is the user's own `[]`.
  */
 export function decide(
   agent: string,
   route: AgentRoute,
   rails: Map<Rail, RailState>,
   cfg: DispatcherConfig,
+  droppedAlternates: readonly DroppedAlternate[] = [],
 ): Decision {
   const file = join(cfg.agentDir, `${agent}.md`);
   if (!isInside(cfg.agentDir, file)) {
@@ -431,7 +442,7 @@ export function decide(
   // An empty list pins the agent to its primary. There is nothing else the
   // answer could be, so no reading is consulted and no hold is possible.
   if (!route.alternates.length) {
-    return assign(route.primary, "no alternate configured");
+    return assign(route.primary, pinnedWhy(droppedAlternates));
   }
 
   // A state missing from the map is as unreadable as one with `ok: false`: we
@@ -598,6 +609,30 @@ export function decide(
 }
 
 /**
+ * Why a route with no alternates to walk is pinned to its primary.
+ *
+ * Two different facts leave a route with an empty list, and reporting the first
+ * for the second tells a user who did configure alternates that they configured
+ * none — on the one line they read when asking why nothing is switching. So the
+ * dropped models are named instead, in the warning's own words, one note each:
+ * a route with three of them is not one unreadably long line, and the note names
+ * the config key to go and fix.
+ *
+ * The pinning itself is unchanged either way. An unresolvable model is *known
+ * bad*, so it was dropped rather than held, and with nothing left to move to the
+ * primary is the only answer — no reading is consulted.
+ *
+ * See docs/adr/0008-dropped-alternates-explained.md.
+ */
+function pinnedWhy(droppedAlternates: readonly DroppedAlternate[]): string {
+  if (!droppedAlternates.length) return "no alternate configured";
+  return withNotes(
+    "every alternate was dropped — pinned to the primary",
+    droppedAlternates.map((dropped) => unknownModelNote(dropped.key, dropped.model)),
+  );
+}
+
+/**
  * The decision for an agent whose primary this pi cannot spawn.
  *
  * A hold, and a different kind of hold from the ones `decide` returns. Those are
@@ -615,7 +650,10 @@ export function heldDecision(agent: string, cfg: DispatcherConfig, model: string
     agent,
     file: join(cfg.agentDir, `${agent}.md`),
     kind: "hold",
-    why: `this pi does not know model ${model} — a newer pi may; holding`,
+    // The primary's own key, so the reader gets the line to edit rather than
+    // having to work out which of the agent's candidates this is. The wording is
+    // the model check's, shared with the note a dropped alternate earns.
+    why: `${unknownModelNote(`agents.${agent}.primary.model`, model)}; holding`,
   };
 }
 
@@ -1877,6 +1915,15 @@ export interface DispatcherDeps {
    */
   held?: Readonly<Record<string, string>>;
   /**
+   * The alternates `checkModels` dropped, by agent name — the
+   * `droppedAlternates` record of the same result.
+   *
+   * Needed because the config that comes back from the check cannot say whether
+   * a route with no alternates started that way or lost them. Absent or empty,
+   * an empty `alternates` list reads as the user's own `[]`.
+   */
+  droppedAlternates?: Readonly<Record<string, readonly DroppedAlternate[]>>;
+  /**
    * Fallback credential store for the Claude rail. Left unset, production takes
    * whichever one this platform has; tests inject a fake so that they never
    * read, or prompt for, the keychain of the machine they run on. An injected
@@ -2179,7 +2226,7 @@ export function createDispatcher(
     const decisions = Object.entries(cfg.agents).map(([agent, route]) =>
       deps.held && Object.hasOwn(deps.held, agent)
         ? heldDecision(agent, cfg, deps.held[agent])
-        : decide(agent, route, rails, cfg),
+        : decide(agent, route, rails, cfg, deps.droppedAlternates?.[agent] ?? []),
     );
     return Promise.all(
       decisions.map(async (decision) => ({
@@ -2355,7 +2402,10 @@ export default function (pi: ExtensionAPI) {
           config: checked.config,
           warnings: [...base.warnings, ...checked.warnings],
         },
-        dispatcher: createDispatcher(checked.config, { held: checked.held }),
+        dispatcher: createDispatcher(checked.config, {
+          held: checked.held,
+          droppedAlternates: checked.droppedAlternates,
+        }),
       };
     }));
 

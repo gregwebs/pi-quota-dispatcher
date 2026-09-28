@@ -89,6 +89,7 @@ test("checkModels without a lookup skips silently: unchanged config, nothing hel
 
   assert.deepEqual(result.config, snapshot, "without a lookup the config is returned as it came in");
   assert.deepEqual(result.held, {});
+  assert.deepEqual(result.droppedAlternates, {});
   assert.deepEqual(result.warnings, []);
   assert.equal(lines.length, 0, "the check must not warn when it is skipped");
 });
@@ -217,6 +218,70 @@ test("an unknown alternate is removed and the alternates after it keep their ord
   assert.deepEqual(lines, result.warnings);
 });
 
+// The record a dropped alternate leaves behind, and the whole reason it exists:
+// a route that lost every alternate comes back looking exactly like one the user
+// pinned with `[]`, so `decide` cannot tell the two apart from the config alone.
+// Each key is indexed in the list as *written*, not in the list that survived —
+// it is the line the reader has to go and fix.
+//
+// Dropping the middle of three is the case that pins that down: an implementation
+// that re-indexed the survivors, or that read the keys off `config`, gets 0 and 1
+// where the user's third alternate is really `[2]`.
+test("checkModels records each dropped alternate under the key its warning named", () => {
+  const route: AgentRoute = {
+    primary: candidate("claude-bridge/claude-opus-5-5", "claude"),
+    alternates: [
+      candidate("openai-codex/gpt-sol-6", "codex"), // transposed: unknown
+      candidate("openai-codex/gpt-6-sol", "codex"), // known: kept
+      candidate("openai-codex/gpt-astra-6", "codex"), // transposed: unknown
+    ],
+  };
+  const { lines, warn } = warnRecorder();
+
+  const result = checkModels(
+    config({ planner: route }),
+    lookupFor("claude-bridge/claude-opus-5-5", "openai-codex/gpt-6-sol"),
+    warn,
+  );
+
+  assert.deepEqual(result.droppedAlternates, {
+    planner: [
+      { key: "agents.planner.alternates[0].model", model: "openai-codex/gpt-sol-6" },
+      { key: "agents.planner.alternates[2].model", model: "openai-codex/gpt-astra-6" },
+    ],
+  });
+  // The record and the warning say the same thing in the same words, which is
+  // what lets `decide` quote the log line in the report rather than invent a
+  // second wording for one fact.
+  assert.deepEqual(
+    lines,
+    result.droppedAlternates.planner.map((dropped) => unknownLine(dropped.key, dropped.model)),
+  );
+});
+
+/**
+ * An alternate dropped from a route that kept another one is still recorded:
+ * the record is "what did boot drop?", and the decision is free to ignore it.
+ */
+test("checkModels records a drop even when the route still has an alternate", () => {
+  const route: AgentRoute = {
+    primary: candidate("claude-bridge/claude-opus-5-5", "claude"),
+    alternates: [
+      candidate("openai-codex/gpt-sol-6", "codex"), // unknown
+      candidate("openai-codex/gpt-6-sol", "codex"), // known
+    ],
+  };
+
+  const result = checkModels(
+    config({ planner: route }),
+    lookupFor("claude-bridge/claude-opus-5-5", "openai-codex/gpt-6-sol"),
+  );
+
+  assert.deepEqual(result.droppedAlternates, {
+    planner: [{ key: "agents.planner.alternates[0].model", model: "openai-codex/gpt-sol-6" }],
+  });
+});
+
 // ---------------------------------------------------------------- one warning per occurrence
 
 test("the same unknown id twice warns twice and holds only the primary's agent", () => {
@@ -253,6 +318,7 @@ test("a config whose models are all known produces no warnings and is returned u
 
   assert.deepEqual(result.config, snapshot);
   assert.deepEqual(result.held, {});
+  assert.deepEqual(result.droppedAlternates, {});
   assert.deepEqual(result.warnings, []);
   assert.equal(lines.length, 0);
 });
@@ -409,7 +475,8 @@ test("heldDecision is a hold that names the unknown model and leaves no model to
   assert.equal(d.file, join(cfg.agentDir, "planner.md"));
   assert.equal(
     d.why,
-    `this pi does not know model claude-bridge/claude-sol-9 ${DASH} a newer pi may; holding`,
+    `agents.planner.primary.model: this pi does not know model claude-bridge/claude-sol-9 ${DASH} a newer pi may; holding`,
+    "the hold names the primary's own key, in the same wording a dropped candidate gets",
   );
   assert.equal("model" in d, false, "a hold must carry no model to write");
 });

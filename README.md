@@ -378,9 +378,14 @@ Bad configuration never stops the dispatcher from starting:
   came from (`agents.reviewer.primary.model: this pi does not know model
   openai-codex/gpt-astra-6 — a newer pi may`). An agent whose **primary** is
   unknown is **held**, so its file is left exactly as it is; an **alternate**
-  that is unknown is skipped, and the alternates after it stay eligible. If
-  every alternate on a route is skipped, the route is left with none — the same
-  as `alternates: []` — so the agent stays pinned to its primary.
+  that is unknown is **dropped**, and the alternates after it stay eligible. If
+  every alternate on a route is dropped, the route is left with none — the same
+  as `alternates: []` — so the agent stays pinned to its primary. Those two are
+  not the same fact to the reader, so the report tells them apart: a route you
+  pinned says `no alternate configured`, while one whose alternates were dropped
+  says `every alternate was dropped — pinned to the primary` and then names each
+  of them, one per line, in the wording the boot warning used. More in
+  [0008](docs/adr/0008-dropped-alternates-explained.md).
 
 Agent names are filenames (`<agent dir>/<name>.md`), so they must be lowercase
 letters, digits and dashes, starting with a letter (`planner`,
@@ -469,7 +474,7 @@ are weighed separately:
 
 A model this pi cannot spawn is the opposite case: it is *known bad*, not a
 missing reading, so it is dropped from consideration — a primary that cannot be
-spawned holds, and an unknown alternate is skipped — because no reading could
+spawned holds, and an unknown alternate is dropped — because no reading could
 make it spawnable.
 
 A rail is *metered* when it is billed per token rather than quota-capped. That

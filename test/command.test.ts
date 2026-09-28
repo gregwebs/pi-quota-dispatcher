@@ -688,3 +688,80 @@ test("session_start with a registry holds an unknown primary, leaving the file a
 
   assert.equal(await readFile(fx.plannerFile, "utf8"), before, "a held primary must not be written");
 });
+
+/**
+ * Every alternate of `planner` unknown to this pi, which leaves that route with
+ * the same empty list a route pinned with `"alternates": []` arrives in. `scribe`
+ * is pinned exactly that way, so one pass produces both cases and the report has
+ * to tell them apart without letting either borrow the other's reasons.
+ */
+const ALL_ALTERNATES_UNKNOWN_AGENTS = {
+  planner: {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [
+      { model: "openai-codex/gpt-sol-6", rail: "codex" },
+      { model: "openai-codex/gpt-astra-6", rail: "codex" },
+    ],
+  },
+  scribe: {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [],
+  },
+};
+
+// The wiring this record needs end to end: `checkModels` returns the drops, and
+// only `bootOnce` can hand them to the dispatcher. An extension that threaded
+// `held` alone would leave the config identical to a pinned route and print "no
+// alternate configured" to a user who wrote two — the exact confusion issue #21
+// is about. Asserted through the command, because the dropped record has no other
+// path to the report.
+test("the decision line names the alternates boot dropped instead of claiming none were configured", async () => {
+  const fx = await fixture(2_147_483_647, ALL_ALTERNATES_UNKNOWN_AGENTS);
+
+  await withExtension(
+    fx,
+    async ({ runAll }) => {
+      const text = (await runAll("")).join("\n");
+      const lines = text.split("\n");
+      const decision = lines.find((line) => line.startsWith("planner -> "));
+      assert.ok(decision, text);
+      assert.ok(!decision.includes("no alternate configured"), decision);
+      // Nothing else could be the answer, so the agent is assigned its primary
+      // rather than held — the pinning itself is unchanged by the explanation.
+      assert.ok(decision.includes("planner -> claude-bridge/claude-opus-5-5"), decision);
+      assert.ok(decision.includes("[unchanged]"), decision);
+      assert.ok(decision.includes("every alternate was dropped"), decision);
+
+      // The notes, whole and in order: one per dropped model, in the wording the
+      // boot warning used, and none belonging to the other agent — a record
+      // applied to the wrong agent adds a line here, and a borrowed or reworded
+      // one is not equal to what is expected.
+      assert.deepEqual(
+        lines.filter((line) => line.startsWith("  agents.") && line.includes("this pi does not know model")),
+        [
+          "  agents.planner.alternates[0].model: this pi does not know model openai-codex/gpt-sol-6 — a newer pi may",
+          "  agents.planner.alternates[1].model: this pi does not know model openai-codex/gpt-astra-6 — a newer pi may",
+        ],
+        text,
+      );
+
+      // `scribe` wrote no alternates at all, and says so.
+      const scribe = lines.find((line) => line.startsWith("scribe -> "));
+      assert.ok(scribe, text);
+      assert.ok(scribe.includes("(no alternate configured)"), scribe);
+
+      // The boot warning is still replayed in the provenance block, which is the
+      // duplication ADR 0008 argues for: the decision explains the agent, the
+      // block stays a faithful log of every warning. Filtering the replay because
+      // a decision already said it is the tempting tidy-up this pins against.
+      assert.ok(
+        lines.includes(
+          "  warning: agents.planner.alternates[0].model: this pi does not know model openai-codex/gpt-sol-6 — a newer pi may",
+        ),
+        text,
+      );
+    },
+    stubFetch,
+    { modelRegistry: registry({ "claude-bridge": ["claude-opus-5-5"] }) },
+  );
+});
