@@ -16,6 +16,7 @@ import {
   CONFIG_FILE_NAME,
   DEFAULT_CONFIG,
   THINKING_LEVELS,
+  configFilesFor,
   defaultConfig,
   describeConfig,
   globalConfigPath,
@@ -1482,6 +1483,40 @@ test("the value a rejected override leaves standing keeps its real source in des
   assert.ok(line.includes("claude-bridge/claude-opus-5-6"), line);
   assert.ok(line.includes("[global]"), line);
   assert.ok(!line.includes("[built-in]"), line);
+});
+
+test("configFilesFor names each key's layer file, deduped in layer order", async () => {
+  const fs = fakeFs({
+    [GLOBAL_PATH]: JSON.stringify({
+      agents: { planner: { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } } },
+    }),
+    [PROJECT_PATH]: JSON.stringify({
+      agents: { reviewer: { primary: { model: "openai-codex/gpt-6-astra", rail: "codex" } } },
+    }),
+  });
+  const loaded = await loadConfig({
+    agentDir: AGENT_DIR,
+    cwd: CWD,
+    readFile: fs.readFile,
+    warn: () => {},
+    fileExists: () => true,
+  });
+
+  // Each key names the file that wrote it, and a key no layer set names none.
+  assert.deepEqual(configFilesFor(loaded, ["agents.planner.primary.model"]), [GLOBAL_PATH]);
+  assert.deepEqual(configFilesFor(loaded, ["agents.reviewer.primary.model"]), [PROJECT_PATH]);
+  assert.deepEqual(configFilesFor(loaded, ["sessionSwitchAt"]), []);
+
+  // Two keys, one file each: deduped, and in the layer order the config was
+  // read in rather than the order the keys were passed.
+  assert.deepEqual(
+    configFilesFor(loaded, ["agents.reviewer.primary.model", "agents.planner.primary.model"]),
+    [GLOBAL_PATH, PROJECT_PATH],
+  );
+  assert.deepEqual(
+    configFilesFor(loaded, ["agents.planner.primary.model", "agents.planner.primary.model"]),
+    [GLOBAL_PATH],
+  );
 });
 
 // ---------------------------------------------------------------- thinking

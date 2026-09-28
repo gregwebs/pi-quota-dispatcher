@@ -57,6 +57,7 @@ import {
   type Rail,
   type ThinkingLevel,
   agentNameRejection,
+  configFilesFor,
   describeConfig,
   globalConfigPath,
   loadConfig,
@@ -72,6 +73,7 @@ export {
   CONFIG_FILE_NAME,
   DEFAULT_CONFIG,
   THINKING_LEVELS,
+  configFilesFor,
   defaultConfig,
   describeConfig,
   globalConfigPath,
@@ -101,7 +103,7 @@ export type {
   ThinkingLevel,
 } from "./config.ts";
 
-import { checkModels, modelLookup, type DroppedAlternate, unknownModelNote } from "./models.ts";
+import { checkModels, modelLookup, type DroppedAlternate, type ModelMiss, unknownModelNote } from "./models.ts";
 
 // The models module is where a config's model ids are resolved against the pi
 // that is running; re-exported here for the same reason as the config module.
@@ -110,6 +112,7 @@ export type {
   DroppedAlternate,
   ModelCheckResult,
   ModelLookup,
+  ModelMiss,
   ModelRegistryLike,
 } from "./models.ts";
 
@@ -1015,6 +1018,38 @@ export function unconfiguredNotice(
 
   lines.push("", "Then /reload. Run /quota-dispatch at any time to see what it would do.");
   return lines;
+}
+
+/**
+ * The one line for a config that names a model this pi cannot spawn: the
+ * notify's headline and the footer status that holds the state between asks, so
+ * the interruption and the standing fact are the same words.
+ *
+ * "Unknown to this pi" rather than "invalid" is #14's wording, and the reason
+ * this warning exists at all: the id may be perfectly good on a newer pi, and a
+ * user who reads "invalid" goes hunting for a typo that is not there.
+ */
+const UNKNOWN_MODEL_SUMMARY = "quota-dispatcher: a configured model is unknown to this pi.";
+
+/**
+ * What an install whose config names models this pi cannot spawn has to say for
+ * itself: every occurrence, at the dotted key it came from, and the files to
+ * edit.
+ *
+ * The miss lines are `unknownModelNote`'s, verbatim, so the reader meets the
+ * same sentence here as in the log and in `/quota-dispatch`'s provenance block —
+ * the startup warning is a shortcut to that record, not a third telling of the
+ * same fact. Pure, and separate from the UI call, for the same reason
+ * `unconfiguredNotice` is.
+ */
+export function unknownModelsNotice(misses: ModelMiss[], configPaths: string[]): string[] {
+  return [
+    UNKNOWN_MODEL_SUMMARY,
+    ...misses.map((miss) => unknownModelNote(miss.key, miss.model)),
+    // The action last, so the occurrences above it read as the evidence for it
+    // rather than as a list trailing off an instruction.
+    `Edit ${configPaths.join(" or ")}, then /reload, or upgrade pi.`,
+  ];
 }
 
 export async function applyDecision(
@@ -2359,6 +2394,44 @@ async function announceUnconfigured(
   ctx.ui.notify(unconfiguredNotice(configPath, agentDir, files).join("\n"), "warning");
 }
 
+/**
+ * The config file to edit for each unknown model id.
+ *
+ * The fallback names the file a user would create: a miss names a candidate of
+ * the effective table, and every candidate there was written by some layer, so
+ * the fallback is unreachable — a better failure than naming none.
+ */
+function unknownModelConfigPaths(misses: ModelMiss[], loaded: LoadedConfig): string[] {
+  const paths = configFilesFor(loaded, misses.map((miss) => miss.key));
+  return paths.length ? paths : [globalConfigPath()];
+}
+
+/**
+ * The warning for a config this pi cannot fully use, and the footer line that
+ * holds the state between warnings.
+ *
+ * The footer is set on every reason and the notify fires only on the three that
+ * ask for setup. That split is #13's, and it earns its keep most on `resume`,
+ * where no notify ever fires: without the footer the only trace of a model the
+ * dispatcher is quietly stepping over would be the console line, which scrolls
+ * past at session start.
+ */
+function announceUnknownModels(
+  misses: ModelMiss[],
+  loaded: LoadedConfig,
+  ctx: ExtensionContext,
+  reason: SessionStartEvent["reason"],
+): void {
+  if (misses.length === 0) {
+    setFooterStatus(ctx, undefined);
+    return;
+  }
+
+  setFooterStatus(ctx, UNKNOWN_MODEL_SUMMARY);
+  if (!ctx.hasUI || !ASK_REASONS.has(reason)) return;
+  ctx.ui.notify(unknownModelsNotice(misses, unknownModelConfigPaths(misses, loaded)).join("\n"), "warning");
+}
+
 export default function (pi: ExtensionAPI) {
   /**
    * Config is resolved once per extension load, and the command reports which
@@ -2389,7 +2462,9 @@ export default function (pi: ExtensionAPI) {
    * `session_start` always precedes the first tick, so the cache is warm by
    * then; a tick before any session is a no-op rather than a ctx-less boot.
    */
-  let boot: Promise<{ loaded: LoadedConfig; dispatcher: Dispatcher }> | undefined;
+  let boot:
+    | Promise<{ loaded: LoadedConfig; dispatcher: Dispatcher; misses: ModelMiss[] }>
+    | undefined;
   const bootOnce = (ctx: ExtensionContext) =>
     (boot ??= loadedOnce().then((base) => {
       const checked = checkModels(base.config, modelLookup(ctx));
@@ -2406,6 +2481,10 @@ export default function (pi: ExtensionAPI) {
           held: checked.held,
           droppedAlternates: checked.droppedAlternates,
         }),
+        // The occurrences the same check warned about, for `session_start` to
+        // surface. Rendered lines would have to be read back apart to be listed
+        // as a warning, which is the work `checkModels` already did.
+        misses: checked.misses,
       };
     }));
 
@@ -2450,17 +2529,18 @@ export default function (pi: ExtensionAPI) {
   // to write, and asking two vendors for quota to then decide about no files is
   // a request the user never asked for. It says so instead.
   pi.on("session_start", async (event, ctx) => {
-    const { loaded, dispatcher } = await bootOnce(ctx);
+    const { loaded, dispatcher, misses } = await bootOnce(ctx);
 
     if (managesNothing(loaded.config)) {
       await announceUnconfigured(loaded, ctx, event.reason);
       return;
     }
 
-    // Clears the footer line the state carried while the table was empty. The
-    // table is read once per extension load, so this is the same session that
-    // set it whenever it was set at all.
-    setFooterStatus(ctx, undefined);
+    // Before the evaluation, so the warning is on screen while the quota reads
+    // that follow it are still in flight. It also replaces the footer line an
+    // unconfigured install left: the table is read once per extension load, so
+    // the state has to change here or nowhere.
+    announceUnknownModels(misses, loaded, ctx, event.reason);
     await dispatcher.evaluate().catch(() => {});
   });
 

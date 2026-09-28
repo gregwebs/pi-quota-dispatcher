@@ -90,6 +90,7 @@ test("checkModels without a lookup skips silently: unchanged config, nothing hel
   assert.deepEqual(result.config, snapshot, "without a lookup the config is returned as it came in");
   assert.deepEqual(result.held, {});
   assert.deepEqual(result.droppedAlternates, {});
+  assert.deepEqual(result.misses, []);
   assert.deepEqual(result.warnings, []);
   assert.equal(lines.length, 0, "the check must not warn when it is skipped");
 });
@@ -302,6 +303,12 @@ test("the same unknown id twice warns twice and holds only the primary's agent",
   assert.equal(result.warnings[1], unknownLine("agents.zebra.alternates[0].model", unknown));
   assert.deepEqual(result.held, { alpha: unknown }, "only the unknown *primary* is held");
   assert.deepEqual(lines, result.warnings);
+  // The occurrences as data: the same two, in the same order, so a caller that
+  // has to list them itself never has to parse a rendered sentence.
+  assert.deepEqual(result.misses, [
+    { key: "agents.alpha.primary.model", model: unknown },
+    { key: "agents.zebra.alternates[0].model", model: unknown },
+  ]);
 });
 
 test("a config whose models are all known produces no warnings and is returned unchanged", () => {
@@ -319,6 +326,7 @@ test("a config whose models are all known produces no warnings and is returned u
   assert.deepEqual(result.config, snapshot);
   assert.deepEqual(result.held, {});
   assert.deepEqual(result.droppedAlternates, {});
+  assert.deepEqual(result.misses, [], "a clean config has nothing to surface");
   assert.deepEqual(result.warnings, []);
   assert.equal(lines.length, 0);
 });
@@ -436,6 +444,24 @@ test("warnings come out agents by name, then primary, then alternates in index o
     alpha: "claude-bridge/claude-alpha-primary",
     zulu: "claude-bridge/claude-zulu-primary",
   });
+  // One list, two renderings: the misses are the occurrences the lines were
+  // built from, so a caller can pick out the keys and models without reversing
+  // the wording.
+  assert.deepEqual(
+    result.warnings,
+    result.misses.map((miss) => unknownLine(miss.key, miss.model)),
+    "every warning is a miss, at the key and in the order the miss records",
+  );
+  assert.deepEqual(
+    result.misses.map((miss) => miss.key),
+    [
+      "agents.alpha.primary.model",
+      "agents.alpha.alternates[0].model",
+      "agents.alpha.alternates[1].model",
+      "agents.zulu.primary.model",
+      "agents.zulu.alternates[1].model",
+    ],
+  );
 });
 
 // ---------------------------------------------------------------- transposed-ids fixture

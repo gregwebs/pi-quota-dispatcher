@@ -10,10 +10,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import extension, {
   type AgentFile,
+  type ModelMiss,
   agentTableSnippet,
   describeAgentFiles,
   readAgentFiles,
   unconfiguredNotice,
+  unknownModelsNotice,
 } from "../src/index.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
@@ -23,6 +25,10 @@ const CONFIG_FILE_NAME = "quota-dispatch.json";
 
 const TEMPLATE = (name: string, model: string) =>
   `---\nname: ${name}\ndescription: x\nmodel: "${model}"\nthinking: high\n---\n\nBody.\n`;
+
+// The em dash the agreed wording pins (U+2014), kept as a named constant so a
+// careless hyphen cannot slip into an assertion.
+const DASH = "\u2014";
 
 // ---------------------------------------------------------------- readAgentFiles
 
@@ -252,6 +258,44 @@ test("unconfiguredNotice gives no snippet when no file can seed one", () => {
   assert.ok(!text.includes('"agents"'), `no empty snippet may be offered:\n${text}`);
   assert.ok(text.includes("blank") && text.includes("mystery"), text);
   assert.match(text, /no snippet to paste/, text);
+});
+
+// ---------------------------------------------------------------- unknownModelsNotice
+
+test("unknownModelsNotice names every miss once, at its key, and the file to edit", () => {
+  const misses: ModelMiss[] = [
+    { key: "agents.reviewer.primary.model", model: "openai-codex/gpt-astra-6" },
+    { key: "agents.reviewer.alternates[0].model", model: "openai-codex/gpt-sol-6" },
+  ];
+
+  const lines = unknownModelsNotice(misses, ["/a/quota-dispatch.json"]);
+
+  assert.deepEqual(lines, [
+    "quota-dispatcher: a configured model is unknown to this pi.",
+    `agents.reviewer.primary.model: this pi does not know model openai-codex/gpt-astra-6 ${DASH} a newer pi may`,
+    `agents.reviewer.alternates[0].model: this pi does not know model openai-codex/gpt-sol-6 ${DASH} a newer pi may`,
+    "Edit /a/quota-dispatch.json, then /reload, or upgrade pi.",
+  ]);
+
+  const text = lines.join("\n");
+  assert.match(text, /unknown to this pi/, "the id is unknown here, not bad everywhere");
+  assert.ok(!/invalid/i.test(text), `the notice must not call an id invalid:\n${text}`);
+});
+
+// A miss can be written in either layer, so the notice may have two files to
+// name — and a reader who edits the wrong one has not fixed anything.
+test("unknownModelsNotice names both config layers when the misses came from both", () => {
+  const misses: ModelMiss[] = [
+    { key: "agents.planner.primary.model", model: "a/x" },
+    { key: "agents.writer.primary.model", model: "b/y" },
+  ];
+
+  const text = unknownModelsNotice(misses, ["/home/g/quota-dispatch.json", "/repo/.pi/quota-dispatch.json"]).join(
+    "\n",
+  );
+
+  assert.ok(text.includes("/home/g/quota-dispatch.json"), text);
+  assert.ok(text.includes("/repo/.pi/quota-dispatch.json"), text);
 });
 
 // ---------------------------------------------------------------- fresh install (integration)
