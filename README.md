@@ -326,11 +326,19 @@ layers are folded and never kept in the effective config:
 | `"disable": true` | Remove the agent, whatever lower layers said, and report it once as `agents.<name> = disabled [<layer>]`. |
 | `"ignore": true` | This copy of the entry contributes nothing and warns nothing; a lower layer's route stands. It wins over `disable`. |
 | `"disable": false` | Inert — the rest of the entry still applies. |
+| `"ignore": false` | Inert, exactly as `disable: false`. |
 
 `disable` and `ignore` are how you say "off" and "not this copy" without letting
-a mistyped value do either by accident. There is **no `null`** anywhere: a `null`
-at the agent or candidate level warns and leaves the previous layer's value
-standing — it removes nothing.
+a mistyped value do either by accident. A `false` flag asserts nothing, so an
+entry carrying only flags names no agent route at all: on an agent no lower layer
+defines it changes nothing and gets no `has no primary` warning (the only warning
+such an entry can produce is about a non-boolean flag, and that one is the flag's
+own), and the provenance block simply does not mention the agent. `agent
+"<name>" has no primary` is for an entry that named a field of an agent route —
+`primary`, `alternates`, or a `thinking` default — and could not complete one: a
+candidate with no rail, or an `alternates` list with nothing for it to hang
+from. There is **no `null`** anywhere: a `null` at the agent or candidate level
+warns and leaves the previous layer's value standing — it removes nothing.
 
 `alternates` is a **priority list**, consulted in order, and it replaces whole:
 
