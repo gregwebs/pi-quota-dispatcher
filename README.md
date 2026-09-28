@@ -109,6 +109,37 @@ files it deliberately does not manage.
 Config is read once per extension load, so `/reload` is what picks up a new
 route — and what stops the ask.
 
+## A model this pi does not know
+
+The other state that needs a person is a config that names a model the running pi
+cannot spawn. Agents are not left broken by it — an unknown **primary** holds its
+agent, an unknown **alternate** is dropped — but nothing moves or gets written
+until someone fixes the id, so the same three reasons raise a warning-level
+notification listing every occurrence and the file to edit:
+
+```
+quota-dispatcher: a configured model is unknown to this pi.
+agents.reviewer.primary.model: this pi does not know model openai-codex/gpt-astra-6 — a newer pi may
+agents.reviewer.alternates[0].model: this pi does not know model openai-codex/gpt-sol-6 — a newer pi may
+Edit ~/.pi/agent/quota-dispatch.json, then /reload, or upgrade pi.
+```
+
+One message per session however many ids are wrong, one line per occurrence, and
+the file named is the layer the id is actually written in — a project-layer typo
+names the project file. The line under a held agent says "unknown **to this pi**"
+rather than "invalid", because a newer pi may well know the id.
+
+A footer line (`quota-dispatcher: a configured model is unknown to this pi.`)
+holds the state on every reason, including `resume` and `fork`, where no notify
+is raised: a resumed session still has to be able to see that the dispatcher is
+stepping over a model. A pi with no model registry cannot answer the question at
+all: the check does not run, so no warning is raised and the footer is only
+cleared, as on any configured install. Everything here is an addition to the
+log, never a replacement for it: each miss is still written to `console.error`,
+and `/quota-dispatch` ends with the same lines in its provenance block, which
+stays the durable record. More in
+[0009](docs/adr/0009-unknown-models-at-startup.md).
+
 ## Commands
 
 | Command | Effect |
@@ -376,8 +407,10 @@ Bad configuration never stops the dispatcher from starting:
   machine. Every configured candidate is resolved at boot against the running
   pi's registry, and each miss is logged once per occurrence, naming the key it
   came from (`agents.reviewer.primary.model: this pi does not know model
-  openai-codex/gpt-astra-6 — a newer pi may`). An agent whose **primary** is
-  unknown is **held**, so its file is left exactly as it is; an **alternate**
+  openai-codex/gpt-astra-6 — a newer pi may`) and raised as a single
+  warning-level notification on the three startup reasons, held by a footer line
+  on every reason. An agent whose **primary** is unknown is **held**, so its file
+  is left exactly as it is; an **alternate**
   that is unknown is **dropped**, and the alternates after it stay eligible. If
   every alternate on a route is dropped, the route is left with none — the same
   as `alternates: []` — so the agent stays pinned to its primary. Those two are
@@ -385,7 +418,8 @@ Bad configuration never stops the dispatcher from starting:
   pinned says `no alternate configured`, while one whose alternates were dropped
   says `every alternate was dropped — pinned to the primary` and then names each
   of them, one per line, in the wording the boot warning used. More in
-  [0008](docs/adr/0008-dropped-alternates-explained.md).
+  [0008](docs/adr/0008-dropped-alternates-explained.md) and
+  [0009](docs/adr/0009-unknown-models-at-startup.md).
 
 Agent names are filenames (`<agent dir>/<name>.md`), so they must be lowercase
 letters, digits and dashes, starting with a letter (`planner`,

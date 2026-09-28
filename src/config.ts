@@ -1395,3 +1395,13 @@ export function describeConfig(loaded: LoadedConfig): string[] {
   for (const warning of loaded.warnings) lines.push(`  warning: ${warning}`);
   return lines;
 }
+
+/**
+ * The config files that supplied these keys, deduped and in layer order, so a
+ * caller can name the file the reader has to edit rather than whichever config
+ * file happens to exist. A key no layer set (`built-in`) names no file.
+ */
+export function configFilesFor(loaded: LoadedConfig, keys: Iterable<string>): string[] {
+  const layers = new Set([...keys].map((key) => loaded.sources[key]));
+  return loaded.files.filter((file) => layers.has(file.source)).map((file) => file.path);
+}

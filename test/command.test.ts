@@ -765,3 +765,243 @@ test("the decision line names the alternates boot dropped instead of claiming no
     { modelRegistry: registry({ "claude-bridge": ["claude-opus-5-5"] }) },
   );
 });
+
+// ---------------------------------------------------------------- unknown models at startup (issue #22)
+
+/**
+ * One route with two ids this pi does not know — the primary and the second
+ * alternate — so the startup warning has to name each of them at its own key
+ * rather than stopping at the first. The registry knows the model `planner.md`
+ * already carries and the first alternate, so the plan for the agent is not
+ * wholly broken: the check has work to do either way.
+ */
+const TWO_UNKNOWN_AGENTS = {
+  planner: {
+    primary: { model: "claude-bridge/claude-sol-9", rail: "claude" }, // transposed: unknown
+    alternates: [
+      { model: "claude-bridge/claude-opus-5-5", rail: "claude" }, // known
+      { model: "openai-codex/gpt-sol-6", rail: "codex" }, // transposed: unknown
+    ],
+  },
+};
+
+/** The registry for `TWO_UNKNOWN_AGENTS`: everything but the two transpositions. */
+const TWO_UNKNOWN_REGISTRY = registry({
+  "claude-bridge": ["claude-opus-5-5"],
+  "openai-codex": ["gpt-6-sol"],
+});
+
+/** The two sentences the boot warning for `TWO_UNKNOWN_AGENTS` is made of. */
+const TWO_UNKNOWN_LINES = [
+  `agents.planner.primary.model: this pi does not know model claude-bridge/claude-sol-9 — a newer pi may`,
+  `agents.planner.alternates[1].model: this pi does not know model openai-codex/gpt-sol-6 — a newer pi may`,
+];
+
+for (const reason of ["startup", "new", "reload"]) {
+  test(`a config naming models this pi does not know notifies once, at warning level, on ${reason}`, async () => {
+    const fx = await fixture(2_147_483_647, TWO_UNKNOWN_AGENTS);
+
+    await withExtension(
+      fx,
+      async ({ notifications, statuses, sessionStart }) => {
+        await sessionStart(reason);
+
+        assert.equal(notifications.length, 1, `expected exactly one notify on ${reason}`);
+        assert.equal(notifications[0].level, "warning");
+
+        const text = notifications[0].text;
+        const lines = text.split("\n");
+        assert.ok(
+          text.includes(join(fx.agentDir, CONFIG_FILE_NAME)),
+          `the notice must name the file to edit:\n${text}`,
+        );
+        // Each miss once, whole, in the wording the log and the report use.
+        assert.deepEqual(
+          lines.filter((line) => line.includes("this pi does not know model")),
+          TWO_UNKNOWN_LINES,
+          text,
+        );
+        // The footer carries the state on every reason, and its words are the
+        // notify's own headline: the interruption and the standing fact are one
+        // sentence, so a surface that disagrees cannot pass by accident.
+        assert.deepEqual(
+          statuses,
+          [{ key: "quota-dispatch", text: "quota-dispatcher: a configured model is unknown to this pi." }],
+          `the footer must hold the unknown model on ${reason}: ${JSON.stringify(statuses)}`,
+        );
+        assert.equal(lines[0], statuses[0].text, "the warning's headline and the footer are the same words");
+      },
+      stubFetch,
+      { modelRegistry: TWO_UNKNOWN_REGISTRY },
+    );
+  });
+}
+
+for (const reason of ["resume", "fork"]) {
+  test(`an unknown model is not notified on ${reason}, but the footer holds it`, async () => {
+    const fx = await fixture(2_147_483_647, TWO_UNKNOWN_AGENTS);
+
+    await withExtension(
+      fx,
+      async ({ notifications, statuses, sessionStart }) => {
+        await sessionStart(reason);
+
+        assert.equal(notifications.length, 0, `the warning must not interrupt ${reason}`);
+        // The footer describes the install, not the reason, so it still reports
+        // the state — which on `resume` is the only place the state is said.
+        assert.deepEqual(
+          statuses,
+          [{ key: "quota-dispatch", text: "quota-dispatcher: a configured model is unknown to this pi." }],
+          `the footer must carry the unknown model on ${reason}: ${JSON.stringify(statuses)}`,
+        );
+      },
+      stubFetch,
+      { modelRegistry: TWO_UNKNOWN_REGISTRY },
+    );
+  });
+}
+
+// Every model in this table is one the registry answers for, so the check finds
+// nothing — which is the same shape as a check that never ran, and both have to
+// leave the footer the configured install has always had: cleared.
+test("a clean config notifies nothing and clears the footer", async () => {
+  const fx = await fixture(2_147_483_647, {
+    planner: {
+      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+      alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
+    },
+  });
+
+  await withExtension(
+    fx,
+    async ({ notifications, statuses, sessionStart }) => {
+      await sessionStart("startup");
+
+      assert.equal(notifications.length, 0, "a usable config must not be interrupted");
+      assert.deepEqual(statuses, [{ key: "quota-dispatch", text: undefined }], JSON.stringify(statuses));
+    },
+    stubFetch,
+    { modelRegistry: TWO_UNKNOWN_REGISTRY },
+  );
+});
+
+// A pi with no registry cannot answer, so the check is skipped and there is no
+// state to report. This is the path every existing install keeps until pi grows
+// the field, and it must stay silent rather than guess.
+test("a registryless context notifies nothing, even for ids nothing could resolve", async () => {
+  const fx = await fixture(2_147_483_647, TWO_UNKNOWN_AGENTS);
+
+  await withExtension(fx, async ({ notifications, statuses, sessionStart }) => {
+    await sessionStart("startup");
+
+    assert.equal(notifications.length, 0, "a check that did not run reports nothing");
+    assert.deepEqual(statuses, [{ key: "quota-dispatch", text: undefined }], JSON.stringify(statuses));
+  });
+});
+
+test("an unknown model renders nothing at all when ctx.hasUI is false", async () => {
+  const fx = await fixture(2_147_483_647, TWO_UNKNOWN_AGENTS);
+
+  await withExtension(
+    fx,
+    async ({ notifications, statuses, sessionStart }) => {
+      await sessionStart("startup");
+
+      assert.equal(notifications.length, 0, "no notify without a UI");
+      assert.equal(statuses.length, 0, "no status without a UI");
+    },
+    stubFetch,
+    { hasUI: false, modelRegistry: TWO_UNKNOWN_REGISTRY },
+  );
+});
+
+// The file to edit is the layer the id was written in. A notice that always
+// named the global config would send a user with a project-layer typo to a file
+// that does not contain it.
+test("the notice names the project layer when that is where the unknown id is written", async () => {
+  const fx = await fixture(2_147_483_647, {
+    planner: {
+      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+      alternates: [],
+    },
+  });
+  const projectConfig = join(fx.projectDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+  // The fixture's project file carries a scalar only; this layer names the route
+  // that replaces the global one whole, in the model this pi cannot spawn.
+  await writeFile(
+    projectConfig,
+    JSON.stringify({
+      margin: 10,
+      agents: { planner: { primary: { model: "claude-bridge/claude-sol-9", rail: "claude" } } },
+    }),
+    "utf8",
+  );
+
+  await withExtension(
+    fx,
+    async ({ notifications, sessionStart }) => {
+      await sessionStart("startup");
+
+      assert.equal(notifications.length, 1, "the project-layer miss must be surfaced");
+      const text = notifications[0].text;
+      assert.ok(text.includes(projectConfig), `the notice must name the project file:\n${text}`);
+      assert.ok(
+        !text.includes(join(fx.agentDir, CONFIG_FILE_NAME)),
+        `the global file does not hold this id and must not be named:\n${text}`,
+      );
+    },
+    stubFetch,
+    { modelRegistry: registry({ "claude-bridge": ["claude-opus-5-5"] }) },
+  );
+});
+
+// Two layers can hold a miss at once, and each names its own file. A notice
+// that collapsed them to one path would send the reader to the wrong file for
+// one of the ids, and one that deduped by model id would hide an occurrence.
+test("a miss in each layer names both config files, each occurrence once", async () => {
+  const fx = await fixture(2_147_483_647, {
+    planner: {
+      primary: { model: "claude-bridge/claude-sol-9", rail: "claude" }, // global miss
+      alternates: [],
+    },
+  });
+  const globalConfig = join(fx.agentDir, CONFIG_FILE_NAME);
+  const projectConfig = join(fx.projectDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+  // A different agent, so the project route adds to the table rather than
+  // replacing the global one: both misses survive into the effective config.
+  await writeFile(
+    projectConfig,
+    JSON.stringify({
+      margin: 10,
+      agents: {
+        reviewer: {
+          primary: { model: "openai-codex/gpt-sol-6", rail: "codex" }, // project miss
+          alternates: [],
+        },
+      },
+    }),
+    "utf8",
+  );
+
+  await withExtension(
+    fx,
+    async ({ notifications, sessionStart }) => {
+      await sessionStart("startup");
+
+      assert.equal(notifications.length, 1, "one notice for the whole install, however many layers are wrong");
+      const text = notifications[0].text;
+      assert.ok(text.includes(globalConfig), `the notice must name the global file:\n${text}`);
+      assert.ok(text.includes(projectConfig), `the notice must name the project file:\n${text}`);
+      assert.deepEqual(
+        text.split("\n").filter((line) => line.includes("this pi does not know model")),
+        [
+          `agents.planner.primary.model: this pi does not know model claude-bridge/claude-sol-9 — a newer pi may`,
+          `agents.reviewer.primary.model: this pi does not know model openai-codex/gpt-sol-6 — a newer pi may`,
+        ],
+        text,
+      );
+    },
+    stubFetch,
+    { modelRegistry: registry({ "claude-bridge": ["claude-opus-5-5"], "openai-codex": ["gpt-6-sol"] }) },
+  );
+});

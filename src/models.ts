@@ -46,24 +46,33 @@ export interface ModelRegistryLike {
 export type ModelLookup = (provider: string, modelId: string) => boolean;
 
 /**
- * One alternate dropped because this pi cannot spawn it, with the config key the
- * warning named it by.
+ * One configured candidate this pi cannot spawn, with the config key the warning
+ * named it by.
+ *
+ * The pair is the whole of a miss: the id that has to resolve somewhere else,
+ * and the line the reader has to go and edit. `ModelCheckResult` keeps every one
+ * of them in the order they were found, because the startup warning lists each
+ * occurrence whether or not a decision ever mentions it.
+ */
+export interface ModelMiss {
+  key: string;
+  model: string;
+}
+
+/**
+ * One alternate dropped because this pi cannot spawn it: the same two strings a
+ * `ModelMiss` is, under the name the decision knows them by.
  *
  * Carried out of the check rather than only reported, because a route whose
  * alternates were all dropped reaches `decide` looking exactly like one the user
  * pinned with `[]` — and those two need opposite explanations. The key rides
  * along so the decision can say it in the warning's own words, which name the
- * line the reader has to go and fix.
+ * line the reader has to go and fix; it is a provenance key,
+ * `agents.<name>.alternates[<n>].model`, indexed in the alternates list as the
+ * user wrote it — before any dropping, so the key still names the right element
+ * of a route that kept some of its list.
  */
-export interface DroppedAlternate {
-  /**
-   * Provenance key, `agents.<name>.alternates[<n>].model`, indexed in the
-   * alternates list as the user wrote it — before any dropping, so the key
-   * still names the right element of a route that kept some of its list.
-   */
-  key: string;
-  model: string;
-}
+export type DroppedAlternate = ModelMiss;
 
 /**
  * The one wording for a model this pi does not know, shared by the boot warning
@@ -123,10 +132,21 @@ export interface ModelCheckResult {
    */
   held: Record<string, string>;
   /**
-   * One line per unresolvable candidate — one per occurrence, never deduped by
+   * Every candidate this pi cannot spawn, one per occurrence, never deduped by
    * model id, because the reader has to fix every place the id is written. In a
    * fixed order: agents by name, and within an agent the primary before its
    * alternates in priority order.
+   *
+   * The occurrences `warnings` renders, kept as data as well because the `key`
+   * is the provenance key a layer records against: it is what resolves the miss
+   * to the config file to edit, `loaded.sources[miss.key]`. A list of already
+   * rendered sentences cannot give that key back without parsing its own
+   * wording.
+   */
+  misses: ModelMiss[];
+  /**
+   * One line per unresolvable candidate, each `misses` entry through
+   * `unknownModelNote`, in the same order.
    */
   warnings: string[];
 }
@@ -169,7 +189,10 @@ export function modelLookup(ctx: { modelRegistry?: ModelRegistryLike }): ModelLo
  *
  * `warn` is called as each miss is found and the same lines come back in
  * `warnings`, the way `loadConfig` reports: the sink is for the log, the return
- * value is for `/quota-dispatch`, which prints them in its provenance block.
+ * value is for `/quota-dispatch`, which prints them in its provenance block. The
+ * occurrences come back as `misses` too, because each miss's key is what
+ * resolves to the config file to edit — data a list of finished sentences no
+ * longer carries.
  *
  * Without a lookup the check is skipped silently and `config` comes back
  * unchanged, which is how a pi with no registry is handled.
@@ -179,14 +202,14 @@ export function checkModels(
   lookup: ModelLookup | undefined,
   warn: (message: string) => void = console.error,
 ): ModelCheckResult {
-  if (!lookup) return { config, held: {}, droppedAlternates: {}, warnings: [] };
+  if (!lookup) return { config, held: {}, droppedAlternates: {}, misses: [], warnings: [] };
 
   const held: Record<string, string> = {};
   const droppedAlternates: Record<string, DroppedAlternate[]> = {};
-  const warnings: string[] = [];
+  const misses: ModelMiss[] = [];
 
   /**
-   * Whether `model` resolves, warning once and recording the line when it does
+   * Whether `model` resolves, warning once and recording the miss when it does
    * not. A model with no `/` cannot name a pi model at all, so it is a miss
    * without being put to the lookup; the config seam already rejects those, so
    * this is the belt-and-braces path rather than a second wording.
@@ -202,7 +225,7 @@ export function checkModels(
       // Warning sinks are callers' code; a throwing one must not sink the
       // check. The line is still returned for `/quota-dispatch` to print.
     }
-    warnings.push(line);
+    misses.push({ key: dotted, model });
     return false;
   };
 
@@ -237,5 +260,11 @@ export function checkModels(
     };
   }
 
-  return { config: { ...config, agents }, held, droppedAlternates, warnings };
+  return {
+    config: { ...config, agents },
+    held,
+    droppedAlternates,
+    misses,
+    warnings: misses.map((miss) => unknownModelNote(miss.key, miss.model)),
+  };
 }
