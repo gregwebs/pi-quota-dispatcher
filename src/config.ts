@@ -158,6 +158,15 @@ export interface AgentRoute {
  * leaves a lower layer's route exactly as it was. Any other non-boolean value
  * is not a skip instruction at all: it warns and is treated as absent, leaving
  * the rest of the entry to apply.
+ *
+ * An entry that carries skip flags and names no field of an agent route states
+ * no route at all. On an agent no lower layer defines it therefore changes
+ * nothing and gets no `has no primary` warning: the only warning such an entry
+ * can produce is about a flag value that is not a boolean, and that one is the
+ * flag's own. There is no half-built agent route to report, and the provenance
+ * block already shows the agent as unmanaged. `has no primary` is for an entry
+ * that named a route field — `primary`, `alternates` or `thinking` — and could
+ * not complete one.
  */
 export type SkipFlag = "disable" | "ignore";
 
@@ -988,12 +997,29 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
     // value and its source are never out of step.
     const pending = new Map<string, ConfigSource | null>();
 
+    // Whether this entry named a field of an agent route — one of `AgentRoute`'s
+    // fields rather than a skip flag, which says what to do with an entry
+    // instead of what the entry is. An entry that named none of them is not an
+    // agent route that failed to complete, so it must not be reported as one
+    // below.
+    let namedRouteField = false;
+
     for (const [field, value] of Object.entries(data)) {
       if (field === "disable" || field === "ignore") {
         // Already consumed as a skip instruction; a `false` one is valid and
         // inert, so it is not an unknown key.
         continue;
       }
+      if (field !== "thinking" && field !== "primary" && field !== "alternates") {
+        warn(`unknown key "agents.${agent}.${field}"`);
+        continue;
+      }
+      // A field of an agent route, whatever its value turns out to be worth: the
+      // entry is an attempt at one, so ending up with no primary is reportable
+      // below. A key this schema does not have is not — it warned for itself, and
+      // a misspelling is not a half-built agent route.
+      namedRouteField = true;
+
       if (field === "thinking") {
         // The route's own default, which outranks a model's and is outranked by
         // a candidate's. Rejecting it leaves the lower layer's level standing,
@@ -1004,10 +1030,6 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
         }
         holders.thinking = value;
         pending.set(`agents.${agent}.thinking`, source);
-        continue;
-      }
-      if (field !== "primary" && field !== "alternates") {
-        warn(`unknown key "agents.${agent}.${field}"`);
         continue;
       }
 
@@ -1091,7 +1113,12 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       // Never remove an agent a lower layer set: an invalid value leaves the
       // previous value standing. Removal stays explicit (`disable: true`).
       // Returning here discards `pending`, so neither value nor source moves.
-      warn(`agent "${agent}" has no primary`);
+      //
+      // The warning is about an agent route that could not be finished, so it is
+      // owed only to an entry that named a route field: `{"disable": false}`
+      // asks for no agent route, and one it does not get is not a failure to
+      // report.
+      if (namedRouteField) warn(`agent "${agent}" has no primary`);
       return;
     }
     config.agents[agent] = {

@@ -437,6 +437,123 @@ test("disable: false alone is a no-op that leaves a lower layer's route standing
   assert.equal("agents.planner" in r.sources, false);
 });
 
+// The boundary #16 draws: `has no primary` reports an agent route that could not
+// be finished, so it is owed only to an entry that named a route field. An entry
+// that carries flags and nothing else names no agent route — and on an agent no
+// lower layer defines there is nothing for it to leave standing — so it must
+// change nothing and say nothing. The provenance block is the whole answer: the
+// agent is simply unmanaged.
+test("a flag-only entry on an agent nothing defines is silent and defines nothing", () => {
+  const untouched = mergeConfig(base(), []);
+  for (const flag of SKIP_FLAGS) {
+    const r = mergeConfig(base(), [
+      { source: "project", data: { agents: { ghost: { [flag]: false } } } },
+    ]);
+    assert.deepEqual(r.warnings, [], `${flag}: ${r.warnings.join("\n")}`);
+    // Nothing moved anywhere: not the table, and not a provenance entry for the
+    // agent this layer named and then said nothing about.
+    assert.deepEqual(r.config, base(), flag);
+    assert.deepEqual(r.sources, untouched.sources, flag);
+  }
+});
+
+// The same silent path by two other roads: an entry that names nothing at all,
+// and one whose only key is rejected on its own terms. Neither tried to build an
+// agent route, so neither has one to report as incomplete.
+test("an empty entry, and one naming only an unknown key, say nothing about a primary", () => {
+  const empty = mergeConfig(base(), [{ source: "project", data: { agents: { ghost: {} } } }]);
+  assert.deepEqual(empty.warnings, []);
+  assert.equal("ghost" in empty.config.agents, false);
+
+  const unknownKey = mergeConfig(base(), [
+    { source: "project", data: { agents: { ghost: { primry: { model: "openai-codex/gpt-6-sol" } } } } },
+  ]);
+  assert.ok(
+    unknownKey.warnings.some((w) => w.includes("agents.ghost.primry")),
+    `the unknown key is what warns: ${unknownKey.warnings.join("\n")}`,
+  );
+  assert.equal(
+    unknownKey.warnings.some((w) => w.includes("has no primary")),
+    false,
+    `a misspelled key is not a failed agent route: ${unknownKey.warnings.join("\n")}`,
+  );
+  assert.equal("ghost" in unknownKey.config.agents, false);
+});
+
+// A non-boolean flag has already warned about itself and is then treated as
+// absent, which leaves the entry a statement about flags — and so, still, no
+// agent route.
+test("a non-boolean flag on an agent nothing defines warns only about the flag", () => {
+  const untouched = mergeConfig(base(), []);
+  for (const flag of SKIP_FLAGS) {
+    const r = mergeConfig(base(), [
+      { source: "project", data: { agents: { ghost: { [flag]: "yes" } } } },
+    ]);
+    assert.ok(
+      r.warnings.some((w) => w.includes(`agents.ghost.${flag}`)),
+      `${flag}: ${r.warnings.join("\n")}`,
+    );
+    assert.equal(
+      r.warnings.some((w) => w.includes("has no primary")),
+      false,
+      `${flag}: ${r.warnings.join("\n")}`,
+    );
+    // The value warns for itself and is then absent, so the entry defines
+    // nothing and moves nothing.
+    assert.deepEqual(r.config, base(), flag);
+    assert.deepEqual(r.sources, untouched.sources, flag);
+  }
+});
+
+// The other side of the boundary, so the silence above cannot be bought by
+// dropping the warning altogether: an entry that named a route field and could
+// not complete one is reported however it failed.
+test("naming a route field that cannot complete still reports no primary", () => {
+  // A primary whose rail is stated nowhere: the model is named, so the entry
+  // did try to build an agent route.
+  const badRail = mergeConfig(base(), [
+    {
+      source: "project",
+      data: { agents: { ghost: { primary: { model: "openai-codex/gpt-6-sol" } } } },
+    },
+  ]);
+  assert.ok(badRail.warnings.some((w) => w.includes("needs a rail")), badRail.warnings.join("\n"));
+  assert.ok(
+    badRail.warnings.some((w) => w.includes('agent "ghost" has no primary')),
+    badRail.warnings.join("\n"),
+  );
+  assert.equal("ghost" in badRail.config.agents, false);
+
+  // An alternates-only entry names a route field without naming a primary.
+  const alternatesOnly = mergeConfig(base(), [
+    { source: "project", data: { agents: { ghost: { alternates: [] } } } },
+  ]);
+  assert.deepEqual(alternatesOnly.warnings, ['project: agent "ghost" has no primary']);
+  assert.equal("ghost" in alternatesOnly.config.agents, false);
+
+  // `thinking` is a field of a route rather than a statement about the entry, so
+  // an entry naming only a level has tried to define a route and is told what it
+  // is missing — including when the level itself is rejected, because naming the
+  // field is what makes the entry an attempt.
+  const levelOnly = mergeConfig(base(), [
+    { source: "project", data: { agents: { ghost: { thinking: "high" } } } },
+  ]);
+  assert.deepEqual(levelOnly.warnings, ['project: agent "ghost" has no primary']);
+  assert.equal("ghost" in levelOnly.config.agents, false);
+
+  const badLevel = mergeConfig(base(), [
+    { source: "project", data: { agents: { ghost: { thinking: "deeply" } } } },
+  ]);
+  assert.ok(
+    badLevel.warnings.some((w) => w.includes("agents.ghost.thinking")),
+    badLevel.warnings.join("\n"),
+  );
+  assert.ok(
+    badLevel.warnings.some((w) => w.includes('agent "ghost" has no primary')),
+    badLevel.warnings.join("\n"),
+  );
+});
+
 test("a non-boolean skip flag warns and is treated as absent", () => {
   for (const flag of SKIP_FLAGS) {
     for (const bad of ["yes", 1, null, {}, 0]) {
