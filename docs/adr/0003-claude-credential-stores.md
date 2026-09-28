@@ -9,7 +9,9 @@ long-expired file and a current keychain. Reading only the file made the rail
 report `claude token expired (run Claude Code to refresh)` while Claude was
 answering every turn in another session — advice that was not merely useless but
 wrong, because Claude Code *was* refreshing the credential, into a store the
-extension never looked at.
+extension never looked at. (That note has changed since — see
+[0007](0007-refresh-pings.md), which also removed the advice from it, since this
+extension can now cause the refresh itself.)
 
 So the credential file is read first, and when it cannot supply an unexpired
 token the keychain is read through `security find-generic-password -a $USER -w -s

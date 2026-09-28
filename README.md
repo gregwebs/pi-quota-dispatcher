@@ -326,14 +326,16 @@ for a one-element list.
 | `margin` | `10` | An alternate must be **more than** this many points healthier, on the budget that triggered the move |
 | `ttlMs` | `180000` | How long a quota reading is reused |
 | `pollMs` | `300000` | How often to re-evaluate while a session is open |
+| `claudeRefresh` | `off` | Whether an expired Claude token is refreshed by running Claude Code once — see [Keeping the Claude token fresh](#keeping-the-claude-token-fresh) |
 
 `claudeCredsPath` is settable too, defaulting to
 `~/.claude/.credentials.json`; choosing a different Claude profile is a real
 use. Naming **any other path** is a statement that the credential lives in that
 file and nowhere else, which also turns off the [macOS keychain
-fallback](#where-the-numbers-come-from): that keychain holds the default
-profile's credential, and reporting its headroom while a different profile runs
-would be worse than reporting nothing. `agentDir` and `piAuthPath` (defaults
+fallback](#where-the-numbers-come-from) and makes `claudeRefresh` inert: the
+keychain and the refresh ping both speak for this machine's **default** profile,
+and reporting its headroom — or refreshing its token — while a different profile
+runs would be worse than doing nothing. `agentDir` and `piAuthPath` (defaults
 `<agent dir>/agents` and `<agent dir>/auth.json`) are deliberately **not**
 settable from JSON: they are
 paths pi itself owns, derived from `getAgentDir()`, so a file pointing them
@@ -562,11 +564,61 @@ that was still being tried when the read stopped. The timings are deliberately
 not config-file keys: how long to wait for a socket is a fact about this network,
 not a routing preference. See [0006](docs/adr/0006-bounded-quota-reads.md).
 
+### Keeping the Claude token fresh
+
+Claude Code's credential is an 8-hour access token, and Claude Code is the only
+thing that refreshes it. Driven through a bridge, nothing refreshes it while the
+machine is idle, so the first read of the morning finds it expired — and an
+expired token is a [missing reading](#the-policy), so every route whose primary
+is on the Claude rail holds. `claudeRefresh` decides what to do about that:
+
+| Mode | What it does |
+|---|---|
+| `off` (default) | Report the expiry. What an install did before this key existed. |
+| `offline-ping` | Run `claude -p hi` once with its model request pointed at a loopback listener this extension answers itself, so Claude Code refreshes its own credential and the request dies on loopback having encoded nothing. |
+| `ping` | The same run without the diversion — a real request, costing a real answer's worth of tokens. The fallback if the diversion ever stops working. |
+
+`offline-ping` is the one to turn on, and it is measured rather than hoped —
+zero tokens, nothing reaching Anthropic, and a credential persisted *before* the
+request was sent. It costs a few seconds of session start, once per expiry, and
+all of it Claude Code's own startup, which no flag was able to trim. It is worth
+being precise about who refreshes what: this extension never posts a refresh
+token and never writes the store. It runs Claude Code and lets Claude Code do it,
+because that token rotates on every use and a second writer is how a session gets
+logged out.
+
+The extension is deliberately not talking to a model, and it proves that instead
+of assuming it: the request has to arrive on its own listener. A clean exit with
+no request on that listener is reported as exactly that, and the attempt is never
+repeated — a run whose model call was answered somewhere else means the diversion
+this feature rests on may have failed at the cost of a real request. The child
+also runs under a deliberately narrowed environment, so a `CLAUDE_CONFIG_DIR`,
+a `CLAUDE_CODE_OAUTH_TOKEN` or an `ANTHROPIC_API_KEY` exported into pi cannot
+make it refresh — or spend — a different credential from the one the dispatcher
+read, and a provider switch such as `CLAUDE_CODE_USE_BEDROCK` cannot move the
+request off the listener to bill another provider.
+
+An attempt costs a subprocess, so there is at most one at a time. After an
+attempt that merely failed — the binary missing, a stall before any request — the
+dispatcher backs off for a while and then retries once. After one that could have
+spent a real request, or that ran and did not work, it stops making attempts: a
+repeat can only pay again. That stop lasts until a credential read finds a usable
+token — the end of the expiry — except for a run that never diverted at all,
+which keeps the feature off for the rest of the session, because the next expiry
+would pay again; only a new pi process clears that one. A run that collides with
+Claude Code's own refresh lock is neither — it is reported as a deferral, because
+the other process is doing the work, so the next read may try again.
+See [0007](docs/adr/0007-refresh-pings.md) for the measurements, the bounds, and
+the alternatives that were rejected.
+
 ## Caveats
 
 - **The Claude token expires** (typically within hours). Claude Code refreshes it
-  on use; this extension only reads it. Once *both* stores lapse — the file and,
-  on macOS, the keychain — the Claude rail reports unavailable and the dispatcher
+  on use; this extension only reads it — unless you set
+  [`claudeRefresh`](#keeping-the-claude-token-fresh), which makes it run Claude
+  Code once to cause that refresh rather than waiting for you to use Claude
+  Code. Once *both* stores lapse — the file and, on macOS, the keychain — and
+  nothing refreshes them, the Claude rail reports unavailable and the dispatcher
   holds, leaving every agent file untouched. If you stop using Claude Code the
   Claude side goes dormant — but nothing gets moved onto the other plan to
   compensate, so the failure is quiet.
@@ -593,8 +645,11 @@ not a routing preference. See [0006](docs/adr/0006-bounded-quota-reads.md).
   is abandoned after 5s and retried once after 250ms, so a vendor that has gone
   quiet costs a session about 10s — a few seconds more on macOS, where a Claude
   credential that has to fall back to the keychain waits out its own 5s first,
-  since the two rails are read in parallel. The agents whose route depends on
-  that reading then *hold*, exactly as they do for any other missing reading,
+  since the two rails are read in parallel. A `claudeRefresh` ping adds a bounded
+  run of its own and the credential re-read that follows it, once per expiry —
+  see [Keeping the Claude token
+  fresh](#keeping-the-claude-token-fresh). The agents whose route depends on that
+  reading then *hold*, exactly as they do for any other missing reading,
   rather than being switched to an alternate chosen on evidence nobody read; rule
   5 of [the policy](#the-policy) says which routes those are.
 - **A failed reading is cached like a successful one.** A rail that is still down

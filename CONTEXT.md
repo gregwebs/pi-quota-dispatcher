@@ -103,3 +103,15 @@ the decision for an agent whose **primary** this pi cannot spawn: there the
 model is *known bad* rather than *unknown*, no reading could change the answer,
 and it is dropped from consideration instead of waited on.
 _Avoid_: skip, no-op, hold-off, fall back
+
+**Refresh ping**:
+One throwaway Claude Code process run for a single purpose: to make Claude Code
+refresh its own access token, which is the only thing that can. In its diverted
+form the model request is pointed at a loopback listener this extension answers
+itself, so the run never reaches a model and spends no budget; the undiverted
+form is a real request and spends a real answer's worth. Either way it is not a
+quota read and reports nothing — it exists so that the *next* credential read has
+a token to read. What the extension delegates is the refresh, not the credential:
+it never posts a refresh token and never writes the store, because that token
+rotates and a second writer is a way to end the user's session.
+_Avoid_: token refresh, credential refresh, re-login, keepalive

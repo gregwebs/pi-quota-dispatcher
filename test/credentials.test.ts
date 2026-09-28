@@ -57,13 +57,18 @@ test("parseClaudeToken returns an unexpired accessToken", () => {
 test("parseClaudeToken rejects a missing, blank, or absent accessToken", () => {
   const shaped = cred({ accessToken: "", expiresAt: FIXED + 60_000 });
   // An empty token is no token, so it must not be handed to the usage endpoint.
-  assert.deepEqual(parseClaudeToken(shaped, FIXED), { error: "no claudeAiOauth.accessToken" });
+  assert.deepEqual(parseClaudeToken(shaped, FIXED), {
+    error: "no claudeAiOauth.accessToken",
+    reason: "unusable",
+  });
   assert.deepEqual(parseClaudeToken(cred({ expiresAt: FIXED + 60_000 }), FIXED), {
     error: "no claudeAiOauth.accessToken",
+    reason: "unusable",
   });
   // The section itself missing is the same shape of failure.
   assert.deepEqual(parseClaudeToken(JSON.stringify({}), FIXED), {
     error: "no claudeAiOauth.accessToken",
+    reason: "unusable",
   });
 });
 
@@ -90,11 +95,16 @@ test("parseClaudeToken treats a token whose expiresAt equals now as still usable
   );
 });
 
+// The tag is what a caller acts on: an expiry is the one store failure a refresh
+// ping fixes, and the message alone no longer has to be parsed to learn that.
 test("parseClaudeToken rejects a token that expired in the past", () => {
-  assert.deepEqual(
-    parseClaudeToken(cred({ accessToken: "tok", expiresAt: FIXED - 1 }), FIXED),
-    { error: "claude token expired (run Claude Code to refresh)" },
-  );
+  assert.deepEqual(parseClaudeToken(cred({ accessToken: "tok", expiresAt: FIXED - 1 }), FIXED), {
+    // The fact alone: the advice ("run Claude Code to refresh") is the caller's
+    // decision to state, and a note that repeats it would tell a bridge user to
+    // do by hand what the dispatcher may already have done for them.
+    error: "claude token expired",
+    reason: "expired",
+  });
 });
 
 // A shape without an expiry is not evidence of expiry, so the token is used
@@ -271,7 +281,9 @@ test("readClaudeToken names both reasons when neither store yields a token", asy
   // File's reason first, keychain's after the separator, so the user learns both
   // stores were tried and how each failed.
   assert.deepEqual(out, {
-    error: "claude token expired (run Claude Code to refresh); keychain: no claudeAiOauth.accessToken",
+    error: "claude token expired; keychain: no claudeAiOauth.accessToken",
+    // One store's expiry is enough to make a ping worth trying.
+    reason: "expired",
   });
 });
 
@@ -281,23 +293,29 @@ test("readClaudeToken names a keychain token's own expiry", async () => {
     keychain: async () => ({ text: cred({ accessToken: "stale", expiresAt: FIXED - 1 }) }),
   });
   assert.deepEqual(out, {
-    error: "no claude credentials file; keychain: claude token expired (run Claude Code to refresh)",
+    error: "no claude credentials file; keychain: claude token expired",
+    reason: "expired",
   });
 });
 
 test("readClaudeToken keeps the pre-keychain single-store message with no keychain", async () => {
   // A missing file stays exactly "no claude credentials file", unchanged from
   // before the keychain existed.
-  assert.deepEqual(await readClaudeToken(await absentPath()), { error: "no claude credentials file" });
+  assert.deepEqual(await readClaudeToken(await absentPath()), {
+    error: "no claude credentials file",
+    reason: "unusable",
+  });
 
   const expired = await credsFile(cred({ accessToken: "stale", expiresAt: FIXED - 1 }));
   assert.deepEqual(await readClaudeToken(expired, { now: FIXED }), {
-    error: "claude token expired (run Claude Code to refresh)",
+    error: "claude token expired",
+    reason: "expired",
   });
 
   const shapeless = await credsFile(JSON.stringify({}));
   assert.deepEqual(await readClaudeToken(shapeless, { now: FIXED }), {
     error: "no claudeAiOauth.accessToken",
+    reason: "unusable",
   });
 });
 
@@ -430,9 +448,22 @@ test("with both stores failing the claude rail is unavailable and its agent is h
     },
   );
 
-  const note = "claude token expired (run Claude Code to refresh); keychain: keychain unavailable";
   const lines = await d.report({ force: true });
-  assert.ok(lines.includes(`claude: unavailable — ${note}`), `expected both reasons in one line:\n${lines.join("\n")}`);
+  const reported = lines.find((l) => l.startsWith("claude: unavailable — "));
+  assert.ok(reported, `claude must be unavailable:\n${lines.join("\n")}`);
+  const note = reported.slice("claude: unavailable — ".length);
+  // The rail note is the credential layer's fact — expired, and both stores' —
+  // followed by the decision about it: no ping, because this fixture's
+  // credential path is not the default one.
+  assert.ok(!note.includes("\n"), note);
+  assert.ok(note.includes("claude token expired"), note);
+  // The other store's reason is a distinct, user-fixable problem, so the
+  // decision must be appended to the credential fact rather than replace it.
+  assert.ok(note.includes("keychain unavailable"), note);
+  assert.ok(note.includes("refresh ping"), note);
+  // The path rule is the reason that decided it, named once rather than beside
+  // the key: `refreshPlan` resolves the mode and the path in one place.
+  assert.ok(note.includes("claudeCredsPath"), note);
 
   const path = join(fx.agentDir, "planner.md");
   const before = await readFile(path, "utf8");
