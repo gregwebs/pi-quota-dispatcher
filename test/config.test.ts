@@ -72,6 +72,7 @@ function base(): DispatcherConfig {
   return {
     agentDir: "/root/agents",
     claudeCredsPath: "/root/.claude/.credentials.json",
+    claudeRefresh: "off",
     piAuthPath: "/root/auth.json",
     ttlMs: 180000,
     pollMs: 300000,

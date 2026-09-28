@@ -161,9 +161,55 @@ export interface AgentRoute {
  */
 export type SkipFlag = "disable" | "ignore";
 
+/**
+ * What the dispatcher may do about an expired Claude credential.
+ *
+ * Claude Code owns this credential and is the only thing that refreshes it, as
+ * a side effect of being run. An install driven through a bridge rather than
+ * through `claude` therefore leaves the token to expire overnight, and the rail
+ * is unreadable exactly when a new session wants to read it — a missing reading,
+ * which holds every route that depends on it (ADR 0006).
+ *
+ *   `off`           read the credential, report the expiry, change nothing.
+ *                   What every install did before this key existed.
+ *   `offline-ping`  run one throwaway Claude Code process whose model request
+ *                   is diverted to a loopback listener this extension answers
+ *                   itself, so Claude Code refreshes its own credential without
+ *                   spending budget. See docs/adr/0007-refresh-pings.md.
+ *   `ping`          the same run without the diversion. A real request, costing
+ *                   a real answer's worth of tokens; the fallback for a machine
+ *                   where the diversion stops working.
+ *
+ * `off` is the default because this is the one key that makes the extension
+ * start a process and change state outside itself. `offline-ping` is the
+ * setting to recommend, and the reason the key exists at all.
+ */
+export type ClaudeRefreshMode = "off" | "offline-ping" | "ping";
+
+export const CLAUDE_REFRESH_MODES: readonly ClaudeRefreshMode[] = [
+  "off",
+  "offline-ping",
+  "ping",
+];
+
+/** The modes as a rejection words them, e.g. `"off", "offline-ping", ...`. */
+const CLAUDE_REFRESH_MODE_LIST = CLAUDE_REFRESH_MODES.map((mode) => `"${mode}"`).join(", ");
+
+/**
+ * Whether `value` is a mode this seam accepts.
+ *
+ * Spelled out here for the same reason the thinking levels are: the config
+ * seam's job is to refuse a typo before it can govern anything, and a mode it
+ * accepts is one the dispatcher knows how to carry out.
+ */
+export function isClaudeRefreshMode(value: unknown): value is ClaudeRefreshMode {
+  return typeof value === "string" && (CLAUDE_REFRESH_MODES as readonly string[]).includes(value);
+}
+
 export interface DispatcherConfig {
   agentDir: string;
   claudeCredsPath: string;
+  claudeRefresh: ClaudeRefreshMode;
   piAuthPath: string;
   /** Quota readings are cached this long. 5h/7d windows move slowly. */
   ttlMs: number;
@@ -215,6 +261,7 @@ export const CONFIG_FILE_NAME = "quota-dispatch.json";
 const SCALAR_KEYS = [
   "agentDir",
   "claudeCredsPath",
+  "claudeRefresh",
   "piAuthPath",
   "ttlMs",
   "pollMs",
@@ -260,6 +307,19 @@ const OWNED_PATH_SCALARS: ReadonlyMap<string, string> = new Map([
   ["agentDir", "relocate the agent dir with PI_CODING_AGENT_DIR"],
   ["piAuthPath", "relocate the agent dir with PI_CODING_AGENT_DIR"],
 ]);
+
+/**
+ * The string scalars that accept one of a closed set, and that set as a
+ * rejection words it.
+ *
+ * A key here is validated by its own predicate instead of by the blanket "must
+ * be a string" check, so `{"claudeRefresh": "ocasionally"}` is refused where it
+ * is written rather than at the moment the dispatcher would have acted on it.
+ */
+const ENUM_SCALARS: ReadonlyMap<
+  ScalarKey,
+  { is: (value: unknown) => value is string; list: string }
+> = new Map([["claudeRefresh", { is: isClaudeRefreshMode, list: CLAUDE_REFRESH_MODE_LIST }]]);
 
 /**
  * Agent names are filenames: `<agentDir>/<agent>.md`. A key like `../outside`
@@ -346,6 +406,7 @@ function mismatchedRail(model: string, rail: Rail): Rail | undefined {
  *   agentDir         `<agentDir>/agents`
  *   piAuthPath       `<agentDir>/auth.json`
  *   claudeCredsPath  `~/.claude/.credentials.json`
+ *   claudeRefresh    `off`
  *   ttlMs            180_000
  *   pollMs           300_000
  *   sessionSwitchAt  75
@@ -363,6 +424,7 @@ export function defaultConfig(agentDir: string = getAgentDir()): DispatcherConfi
   return {
     agentDir: join(agentDir, "agents"),
     claudeCredsPath: join(homedir(), ".claude", ".credentials.json"),
+    claudeRefresh: "off",
     piAuthPath: join(agentDir, "auth.json"),
     ttlMs: 180_000,
     pollMs: 300_000,
@@ -1168,6 +1230,7 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
         continue;
       }
       const range = NUMBER_RANGES.get(scalar);
+      const accepted = ENUM_SCALARS.get(scalar);
       if (range) {
         const requirement = `${range.integer ? "an integer" : "a number"} in [${range.min}, ${range.max}]`;
         if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -1176,6 +1239,11 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
         }
         if ((range.integer && !Number.isInteger(value)) || value < range.min || value > range.max) {
           warn(`"${key}" must be ${requirement}`);
+          continue;
+        }
+      } else if (accepted) {
+        if (!accepted.is(value)) {
+          warn(`"${key}" must be one of ${accepted.list}`);
           continue;
         }
       } else if (typeof value !== "string") {

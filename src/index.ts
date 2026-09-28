@@ -42,6 +42,7 @@
 import { execFile } from "node:child_process";
 import { existsSync, type Stats } from "node:fs";
 import { open, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
 import { userInfo } from "node:os";
 import { join, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent";
@@ -49,6 +50,7 @@ import {
   DEFAULT_CONFIG,
   type AgentRoute,
   type Candidate,
+  type ClaudeRefreshMode,
   type DispatcherConfig,
   type LoadedConfig,
   type ModelDefault,
@@ -66,12 +68,14 @@ import {
 // re-exported here so `src/index.ts` remains the one import path for the
 // extension's whole surface.
 export {
+  CLAUDE_REFRESH_MODES,
   CONFIG_FILE_NAME,
   DEFAULT_CONFIG,
   THINKING_LEVELS,
   defaultConfig,
   describeConfig,
   globalConfigPath,
+  isClaudeRefreshMode,
   isThinkingLevel,
   loadConfig,
   mergeConfig,
@@ -83,6 +87,7 @@ export {
 export type {
   AgentRoute,
   Candidate,
+  ClaudeRefreshMode,
   ConfigFile,
   ConfigSource,
   DispatcherConfig,
@@ -1226,30 +1231,77 @@ function currentUser(): string | undefined {
 const CLAUDE_KEYCHAIN_TIMEOUT_MS = 5_000;
 
 /**
- * The real runner. Its stdout is the keychain item's password — the credential
- * JSON — and its failures are reported as the one line a reader can act on:
- * what `security` said, its exit code when it said nothing, or the reason the
- * process never ran.
+ * How long one refresh ping may run.
+ *
+ * Longer than a keychain read because it does far more work — a binary's start
+ * plus a token refresh — and because its failure lasts longer: an expired token
+ * stays expired for the rest of the day, where a missed keychain read costs one
+ * reading. The measurements behind the number, and the residual risk of killing
+ * a run whose token request is in flight, are in
+ * docs/adr/0007-refresh-pings.md.
+ *
+ * The bound need not be tight to be safe, which is what makes it holdable: the
+ * refresh is written *before* the request is dispatched, so whatever landed is
+ * found by the re-read either way.
  */
-const execFileRead: CommandRunner = (file, args) =>
-  new Promise((resolve) => {
-    execFile(
-      file,
-      args,
-      { encoding: "utf8", timeout: CLAUDE_KEYCHAIN_TIMEOUT_MS, windowsHide: true },
-      (err, stdout, stderr) => {
-        if (!err) return resolve({ text: stdout.trim() });
-        resolve({ error: failureDetail(err, stderr) });
-      },
-    );
-  });
+const CLAUDE_PING_TIMEOUT_MS = 10_000;
 
 /**
- * One line, because this ends up in a one-line report: `security`'s own
+ * How long after a failed ping before another may be made.
+ *
+ * A dead refresh token must not mean a subprocess per poll: `pollMs` ships at
+ * five minutes, so without this every poll for the rest of the day would start
+ * one. This is a time gate, armed by a `failed` attempt only — a transient
+ * failure worth exactly one retry, a missing binary or a stall before any
+ * request. An attempt that could have spent money, or ran without effect, arms
+ * the permanent `halted` instead (see `recordVerdict`).
+ */
+export const CLAUDE_PING_COOLDOWN_MS = 900_000;
+
+/**
+ * The real runner, for one subprocess: its stdout is the value read back, and a
+ * failure is reported as the one line a reader can act on — what the command
+ * said, its exit code when it said nothing, or the reason the process never ran.
+ *
+ * `env` narrows the child's environment; left off, the child inherits this
+ * process's, which is what every runner here but the refresh ping wants.
+ */
+export function execFileRunner(timeoutMs: number, env?: NodeJS.ProcessEnv): CommandRunner {
+  return (file, args) =>
+    new Promise((resolve) => {
+      const child = execFile(
+        file,
+        args,
+        {
+          encoding: "utf8",
+          timeout: timeoutMs,
+          windowsHide: true,
+          ...(env === undefined ? {} : { env }),
+        },
+        (err, stdout, stderr) => {
+          if (!err) return resolve({ text: stdout.trim() });
+          resolve({ error: failureDetail(err, stderr, timeoutMs) });
+        },
+      );
+      // A child that reads stdin would otherwise wait for input that is never
+      // coming until the timeout kills it; ending the pipe hands it EOF instead.
+      //
+      // Spawn's `stdio: ["ignore", ...]` cannot do this, because `execFile`
+      // discards that option and rebuilds its own spawn options — a `cat` run
+      // through the documented form still hung for the full timeout.
+      child.stdin?.end();
+    });
+}
+
+/** The keychain read: `security`'s stdout is the credential JSON itself. */
+const execFileRead: CommandRunner = execFileRunner(CLAUDE_KEYCHAIN_TIMEOUT_MS);
+
+/**
+ * One line, because this ends up in a one-line report: the command's own
  * message when it printed one, otherwise the spawn failure's.
  */
-function failureDetail(err: Error, stderr: string): string {
-  if ((err as { killed?: boolean }).killed) return `timed out after ${CLAUDE_KEYCHAIN_TIMEOUT_MS}ms`;
+function failureDetail(err: Error, stderr: string, timeoutMs: number): string {
+  if ((err as { killed?: boolean }).killed) return `timed out after ${timeoutMs}ms`;
   const said = firstLine(stderr) ?? firstLine(err.message);
   const code = (err as { code?: unknown }).code;
   return said ?? (typeof code === "number" ? `exit ${code}` : "failed");
@@ -1263,24 +1315,63 @@ function firstLine(text: string): string | undefined {
 }
 
 /**
+ * Why no store supplied a token, as the one distinction the caller acts on.
+ *
+ *   `expired`   a store answered and the token it holds has run out. Claude
+ *               Code refreshing that store is exactly the fix, so this is the
+ *               one failure a refresh ping is started for.
+ *   `unusable`  no store answered, or none held a token at all. A ping would
+ *               leave every one of those reasons standing.
+ *
+ * The message names the store and the cause; the tag exists so that nothing has
+ * to read the message to know whether a ping is worth trying.
+ */
+export type TokenFailure = "expired" | "unusable";
+
+/** One store's refusal, or both stores' refusals joined into one message. */
+export interface ClaudeTokenError {
+  error: string;
+  reason: TokenFailure;
+}
+
+/** The Claude rail's token, or why no store supplied one. */
+export type ClaudeToken = { token: string } | ClaudeTokenError;
+
+/**
+ * A store that answered with a failure of its own — a keychain read that could
+ * not run, a file that could not be opened. Nothing a refresh ping fixes, which
+ * is what makes it `unusable` rather than `expired`: the store never got as far
+ * as a token whose age could be the problem.
+ */
+function storeFailure(error: string): ClaudeTokenError {
+  return { error, reason: "unusable" };
+}
+
+/**
  * Pulls `claudeAiOauth.accessToken` out of one store's JSON text.
  *
  * `now` is a parameter rather than a call to `Date.now()` so that the expiry
  * comparison stays a pure function of its inputs. A token carrying no
  * `expiresAt` is used: the shaping Claude Code writes always carries one, and a
  * missing field is not evidence of expiry.
+ *
+ * The expiry message is the *fact* only — "claude token expired" — because it
+ * is the first half of the note `fetchClaude` composes, and the second half is
+ * whatever decision was made about it. Naming an action here would tell a
+ * bridge user to run a command that only refreshes a credential the bridge
+ * already owns.
  */
-export function parseClaudeToken(text: string, now: number): { token: string } | { error: string } {
+export function parseClaudeToken(text: string, now: number): ClaudeToken {
   let oauth: any;
   try {
     oauth = JSON.parse(text)?.claudeAiOauth;
   } catch (err) {
-    return { error: `unreadable claude credentials: ${(err as Error).message}` };
+    return storeFailure(`unreadable claude credentials: ${(err as Error).message}`);
   }
-  if (!oauth?.accessToken) return { error: "no claudeAiOauth.accessToken" };
+  if (!oauth?.accessToken) return storeFailure("no claudeAiOauth.accessToken");
   // Claude Code refreshes this on use; we only read it.
   if (typeof oauth.expiresAt === "number" && oauth.expiresAt < now) {
-    return { error: "claude token expired (run Claude Code to refresh)" };
+    return { error: "claude token expired", reason: "expired" };
   }
   return { token: oauth.accessToken };
 }
@@ -1314,11 +1405,18 @@ export interface ClaudeTokenDeps {
  * rail be read" is only answerable if the user learns that both stores were
  * tried and how each failed. With no fallback the note is the file's reason
  * alone.
+ *
+ * The reason the read failed travels beside that message. A ping is worth
+ * starting when *any* store answered with an expiry — Claude Code refreshes the
+ * store it writes, which on Linux is this file and on macOS is the login
+ * keychain, and either one expiring is the case the ping fixes. A store that
+ * could not be read at all is a different problem, a locked keychain or a
+ * permission, and does not on its own call for one.
  */
 export async function readClaudeToken(
   path: string,
   deps: ClaudeTokenDeps = {},
-): Promise<{ token: string } | { error: string }> {
+): Promise<ClaudeToken> {
   const now = deps.now ?? Date.now();
 
   let file: CredentialRead;
@@ -1331,14 +1429,438 @@ export async function readClaudeToken(
       file = { error: `unreadable claude credentials: ${(err as Error).message}` };
     }
   }
-  const fromFile = "text" in file ? parseClaudeToken(file.text, now) : file;
+  const fromFile: ClaudeToken = "text" in file ? parseClaudeToken(file.text, now) : storeFailure(file.error);
   if ("token" in fromFile) return fromFile;
   if (!deps.keychain) return fromFile;
 
   const read = await deps.keychain();
-  const fromKeychain = "text" in read ? parseClaudeToken(read.text, now) : read;
+  const fromKeychain: ClaudeToken =
+    "text" in read ? parseClaudeToken(read.text, now) : storeFailure(read.error);
   if ("token" in fromKeychain) return fromKeychain;
-  return { error: `${fromFile.error}; keychain: ${fromKeychain.error}` };
+  return {
+    error: `${fromFile.error}; keychain: ${fromKeychain.error}`,
+    reason: fromFile.reason === "expired" || fromKeychain.reason === "expired" ? "expired" : "unusable",
+  };
+}
+
+/**
+ * The loopback socket a refresh ping's model request is diverted to.
+ *
+ * A listener rather than an unroutable port, for two reasons measured in
+ * docs/adr/0007-refresh-pings.md: it ends the run promptly, and a request
+ * *arriving* is the only evidence that the diversion took effect — the command
+ * exits non-zero either way, so a run that died on this socket and one that
+ * failed to authenticate are indistinguishable by exit status. Without that
+ * evidence an override which silently did not apply would spend a real request
+ * while being reported as a failed refresh.
+ */
+export interface PingListener {
+  /** The base URL the ping's `--settings` carries. */
+  url: string;
+  /**
+   * Whether the diverted request turned up.
+   *
+   * Headers are never read: the request carries the freshly refreshed access
+   * token in an `Authorization` header, and a listener that recorded one would
+   * be the only place in this extension that holds a credential.
+   */
+  arrived(): boolean;
+  /**
+   * The socket's own failure after it began listening, if any.
+   *
+   * A live listener has no caller left to reject, so an `'error'` event cannot
+   * be passed up the way a failed bind is; dropping it would take the whole pi
+   * process down, and swallowing it would let a broken socket masquerade as a
+   * clean exit that never reached the listener. Recorded here so the refresher
+   * reports it as the failure it is.
+   */
+  error(): string | undefined;
+  close(): Promise<void>;
+}
+
+/** Opens a listener. A seam, so the refresher's failure paths are testable. */
+export type PingListenerFactory = () => Promise<PingListener>;
+
+/**
+ * What became of one refresh ping.
+ *
+ * Cases rather than a success flag, because the caller does three different
+ * things with the answer: the rail's note is built from how the attempt went,
+ * `failed` arms a cooldown, and the outcomes that could have spent money or ran
+ * without effect arm a halt for the rest of the expiry. The credential is
+ * re-read after any of them, including `failed`: the refresh is written *before*
+ * the request is dispatched, so a command that failed afterwards can still have
+ * left a fresh token behind.
+ */
+export type ClaudePing =
+  /**
+   * The command ran far enough to dispatch its model request — in the diverted
+   * form, the request arrived on our own listener. Whether a fresh token came
+   * back is the store's answer, not ours: re-read it.
+   */
+  | { outcome: "pinged" }
+  /**
+   * Another Claude Code process holds the refresh lock and is refreshing the
+   * token itself. Benign, and a deferral rather than a failure: the next read is
+   * what finds its work.
+   */
+  | { outcome: "deferred"; note: string }
+  /**
+   * The command exited cleanly with no request on the listener.
+   *
+   * A clean exit means the model call was *answered* — so it was answered
+   * somewhere else, and the diversion this whole design rests on may have
+   * silently failed at the cost of a real request. Deliberately not `failed`:
+   * `failed` is "nothing appears to have happened", this is "something happened
+   * and it was not what we asked for".
+   */
+  | { outcome: "undiverted"; note: string }
+  /** The ping could not be run, or ran and failed before dispatching. */
+  | { outcome: "failed"; note: string };
+
+/** One refresh ping: makes Claude Code refresh its own credential. */
+export type ClaudeRefresh = () => Promise<ClaudePing>;
+
+/**
+ * The argv of one refresh ping.
+ *
+ * `divertTo` is the loopback listener's base URL, carried in `--settings`
+ * because that is the one way to hand it over without widening `CommandRunner`
+ * past `(file, args)`. Without it the ping is a real request — the `ping` mode,
+ * which spends a real answer's worth of tokens.
+ *
+ * There is no `--model`. An id the running install does not recognise is
+ * rejected client-side, before authentication is reached, which is the one
+ * outcome that would defeat the whole exercise; and the diverted form encodes
+ * nothing, so no model need be named to ask for it.
+ */
+export function claudePingArgs(divertTo?: string): string[] {
+  if (divertTo === undefined) return ["-p", "hi"];
+  return ["-p", "hi", "--settings", JSON.stringify({ env: { ANTHROPIC_BASE_URL: divertTo } })];
+}
+
+/**
+ * Vendor text: Claude Code saying another of its processes is already holding
+ * the refresh lock. Matched loosely because the wording is not ours and may
+ * change; a miss is harmless — the attempt is reported as failed and arms one
+ * 15-minute cooldown, which costs a retry delay and never a wrong answer.
+ */
+const REFRESH_LOCK_RE = /refresh lock/i;
+
+/**
+ * What a diverted ping that exited cleanly without dispatching is reported as,
+ * in one line.
+ *
+ * Fixed rather than quoting whatever the command printed: a clean-exit run that
+ * never dispatched reached its failure in Claude Code's own output, which names
+ * the account, so the note must carry none of it.
+ */
+const PING_UNDIVERTED_NOTE = "claude exited before the request reached the loopback listener";
+
+/**
+ * The refresh ping for one mode, or `undefined` when the mode is `off` — so that
+ * no caller can run one that is not enabled, the shape `keychainReader` uses for
+ * a platform with no keychain.
+ *
+ * `run` and `listen` are seams: the first so every argument and failure path can
+ * be tested without a `claude` on the machine running the tests, the second so
+ * that "no request arrived" can be tested without a socket.
+ *
+ * The diverted mode is judged by arrival, not by exit status. The 400 the
+ * listener answers with makes the command exit non-zero on its own, so a run
+ * that landed the refresh and a run that failed to authenticate look identical
+ * from outside; only a request on our own socket proves the diversion took
+ * effect — and an override that silently did not would spend a real request.
+ * `ping` mode has no listener to prove anything with, so there a clean exit is
+ * the proof that a real answer came back.
+ */
+export function claudeRefresher(
+  mode: ClaudeRefreshMode,
+  run: CommandRunner = execFileRunner(CLAUDE_PING_TIMEOUT_MS, claudePingEnv(process.env)),
+  listen: PingListenerFactory = loopbackListener,
+): ClaudeRefresh | undefined {
+  if (mode === "off") return undefined;
+
+  if (mode === "ping") {
+    return async () => {
+      const result = await run("claude", claudePingArgs());
+      if ("text" in result) return { outcome: "pinged" };
+      if (REFRESH_LOCK_RE.test(result.error)) return { outcome: "deferred", note: oneLine(result.error) };
+      return { outcome: "failed", note: oneLine(result.error) };
+    };
+  }
+
+  return async () => {
+    let listener: PingListener;
+    try {
+      listener = await listen();
+    } catch (err) {
+      return { outcome: "failed", note: `could not open the loopback listener: ${oneLine(detail(err))}` };
+    }
+    let result: CredentialRead;
+    try {
+      result = await run("claude", claudePingArgs(listener.url));
+    } catch (err) {
+      result = { error: detail(err) };
+    } finally {
+      // In a `finally` so a throwing runner still frees the port; the session
+      // start awaits this path, and a socket left open is a session left waiting.
+      await listener.close();
+    }
+    if (listener.arrived()) return { outcome: "pinged" };
+    // A socket of our own that broke is a failure, and naming it keeps it from
+    // reading as the clean exit that never diverted — which would halt the
+    // feature for the session on the strength of our own bug.
+    const listenerError = listener.error();
+    if (listenerError !== undefined) {
+      return { outcome: "failed", note: `loopback listener failed: ${oneLine(listenerError)}` };
+    }
+    if ("error" in result && REFRESH_LOCK_RE.test(result.error)) {
+      return { outcome: "deferred", note: oneLine(result.error) };
+    }
+    // A clean exit with no arrival: the request was answered somewhere else.
+    if ("text" in result) return { outcome: "undiverted", note: PING_UNDIVERTED_NOTE };
+    return { outcome: "failed", note: oneLine(result.error) };
+  };
+}
+
+/**
+ * The variables a refresh ping must not inherit.
+ *
+ * The ping exists to refresh *the* credential this dispatcher read, but it
+ * inherits pi's environment, and the env can point Claude Code somewhere else in
+ * four ways: which credential it uses, which provider serves the request, where
+ * the request goes, and which model answers. A provider switch or a base URL
+ * that this extension does not know about moves the model request off our
+ * listener entirely, so the diverted ping becomes a billed request against
+ * another provider — the one thing the diversion exists to prevent. `HOME` and
+ * `PATH` are deliberately kept: the child still has to be an ordinary Claude
+ * Code run.
+ *
+ * A denylist rather than an allowlist because the child must still run normally:
+ * an allowlist would also have to be right about everything the child *needs* —
+ * `PATH`, `HOME`, the login keychain, proxies — and being wrong there turns a
+ * working refresh into a silent failure. An allowlist is worth doing once
+ * someone has checked one against a live credential. The residual is bounded: a
+ * selection variable this list does not know about shows up as an `undiverted`
+ * run, which halts for the session — one request at worst, never a loop.
+ */
+const CLAUDE_PING_ENV_EXCLUDE = [
+  // Which credential it uses.
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_AWS_API_KEY",
+  "ANTHROPIC_FOUNDRY_API_KEY",
+  "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+  "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+  "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+  "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR",
+  "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR",
+  // Which provider serves the request.
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+  "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+  "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+  "CLAUDE_CODE_USE_GATEWAY",
+  "CLAUDE_CODE_USE_MANTLE",
+  "CLAUDE_CODE_USE_CCR_V",
+  // Where the request goes.
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_BEDROCK_BASE_URL",
+  "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+  "ANTHROPIC_FOUNDRY_BASE_URL",
+  "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+  "ANTHROPIC_VERTEX_BASE_URL",
+  "ANTHROPIC_AWS_BASE_URL",
+  "CLAUDE_CODE_API_BASE_URL",
+  // Which credential store or OAuth endpoint.
+  "CLAUDE_CONFIG_DIR",
+  "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+  "CLAUDE_LOCAL_OAUTH_API_BASE",
+  // Which model answers: an unrecognised id is rejected before authentication,
+  // which would defeat the exercise.
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "ANTHROPIC_CUSTOM_MODEL_OPTION",
+] as const;
+
+/**
+ * The environment one refresh ping runs under.
+ *
+ * Everything else — `PATH`, `HOME`, proxies, locale — is inherited, because the
+ * child still has to be an ordinary Claude Code run. Pure, so the exact set of
+ * variables is pinned by a test rather than by prose.
+ */
+export function claudePingEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const clean = { ...env };
+  for (const key of CLAUDE_PING_ENV_EXCLUDE) delete clean[key];
+  return clean;
+}
+
+/** The single line a failed command is reported by, whatever length it printed. */
+function oneLine(detail: string): string {
+  return firstLine(detail) ?? "claude failed";
+}
+
+/** An error's takeaway for a note: its message when it has one, else its text. */
+function detail(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * A loopback listener on an ephemeral port, bound to 127.0.0.1 only.
+ *
+ * The port is the OS's to choose, so there is no collision to handle and no
+ * fixed port to be occupied. Every request is answered at once with a 400: enough
+ * for the client to give up rather than retry, and a body it never has to write.
+ * The body is drained, never inspected — the request carries the freshly
+ * refreshed access token in an `Authorization` header, and a listener that read
+ * one would be the only place in this extension holding a credential.
+ */
+export const loopbackListener: PingListenerFactory = async () => {
+  let arrived = false;
+  let listenerError: string | undefined;
+  const server = createServer((req, res) => {
+    arrived = true;
+    req.resume();
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "offline ping" } }));
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  // A listening socket has no caller left to reject, but an `'error'` event with
+  // no listener takes the whole pi process down with it. Record it instead: the
+  // refresher reports the socket's own failure rather than letting it masquerade
+  // as a clean exit that never reached the listener.
+  server.on("error", (err) => {
+    listenerError ??= detail(err);
+  });
+
+  const address = server.address();
+  // A TCP listener always yields an `AddressInfo`, so anything else here is a
+  // failure to report rather than a port to invent a URL around.
+  if (typeof address !== "object" || address === null) {
+    await closeServer(server);
+    throw new Error("loopback listener bound no TCP port");
+  }
+
+  let closed = false;
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    arrived: () => arrived,
+    error: () => listenerError,
+    close: async () => {
+      if (closed) return;
+      closed = true;
+      await closeServer(server);
+    },
+  };
+};
+
+/**
+ * Ends every open connection before closing, so the close resolves promptly.
+ *
+ * `server.close` otherwise waits for the ping client's keep-alive socket to
+ * end, and the session start awaits this refresh, so a close that waited out a
+ * keep-alive would stall the very path the ping exists to unblock.
+ *
+ * The callback's error is deliberately dropped: it only ever means the server
+ * was not listening, and the port is free either way, so there is nothing to
+ * report and nothing to do about it.
+ */
+function closeServer(server: Server): Promise<void> {
+  server.closeAllConnections();
+  return new Promise((resolve) => server.close(() => resolve()));
+}
+
+/**
+ * What an expired token will be met with: a ping, or the reason none can run.
+ *
+ * The mode and the default-path rule are both decided here so that the read
+ * which skips a ping and the setup which would run one cannot disagree about
+ * why.
+ */
+export type RefreshPlan = { ping: ClaudeRefresh; spends: boolean } | { skip: string };
+
+/**
+ * The single place the mode and the default-path rule are resolved.
+ *
+ * `injected` wins over both, as it does for the keychain reader: a test's
+ * injected ping is a statement about which process may be spawned, and the
+ * default-path rule is about whose *platform* keychain the default credential
+ * file belongs to.
+ *
+ * `spends` marks the one mode whose every attempt is a real request, so a
+ * failure there can only be answered by paying again — which is what makes it a
+ * halt rather than a cooldown.
+ */
+export function refreshPlan(cfg: DispatcherConfig, injected?: ClaudeRefresh): RefreshPlan {
+  if (injected) return { ping: injected, spends: cfg.claudeRefresh === "ping" };
+  if (!isDefaultClaudeCredsPath(cfg.claudeCredsPath)) {
+    return { skip: "claudeCredsPath names another profile" };
+  }
+  const ping = claudeRefresher(cfg.claudeRefresh);
+  if (!ping) return { skip: 'claudeRefresh is "off"' };
+  return { ping, spends: cfg.claudeRefresh === "ping" };
+}
+
+/** Why no ping was run, in the shape an expired rail's note carries it. */
+function skippedNote(reason: string): string {
+  return `no refresh ping was run (${reason})`;
+}
+
+/**
+ * The rail's note for an expired credential: the credential layer's own message
+ * — the fact, naming both stores when both were tried — then what was decided
+ * about it. The decision is appended rather than substituted so that a keychain
+ * which could not be read is not lost behind a ping's verdict.
+ */
+function expiredNote(fact: string, decision: string): string {
+  return `${fact}; ${decision}`;
+}
+
+/** The suffix a halted note carries, so the rail says no further attempt is coming. */
+const HALT_SUFFIX = "no further attempt will be made";
+
+/**
+ * The suffix the sticky halt carries. It is the one difference from the
+ * per-episode halt: the per-episode one ends with the expiry, the sticky one
+ * with the pi process, and the rail has to say so or the user will read the
+ * still-off feature as a bug.
+ */
+const STICKY_HALT_SUFFIX = "no further attempt will be made this session";
+
+function haltNote(note: string): string {
+  return `${note}; ${HALT_SUFFIX}`;
+}
+
+function stickyHaltNote(note: string): string {
+  return `${note}; ${STICKY_HALT_SUFFIX}`;
+}
+
+/**
+ * The line one attempt adds to the rail's note. `pinged`'s line is only known
+ * after the re-read, so it is stated here as what a still-unusable store makes
+ * of it rather than as the verdict itself; the re-read's own failure — expired
+ * or a locked keychain — is the fact the note is built around.
+ */
+function describePing(result: ClaudePing): string {
+  if (result.outcome === "pinged") return "refresh ping ran but the credential is still not usable";
+  return `refresh ping ${result.outcome}: ${result.note}`;
 }
 
 export interface DispatcherDeps {
@@ -1363,6 +1885,17 @@ export interface DispatcherDeps {
    * and an injected reader is a statement about that already.
    */
   readKeychain?: KeychainRead;
+  /**
+   * The refresh ping for an expired Claude credential, or `undefined` when
+   * nothing may be run — which is what `claudeRefresh: "off"` compiles to.
+   * Left unset, production takes it from `claudeRefresh`, and only for the
+   * default credential path: the ping refreshes this machine's default Claude
+   * Code profile and can say nothing about another one. Tests inject a ping so
+   * that no `claude` is ever spawned, and an injected ping is used whatever
+   * `claudeRefresh` and `claudeCredsPath` say, for the same reason an injected
+   * keychain reader is.
+   */
+  refreshClaude?: ClaudeRefresh;
   /**
    * Timings for the two bounded quota reads, overriding `DEFAULT_QUOTA_READ`
    * field by field. Tests inject small ones so the timeout and retry paths can
@@ -1400,6 +1933,26 @@ export function createDispatcher(
   const keychain =
     deps.readKeychain ??
     (isDefaultClaudeCredsPath(cfg.claudeCredsPath) ? keychainReader() : undefined);
+  // The mode and the default-path rule are resolved once, here, so the read that
+  // skips a ping and the plan that would run one cannot disagree about why.
+  const plan = refreshPlan(cfg, deps.refreshClaude);
+
+  // One ping in flight at a time, however many callers race `railState`.
+  let inFlight: Promise<ClaudePing> | undefined;
+  // The gates over the next attempt. `cooldown` is a time gate armed by a
+  // `failed` attempt only. `halted` is armed by anything that could have spent
+  // money or ran without effect, and is cleared only by a read that yields a
+  // usable token — the end of the expiry episode. `stickyHalt` is the one
+  // exception: an `undiverted` run is a statement about the environment, not
+  // about that expiry, so the next expiry would pay again; it survives a usable
+  // token and only a new pi process clears it.
+  //
+  // A gate hit never re-arms any of them: `pollMs` ships at five minutes and the
+  // cooldown at fifteen, so a hit that re-armed would push the retry out forever
+  // and the ping would never be tried again after a transient failure.
+  let cooldown: { at: number; note: string } | undefined;
+  let halted: string | undefined;
+  let stickyHalt: string | undefined;
 
   /**
    * A vendor's usage document, read under a timeout and retried while the
@@ -1452,13 +2005,11 @@ export function createDispatcher(
     }
   }
 
-  async function fetchClaude(): Promise<RailState> {
-    const cred = await readClaudeToken(cfg.claudeCredsPath, { keychain, now: now() });
-    if ("error" in cred) return unavailable("claude", cred.error);
-
+  /** The Claude rail's ordinary read, once a token has been supplied. */
+  async function claudeUsage(token: string): Promise<RailState> {
     const read = await readUsage("https://api.anthropic.com/api/oauth/usage", {
       headers: {
-        Authorization: `Bearer ${cred.token}`,
+        Authorization: `Bearer ${token}`,
         "anthropic-beta": "oauth-2025-04-20",
         Accept: "application/json",
       },
@@ -1468,6 +2019,100 @@ export function createDispatcher(
     const windows = parseClaudeUsage(read.json);
     if (!windows.length) return unavailable("claude", "no usage windows returned");
     return { rail: "claude", ok: true, windows };
+  }
+
+  /**
+   * The line one verdict earns, and the gate it arms. `undefined` for a verdict
+   * whose meaning is only known after the re-read — `pinged`.
+   *
+   * A `failed` attempt in the mode that spends budget, or an `undiverted` one,
+   * can only be repeated by paying again or by running again without effect, so
+   * both halt — but the two halts differ in lifespan. `undiverted` is sticky: a
+   * usable token does not clear it, because the next expiry would fail to divert
+   * the same way and pay again. The spending mode's halt is per-episode, like
+   * the `pinged`-without-a-token halt set below. A `deferred` attempt is
+   * reported but arms nothing: another process is doing the work, so the next
+   * read may try again.
+   */
+  function recordVerdict(verdict: ClaudePing, spends: boolean): string | undefined {
+    if (verdict.outcome === "pinged") return undefined;
+    const note = describePing(verdict);
+    if (verdict.outcome === "deferred") return note;
+    if (verdict.outcome === "undiverted") {
+      stickyHalt = stickyHaltNote(note);
+      return stickyHalt;
+    }
+    if (spends) {
+      halted = haltNote(note);
+      return halted;
+    }
+    cooldown = { at: now(), note };
+    return note;
+  }
+
+  /**
+   * The Claude rail's token, or the note the rail is unreadable for.
+   *
+   * One operation because its parts are not separable: the gate must be
+   * consulted before an attempt, the attempt's verdict arms the next gate, and
+   * the re-read is what decides whether the attempt worked — the refresh is
+   * written *before* the request is dispatched, so even a run that failed
+   * afterwards can have left a fresh token behind.
+   *
+   * A caller that arrives while an attempt is in flight awaits that same
+   * attempt, so concurrent evaluations spawn one `claude`. Only an expiry earns
+   * one: a 401 is an answer about a token just read, and a 429 is the usage
+   * endpoint asking us to slow down (ADR 0006).
+   *
+   * A usable token carries the sticky anomaly back out with it rather than
+   * swallowing it: `undiverted` is the case that most likely paid for a real
+   * request, and reporting it — in the successful rail's own line — is the whole
+   * reason the halt exists.
+   */
+  async function claudeToken(): Promise<{ token: string; note?: string } | { note: string }> {
+    const first = await readClaudeToken(cfg.claudeCredsPath, { keychain, now: now() });
+    if ("token" in first) {
+      // A usable token is the end of the expiry episode, so the per-episode halt
+      // it armed is cleared here and nowhere else. The sticky one is not: it is
+      // a property of the environment, not of this expiry.
+      halted = undefined;
+      return stickyHalt === undefined ? { token: first.token } : { token: first.token, note: stickyHalt };
+    }
+    if (first.reason !== "expired") return { note: first.error };
+    if ("skip" in plan) return { note: expiredNote(first.error, skippedNote(plan.skip)) };
+
+    // A gate hit returns the note its attempt earned, without re-arming. The
+    // sticky halt outranks the per-episode one: once the environment has failed
+    // to divert, no attempt is worth making whatever else is armed.
+    const gate = stickyHalt ?? halted;
+    if (gate !== undefined) return { note: expiredNote(first.error, gate) };
+    if (cooldown && now() - cooldown.at < CLAUDE_PING_COOLDOWN_MS) {
+      return { note: expiredNote(first.error, cooldown.note) };
+    }
+
+    const verdict = await (inFlight ??= plan.ping().finally(() => { inFlight = undefined; }));
+    const decision = recordVerdict(verdict, plan.spends);
+
+    const reread = await readClaudeToken(cfg.claudeCredsPath, { keychain, now: now() });
+    if ("token" in reread) {
+      halted = undefined;
+      return stickyHalt === undefined ? { token: reread.token } : { token: reread.token, note: stickyHalt };
+    }
+    // `pinged` but still nothing usable: the run dispatched a request and the
+    // store gained nothing, so another one would not either.
+    if (decision === undefined) {
+      halted = haltNote(describePing(verdict));
+      return { note: expiredNote(reread.error, halted) };
+    }
+    return { note: expiredNote(reread.error, decision) };
+  }
+
+  async function fetchClaude(): Promise<RailState> {
+    const outcome = await claudeToken();
+    if (!("token" in outcome)) return unavailable("claude", outcome.note);
+    const state = await claudeUsage(outcome.token);
+    if (outcome.note === undefined) return state;
+    return { ...state, note: state.note === undefined ? outcome.note : `${state.note}; ${outcome.note}` };
   }
 
   async function fetchCodex(): Promise<RailState> {
@@ -1577,7 +2222,13 @@ export function createDispatcher(
       const s = rails.get(rail)!;
       if (!s.ok) lines.push(`${rail}: unavailable — ${s.note}`);
       else if (!s.windows.length) lines.push(`${rail}: ok — ${s.note ?? "no windows"}`);
-      else lines.push(`${rail}: ${s.windows.map((w) => `${w.label} ${w.used.toFixed(0)}%`).join(", ")}`);
+      else {
+        const windows = s.windows.map((w) => `${w.label} ${w.used.toFixed(0)}%`).join(", ");
+        // A note on an otherwise healthy rail — the sticky refresh anomaly, or
+        // Codex's `limit_reached=true` — is a note the reader needs; dropping it
+        // here is what would make "an anomaly to report" report nothing.
+        lines.push(`${rail}: ${windows}${s.note === undefined ? "" : ` — ${s.note}`}`);
+      }
     }
     lines.push("");
     for (const { decision, outcome } of await decideAll(rails, true)) {
@@ -1740,7 +2391,9 @@ export default function (pi: ExtensionAPI) {
 
   // Awaited on purpose, so the first spawn of the session already sees current
   // frontmatter. Each quota request is bounded and retried, so the worst a
-  // stalled endpoint can cost is `DEFAULT_QUOTA_READ`'s two attempts — see the
+  // stalled endpoint can cost is `DEFAULT_QUOTA_READ`'s two attempts; an expired
+  // Claude credential that triggers a refresh ping adds that run's own bound and
+  // the credential re-read which follows it, once per expiry episode — see the
   // README caveats.
   //
   // An unconfigured install evaluates nothing: with no agents there is nothing
