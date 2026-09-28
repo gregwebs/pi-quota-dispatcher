@@ -934,10 +934,13 @@ test("loadConfig warns about a configured agent whose file is absent and keeps i
     warn: () => {},
     fileExists: (path) => path !== missing,
   });
-  assert.ok(
-    loaded.warnings.some((w) => w.includes(missing) && w.includes("planner")),
-    loaded.warnings.join("\n"),
-  );
+  // One line carrying the path to create, the agent it is for, and the command
+  // that creates one: a reader who has just been told a file is missing needs
+  // the remedy, not a diagnostic.
+  const warning = loaded.warnings.find((w) => w.includes(missing));
+  assert.ok(warning, loaded.warnings.join("\n"));
+  assert.ok(warning.includes("planner"), warning);
+  assert.ok(warning.includes("run the /agents command to create a new agent"), warning);
   assert.ok(loaded.config.agents.planner, "the agent stays configured");
   assert.equal(loaded.sources["agents.planner.primary.model"], "project");
 });

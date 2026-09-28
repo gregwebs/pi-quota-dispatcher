@@ -580,11 +580,14 @@ export async function loadConfig(deps: LoadConfigDeps = {}): Promise<LoadedConfi
   // that quietly does nothing for that agent: `decide` reports "skipped (no
   // file)" at every evaluation and the reason is never surfaced. The warning is
   // prefixed with the path it is about, like every other one, because that path
-  // is what the reader has to go and create.
+  // is what has to exist. The path alone assumes hand-writing the file, so the
+  // remedy the user actually has in the terminal — `/agents` — is named too.
   for (const agent of Object.keys(merged.config.agents).sort()) {
     const file = join(merged.config.agentDir, `${agent}.md`);
     if (!exists(file)) {
-      warnings.push(`${file}: configured agent "${agent}" has no file`);
+      warnings.push(
+        `${file}: configured agent "${agent}" has no file — run the /agents command to create a new agent`,
+      );
     }
   }
 
