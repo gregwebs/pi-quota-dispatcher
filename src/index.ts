@@ -51,6 +51,7 @@ import {
   type AgentRoute,
   type Candidate,
   type ClaudeRefreshMode,
+  type ConfigFile,
   type DispatcherConfig,
   type LoadedConfig,
   type ModelDefault,
@@ -65,6 +66,7 @@ import {
   loadConfig,
   railFromModel,
   thinkingFor,
+  unusableConfigFileLines,
 } from "./config.ts";
 
 // Config is a separate module because it is read from disk at run time; it is
@@ -95,6 +97,9 @@ export type {
   Candidate,
   ClaudeRefreshMode,
   ConfigFile,
+  ConfigFileFault,
+  ConfigFileState,
+  ConfigPosition,
   ConfigSource,
   DispatcherConfig,
   LoadConfigDeps,
@@ -1022,6 +1027,36 @@ export function unconfiguredNotice(
 
   lines.push("", "Then /reload. Run /quota-dispatch at any time to see what it would do.");
   return lines;
+}
+
+/**
+ * The one line for a config file the dispatcher could not use: the notify's
+ * headline, so the interruption names the state this install is in.
+ *
+ * "A config file" rather than "your config" because the notice may be about
+ * either layer, and the fault lines under it name which.
+ */
+const UNUSABLE_CONFIG_SUMMARY = "quota-dispatcher: a config file could not be used.";
+
+/**
+ * What an install with a config file that is there and unusable has to say for
+ * itself: every fault, then the fix.
+ *
+ * `unconfiguredNotice` is the wrong answer for this install: its file names
+ * agents, so "no agents are configured — name them in <path>" tells the reader
+ * to do what they already did, and buries the one fact that explains the empty
+ * table. Taking the files rather than a rendered sentence is what keeps the
+ * headline honest — nothing but a `ConfigFile` can be handed to a notice that
+ * says a config file could not be used. The fault lines are
+ * `unusableConfigFileLines`', verbatim, so the reader meets the sentence they
+ * will find in the log and the report rather than a third telling of it.
+ */
+export function unusableConfigNotice(files: ConfigFile[]): string[] {
+  return [
+    UNUSABLE_CONFIG_SUMMARY,
+    ...unusableConfigFileLines(files),
+    "Fix the file, then /reload. Run /quota-dispatch at any time to see what it would do.",
+  ];
 }
 
 /**
@@ -2382,16 +2417,38 @@ function setFooterStatus(ctx: ExtensionContext, text: string | undefined): void 
 }
 
 /**
- * The ask, and the status that holds the state between asks. Split out so the
- * handler reads as the decision it is making — configured or not — rather than
- * as UI plumbing.
+ * Report a config file that is there and was not used, on the reasons that ask
+ * for setup, and say whether there was one to report.
+ *
+ * The answer is what the unconfigured branch needs: an install whose file names
+ * routes that were thrown away is not asking to be configured from scratch.
+ */
+function announceUnusableConfig(
+  loaded: LoadedConfig,
+  ctx: ExtensionContext,
+  reason: SessionStartEvent["reason"],
+): boolean {
+  if (!ctx.hasUI || !ASK_REASONS.has(reason)) return false;
+  if (!loaded.files.some((file) => file.state.kind === "unusable")) return false;
+
+  ctx.ui.notify(unusableConfigNotice(loaded.files).join("\n"), "warning");
+  return true;
+}
+
+/**
+ * The ask. It cannot coexist with the unusable-file notice above: an install is
+ * unconfigured *or* it has a file that names routes, and one of those two things
+ * is the answer to "why is nothing managed?".
  */
 async function announceUnconfigured(
   loaded: LoadedConfig,
   ctx: ExtensionContext,
   reason: SessionStartEvent["reason"],
 ): Promise<void> {
+  // An empty table is an empty table whether or not a file fed it, and
+  // "unconfigured" is the standing fact between asks either way.
   setFooterStatus(ctx, STATUS_TEXT);
+  if (announceUnusableConfig(loaded, ctx, reason)) return;
   if (!ctx.hasUI || !ASK_REASONS.has(reason)) return;
 
   const { agentDir } = loaded.config;
@@ -2611,6 +2668,13 @@ export default function (pi: ExtensionAPI) {
     // that follow it are still in flight. It also replaces the footer line an
     // unconfigured install left: the table is read once per extension load, so
     // the state has to change here or nowhere.
+    //
+    // A config file that could not be used is reported here too, not only when
+    // it leaves the table empty: the layer it lost is not the whole config, so
+    // the other symptom is a route that is quietly not the one the reader wrote
+    // — the same invisible-from-the-outside state ADR 0009 raised for a model
+    // this pi cannot spawn.
+    announceUnusableConfig(loaded, ctx, event.reason);
     announceUnknownModels(misses, loaded, ctx, event.reason);
     await dispatcher.evaluate().catch(() => {});
   });

@@ -118,6 +118,43 @@ files it deliberately does not manage.
 Config is read once per extension load, so `/reload` is what picks up a new
 route — and what stops the ask.
 
+### When the file is there but unusable
+
+An install whose config file cannot be used is a different state, and saying
+"name your agents" to it is telling its owner to do what they already did. So it
+gets its own notice — on the same three reasons an unconfigured install is asked
+on — leading with the fault and ending with the fix:
+
+```
+quota-dispatcher: a config file could not be used.
+~/.pi/agent/quota-dispatch.json: not valid JSON (line 3, column 1: Expected double-quoted property name) — the file is skipped whole, so the layers below it still apply
+Fix the file, then /reload. Run /quota-dispatch at any time to see what it would do.
+```
+
+The line under the headline is the same sentence the log and `/quota-dispatch`
+print. A file that is not a JSON object, and one that cannot be read at all, are
+the same state and get the same treatment.
+
+The notice fires whether or not the layers below the skipped one still manage
+agents: a route that quietly is not the one you wrote looks the same from the
+outside as a route you pinned, which is why a model this pi cannot spawn is
+surfaced the same way (see [below](#a-model-this-pi-does-not-know)). It is not a
+footer state — the footer line holds the two states that persist silently across
+`resume` and `fork` — so the standing record is the warning tail of
+`/quota-dispatch`, where the skipped file is named whether or not a notification
+was ever seen.
+
+Where the parser reported a place, the line names the line and column of it. The
+parser reports one for a structural failure — a trailing comma before a `}`, a
+missing comma — and reports only the character it could not read when the file
+is malformed in a way it struggles to place (a trailing comma before a `]`, a
+byte-order mark). Both are spelled out rather than guessed at, so a character
+the reader cannot see arrives as an escape (`Unexpected token '\uFEFF'`), and
+when the parser names no place at all — `Unexpected end of JSON input`, which is
+what an empty file gives — none is invented.
+[0011](docs/adr/0011-an-unusable-config-file-is-reported-as-such.md) has the
+reasoning and the options not taken.
+
 ## A model this pi does not know
 
 The other state that needs a person is a config that names a model the running pi
@@ -414,9 +451,14 @@ is never read — a file that still says `routes` warns
 Bad configuration never stops the dispatcher from starting:
 
 - **Missing file** — not an error. It is simply not a layer.
-- **Unparseable file** — logged to `console.error` and skipped whole, and the
-  layers below it still apply. A half-applied config is harder to reason about
-  than the defaults.
+- **Unparseable file, a file that is not a JSON object, a file that cannot be
+  read** — logged to `console.error` and skipped whole, and the layers below it
+  still apply: a half-applied config is harder to reason about than the
+  defaults. The warning names the file, says the layer was skipped whole, and
+  locates the failure as far as the parser could — see
+  [above](#when-the-file-is-there-but-unusable). A skipped layer is otherwise
+  invisible, because what is left running is the layer beneath it and that looks
+  like a config that works.
 - **Unknown key, malformed `model` (no `/`), an unknown `rail` (on a candidate
   or in `models`), a candidate whose model has no registered rail, a `thinking`
   that is not one of the seven levels, a `models` key that is not a

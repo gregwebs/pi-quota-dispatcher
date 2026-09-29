@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 import {
+  type ConfigFileFault,
   type Candidate,
   type DispatcherConfig,
   type LoadedConfig,
@@ -24,8 +25,10 @@ import {
   globalConfigPath,
   loadConfig,
   mergeConfig,
+  notJsonFault,
   projectConfigPath,
   thinkingFor,
+  unusableConfigFileLines,
 } from "../src/config.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
@@ -972,17 +975,312 @@ test("loadConfig skips missing files silently and uses the built-in defaults", a
   const fs = fakeFs({});
   const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile });
   assert.deepEqual(loaded.warnings, []);
-  assert.ok(loaded.files.every((f) => f.present === false));
+  assert.ok(loaded.files.every((f) => f.state.kind === "absent"));
   assert.deepEqual(loaded.config, defaultConfig(AGENT_DIR));
   assert.equal(loaded.sources.sessionSwitchAt, "built-in");
 });
 
-test("loadConfig warns on unparseable JSON, still reports it present, and uses defaults", async () => {
+test("loadConfig warns on unparseable JSON, reports it unusable, and uses defaults", async () => {
   const fs = fakeFs({ [GLOBAL_PATH]: "{ this is not json" });
   const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
-  assert.equal(loaded.files.find((f) => f.source === "global")?.present, true);
+  assert.equal(loaded.files.find((f) => f.source === "global")?.state.kind, "unusable");
   assert.ok(loaded.warnings.some((w) => w.includes(GLOBAL_PATH)), loaded.warnings.join("\n"));
   assert.deepEqual(loaded.config, defaultConfig(AGENT_DIR));
+});
+
+// What the reader is told about a file that did not parse. The engine's message
+// alone names a byte offset in a file nobody has opened; the warning has to name
+// the file, put the failure on a line that can be gone to, and say that nothing
+// from the file is in force — a skipped layer leaves the ones below it running,
+// which looks exactly like a config that worked.
+//
+// The trailing comma is the everyday case, and it is also the one where the
+// engine's own wording is the diagnosis: "Expected double-quoted property
+// name" is what a comma before a `}` looks like.
+test("a file that is not JSON is reported at its line and column, and says it was skipped", async () => {
+  const fs = fakeFs({ [GLOBAL_PATH]: '{\n  "sessionSwitchAt": 55,\n}' });
+  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
+  const warning = loaded.warnings.find((w) => w.includes(GLOBAL_PATH));
+
+  assert.ok(warning, loaded.warnings.join("\n"));
+  assert.ok(warning.startsWith(`${GLOBAL_PATH}: not valid JSON (`), warning);
+  assert.ok(warning.includes("line 3, column 1"), warning);
+  // The engine says "in JSON at position 12" here. The offset is left out
+  // rather than printed beside the line: it is the same fact, and it is the
+  // spelling that makes the reader count their way through the file.
+  assert.ok(!warning.includes("position"), warning);
+  assert.ok(warning.endsWith("— the file is skipped whole, so the layers below it still apply"), warning);
+});
+
+// The engine has a second shape: newer V8 quotes the offending text back at the
+// reader — `Unexpected token 'x', "x" is not valid JSON` — which repeats the
+// verdict and, for a file whose text spans lines, would carry newlines into a
+// message every surface renders as one line.
+test("a rejected token is reported without the engine quoting the file back", async () => {
+  const fs = fakeFs({ [PROJECT_PATH]: '{\n  // comment\n  "sessionSwitchAt": 55\n}' });
+  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
+  const warning = loaded.warnings.find((w) => w.includes(PROJECT_PATH));
+
+  assert.ok(warning, loaded.warnings.join("\n"));
+  assert.equal(warning.split("\n").length, 1, warning);
+  assert.ok(warning.startsWith(`${PROJECT_PATH}: not valid JSON (`), warning);
+  assert.ok(!warning.includes("is not valid JSON)"), warning);
+  assert.ok(warning.includes("line 2, column 3"), warning);
+});
+
+// An empty file — the shape a `touch`ed config has — is the realistic way to
+// reach an engine error that names no place at all: `Unexpected end of JSON
+// input` is its whole message. Inventing line 1 column 1 would be pointing
+// somewhere the reader is not.
+test("a file the parser ran out of is reported without a made-up location", async () => {
+  const fs = fakeFs({ [PROJECT_PATH]: "" });
+  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
+
+  assert.deepEqual(loaded.warnings, [
+    `${PROJECT_PATH}: not valid JSON (Unexpected end of JSON input) — the file is skipped whole, so the layers below it still apply`,
+  ]);
+});
+
+// The promise the warning makes, checked against what the loader did: a skipped
+// project layer leaves the global one in force, so the numbers on screen are the
+// lower layer's even though the file names other ones.
+test("a skipped layer leaves the layers below it in force, as the warning says", async () => {
+  const fs = fakeFs({
+    [GLOBAL_PATH]: JSON.stringify({ sessionSwitchAt: 55 }),
+    [PROJECT_PATH]: "{ broken",
+  });
+  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
+
+  assert.equal(loaded.config.sessionSwitchAt, 55);
+  assert.equal(loaded.sources.sessionSwitchAt, "global");
+  assert.equal(loaded.files.find((f) => f.source === "project")?.state.kind, "unusable");
+  assert.equal(loaded.files.find((f) => f.source === "global")?.state.kind, "applied");
+  assert.ok(
+    loaded.warnings.every((w) => w.includes("the layers below it still apply")),
+    loaded.warnings.join("\n"),
+  );
+});
+
+// One rendering of one fact: the startup notice prints these same lines, and it
+// is handed the files rather than the warnings precisely so that it does not
+// have to take the warning text back apart to find them.
+test("the warning for an unusable file is exactly the line the notice prints", async () => {
+  const fs = fakeFs({ [GLOBAL_PATH]: "{ broken", [PROJECT_PATH]: "[1,2]" });
+  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
+  const lines = unusableConfigFileLines(loaded.files);
+
+  assert.equal(lines.length, 2);
+  assert.deepEqual(lines, loaded.warnings);
+  assert.ok(lines[0].startsWith(`${GLOBAL_PATH}: not valid JSON`), lines[0]);
+  // Valid JSON, and still not a config: said in the same shape, with the same
+  // consequence, because the layer was dropped either way.
+  assert.equal(
+    lines[1],
+    `${PROJECT_PATH}: config must be a JSON object — the file is skipped whole, so the layers below it still apply`,
+  );
+});
+
+test("an unreadable file is reported as unreadable rather than as absent or unparseable", async () => {
+  const readFile = async (path: string): Promise<string> => {
+    const err = new Error(`EACCES: permission denied, open '${path}'`);
+    (err as NodeJS.ErrnoException).code = "EACCES";
+    throw err;
+  };
+  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile, warn: () => {} });
+
+  for (const file of loaded.files) assert.equal(file.state.kind, "unusable");
+  assert.ok(loaded.warnings.some((w) => w.startsWith(`${GLOBAL_PATH}: could not be read (`)), loaded.warnings.join("\n"));
+});
+
+// The engine's message is not ours to control: its shape has changed across V8
+// versions, and it reports the place in the file in one of two spellings — or,
+// when it quotes the offending character, in none at all. Synthetic messages pin
+// the whole table, so what a run of Node happens to say does not decide what is
+// asserted.
+test("a parse failure is understood whatever spelling of it the engine uses", () => {
+  const text = '{\n  "a": 1,\n}';
+  const fault = (message: string): ConfigFileFault => notJsonFault(text, new SyntaxError(message));
+
+  // The current spelling: a line and a column, with the offset beside it.
+  assert.deepEqual(fault("Expected double-quoted property name in JSON at position 12 (line 3 column 1)"), {
+    kind: "not-json",
+    detail: "Expected double-quoted property name",
+    at: { line: 3, column: 1 },
+  });
+  // The older spelling: the offset is all there is, so it is converted against
+  // the file's own text.
+  assert.deepEqual(fault("Expected double-quoted property name in JSON at position 12"), {
+    kind: "not-json",
+    detail: "Expected double-quoted property name",
+    at: { line: 3, column: 1 },
+  });
+  // A failure on the first line, where there is no newline to count from.
+  assert.deepEqual(fault("Unexpected token 'x' in JSON at position 0"), {
+    kind: "not-json",
+    detail: "Unexpected token 'x'",
+    at: { line: 1, column: 1 },
+  });
+  // The spelling that quotes the file back instead of naming a place: the quote
+  // goes, and no place is invented to replace it. V8 truncates that quote on
+  // either side or both, which is why it is cut rather than matched whole.
+  for (const quote of ['"[1,]"', '..." "a/b" }, ] } } }"', '"...",13,14,15,], "b": 2 "...']) {
+    assert.deepEqual(fault(`Unexpected token ']', ${quote} is not valid JSON`), {
+      kind: "not-json",
+      detail: "Unexpected token ']'",
+    });
+  }
+  // The tail that does not say ` in JSON`, and the file's own words for a place.
+  assert.deepEqual(fault("Unexpected non-whitespace character after JSON at position 7 (line 1 column 8)"), {
+    kind: "not-json",
+    detail: "Unexpected non-whitespace character after JSON",
+    at: { line: 1, column: 8 },
+  });
+  assert.deepEqual(fault('Unexpected token \']\', "[\"at position 5\",]" is not valid JSON'), {
+    kind: "not-json",
+    detail: "Unexpected token ']'",
+  });
+  // A file that ends before its JSON does names no place either, and none is
+  // invented.
+  assert.deepEqual(fault("Unexpected end of JSON input"), {
+    kind: "not-json",
+    detail: "Unexpected end of JSON input",
+  });
+  // A message that is nothing but the quote says nothing about the fault, and
+  // the rendering still gives the verdict.
+  assert.deepEqual(fault('"NaN" is not valid JSON'), { kind: "not-json", detail: "" });
+});
+
+/**
+ * The rendered warning for one fault, through the same renderer the log, the
+ * report and the startup notice use.
+ */
+function faultLine(fault: ConfigFileFault): string {
+  return unusableConfigFileLines([
+    { source: "global", path: GLOBAL_PATH, state: { kind: "unusable", fault } },
+  ])[0];
+}
+
+/** The real error `JSON.parse` throws for `text`, so the engine's own wording is
+ * under test rather than our guess at it. */
+function parseError(text: string): unknown {
+  try {
+    JSON.parse(text);
+  } catch (err) {
+    return err;
+  }
+  throw new Error(`expected ${JSON.stringify(text)} not to parse`);
+}
+
+// A fault has to be one line, and it must not carry the file's own text: the
+// parser quotes that text back, and a config is the user's. Every case asserts
+// the exact line, because a line that merely *lacks* the file's text can also be
+// one that invented a position instead.
+test("a fault is one line, and never quotes the file back", () => {
+  const expected = (detail: string): string =>
+    `${GLOBAL_PATH}: not valid JSON (${detail}) — the file is skipped whole, so the layers below it still apply`;
+  const cases: Array<[string, string, string]> = [
+    // The engine's window around a `/` carries the file's own newline and the
+    // beginning of a path, which is what the reader must not get back.
+    [
+      '{ "claudeCredsPath": "/home/me/.credentials.json",\n  "x": /home/me/.credentials.json\n}',
+      "home/me",
+      "Unexpected token '/'",
+    ],
+    // The engine's own words for a place, as a value in the file. Read out of the
+    // quote, they would be a position the file never failed at.
+    ['["at position 5",]', "at position 5", "Unexpected token ']'"],
+  ];
+
+  for (const [text, fileText, detail] of cases) {
+    const err = parseError(text) as Error;
+    // The premise, asserted rather than assumed: the parser really does repeat
+    // the file back here, so the line below is not passing for want of anything
+    // to strip.
+    assert.ok(err.message.includes(fileText), `the engine must quote ${fileText}: ${err.message}`);
+
+    const line = faultLine(notJsonFault(text, err));
+    assert.equal(line.split("\n").length, 1, line);
+    assert.equal(line, expected(detail), text);
+  }
+});
+
+// The verdict is said once: the engine's `"…" is not valid JSON` tail repeats
+// what the line has already said.
+test("the engine's verdict is not repeated back", () => {
+  const text = '{ "a": [1,] }';
+  const line = faultLine(notJsonFault(text, parseError(text)));
+
+  assert.ok(line.includes("not valid JSON"), line);
+  assert.ok(!line.includes("is not valid JSON"), line);
+});
+
+// A stray `}` at the end of an otherwise finished document is a common edit
+// mistake, and it is the one engine message that does not say ` in JSON` before
+// its offset: the offset and the line-and-column are the same fact, and only one
+// of them belongs on the line.
+test("an offset is not printed beside the position it duplicates", () => {
+  const text = '{"a":1}}';
+  assert.equal(
+    faultLine(notJsonFault(text, parseError(text))),
+    `${GLOBAL_PATH}: not valid JSON (line 1, column 8: Unexpected non-whitespace character after JSON) — ` +
+      "the file is skipped whole, so the layers below it still apply",
+  );
+});
+
+// A token the reader cannot see is a token they cannot act on. The parser quotes
+// the character that stopped it, and that character is whatever the file holds.
+test("an invisible offending character is spelled out", () => {
+  for (const [text, spelled] of [
+    ["\uFEFF{}", "\\uFEFF"],
+    ["\u00A0{}", "\\u00A0"],
+    ["\u000B{}", "\\u000B"],
+    ["\u2028{}", "\\u2028"],
+  ] as const) {
+    const line = faultLine(notJsonFault(text, parseError(text)));
+    assert.ok(line.includes(spelled), `${JSON.stringify(text)} -> ${line}`);
+    assert.equal(line.split("\n").length, 1, line);
+  }
+});
+
+test("a thrown value that is not an Error still yields a fault", () => {
+  assert.deepEqual(notJsonFault("{}", "a string was thrown"), {
+    kind: "not-json",
+    detail: "a string was thrown",
+  });
+});
+
+// Every fault is rendered as a warning line, so no fault may bring a line break
+// with it — from a quoted character, or from an operating system message that
+// happens to wrap. One place escapes them, and this is what says so.
+test("every fault renders as one line, whatever it carries", () => {
+  const faults: ConfigFileFault[] = [
+    { kind: "unreadable", detail: "EACCES: permission denied,\nopen 'x'" },
+    { kind: "not-json", detail: "Expected\nproperty name" },
+    { kind: "not-an-object" },
+  ];
+
+  for (const fault of faults) {
+    const line = faultLine(fault);
+    assert.equal(line.split("\n").length, 1, JSON.stringify(line));
+  }
+});
+
+// A code point above the basic plane needs five hex digits, and four cannot hold
+// it: `\uE0041` reads as `\uE004` and then a `1`.
+test("an invisible character above the basic plane is escaped unambiguously", () => {
+  const line = faultLine({ kind: "unreadable", detail: "a\u{E0041}b" });
+  assert.ok(line.includes("a\\u{E0041}b"), line);
+});
+
+// The engine's own words are kept where they diagnose: "Expected double-quoted
+// property name" is what a trailing comma looks like.
+test("the rendering keeps the parser's diagnosis and places it in the file", () => {
+  const text = '{\n  "a": 1,\n}';
+  assert.equal(
+    faultLine(notJsonFault(text, parseError(text))),
+    `${GLOBAL_PATH}: not valid JSON (line 3, column 1: Expected double-quoted property name) — ` +
+      "the file is skipped whole, so the layers below it still apply",
+  );
 });
 
 test("loadConfig warns and skips non-object JSON", async () => {
@@ -1144,10 +1442,9 @@ test("loadConfig never rejects when readFile fails with a non-ENOENT error", asy
   const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile, warn: () => {} });
   assert.deepEqual(loaded.config, defaultConfig(AGENT_DIR));
   assert.ok(loaded.warnings.length >= 1, "expected a warning for the unreadable files");
-  // A file that is there but cannot be read is reported present, alongside the
-  // warning naming it; "absent" would send someone looking for a file that is
-  // exactly where they left it.
-  assert.ok(loaded.files.every((f) => f.present === true), JSON.stringify(loaded.files));
+  // A file that is there but cannot be read is unusable, not absent: "absent"
+  // would send someone looking for a file that is exactly where they left it.
+  assert.ok(loaded.files.every((f) => f.state.kind === "unusable"), JSON.stringify(loaded.files));
   assert.ok(loaded.warnings.some((w) => w.includes(GLOBAL_PATH)), loaded.warnings.join("\n"));
   assert.ok(loaded.warnings.some((w) => w.includes(PROJECT_PATH)), loaded.warnings.join("\n"));
 });
@@ -1173,8 +1470,8 @@ test("loadConfig with no deps resolves the relocated agent dir from PI_CODING_AG
     const global = loaded.files.find((f) => f.source === "global");
     const project = loaded.files.find((f) => f.source === "project");
     assert.equal(global?.path, join(agentDir, CONFIG_FILE_NAME));
-    assert.equal(global?.present, true);
-    assert.equal(project?.present, false);
+    assert.equal(global?.state.kind, "applied");
+    assert.equal(project?.state.kind, "absent");
     assert.equal(loaded.config.sessionSwitchAt, 33);
     assert.equal(loaded.sources.sessionSwitchAt, "global");
   } finally {

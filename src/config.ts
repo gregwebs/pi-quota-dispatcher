@@ -463,15 +463,71 @@ export function projectConfigPath(cwd: string = process.cwd()): string {
 /** Which layer a resolved value came from. */
 export type ConfigSource = "built-in" | "global" | "project";
 
+/**
+ * Where in a config file something was found, 1-based, as an editor counts.
+ */
+export interface ConfigPosition {
+  line: number;
+  column: number;
+}
+
+/**
+ * Why a file that is there produced no layer.
+ *
+ * A case per kind, carrying the parser's own words where they diagnose, rather
+ * than a finished sentence: the wording is what the log, the report and the
+ * startup notice all print, so it is composed in one place
+ * (`unusableConfigFileLines`) and this is the fact underneath it. A finished
+ * string here would also be a sentence the tests could build and the loader
+ * never could.
+ */
+export type ConfigFileFault =
+  /** Read failed for a reason other than absence: a permission, a directory. */
+  | { kind: "unreadable"; detail: string }
+  /**
+   * `JSON.parse` refused it, with its own diagnosis. `at` is set only when the
+   * engine named a place: some of its messages report a line and a column, some
+   * an offset, and some — the ones that quote the offending character — none.
+   */
+  | { kind: "not-json"; detail: string; at?: ConfigPosition }
+  /** Valid JSON, and still not a config: the routes live under named keys. */
+  | { kind: "not-an-object" };
+
+/**
+ * What became of one config file. Being there at all is every case but
+ * `absent`, which is why a file cannot be reported as missing while it is
+ * sitting on disk.
+ */
+export type ConfigFileState =
+  /** No file at the path. Not an error: it is simply not a layer. */
+  | { kind: "absent" }
+  /** Read, parsed and folded in as a layer. */
+  | { kind: "applied" }
+  /** There, but no layer came of it. */
+  | { kind: "unusable"; fault: ConfigFileFault };
+
 export interface ConfigFile {
   source: "global" | "project";
   path: string;
-  /**
-   * Whether the file was there. A file that exists but does not parse is still
-   * `present` — it is the reason the run warned, and reporting it as "absent"
-   * would send someone looking for a file that is right where they left it.
-   */
-  present: boolean;
+  state: ConfigFileState;
+}
+
+/**
+ * One `<path>: <fault>` line per config file that is there but produced no
+ * layer, in layer order — global before project.
+ *
+ * The single rendering of a file fault, and the only place the consequence
+ * clause is applied: `loadConfig` splices these into the warnings it returns and
+ * logs, and the startup notice prints them as its evidence, so the reader meets
+ * one sentence for one fact wherever they meet it. Same deal as
+ * `unknownModelNote`, and for the same reason.
+ */
+export function unusableConfigFileLines(files: ConfigFile[]): string[] {
+  return files.flatMap((file) =>
+    file.state.kind === "unusable"
+      ? [`${file.path}: ${faultText(file.state.fault)} — ${SKIPPED_WHOLE}`]
+      : [],
+  );
 }
 
 export interface LoadedConfig {
@@ -518,12 +574,174 @@ export interface LoadConfigDeps {
 }
 
 /**
+ * Characters the reader cannot see, or that would put something where they are
+ * not looking: control, format, surrogate, line/paragraph-separator and
+ * space-separator characters. The ASCII space is the exception — it is what
+ * prose is made of — and it is the one of these that cannot be an offending
+ * token, since JSON skips it.
+ *
+ * A fault quotes the parser's own account of the character that stopped it, and
+ * that character is whatever the file holds: a byte-order mark, a non-breaking
+ * space or a zero-width space (invisible), a vertical tab (which re-indents the
+ * line it lands in), a line separator (which breaks it in two), or a lone
+ * surrogate (which a terminal renders as nothing or as a replacement box).
+ */
+const INVISIBLE = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\p{Zs}]/gu;
+
+/** The clause every file fault ends with: what a skipped layer costs.
+ *
+ * The reader's next question after "this file is wrong" is "then what am I
+ * running?", and the answer is the same whichever fault it was. It is also the
+ * half a warning needs and a bare parser error cannot give: the values on
+ * screen are the layers below this one, so they are plausible and unrelated to
+ * what the file says.
+ */
+const SKIPPED_WHOLE = "the file is skipped whole, so the layers below it still apply";
+
+/** `(line 3 column 1)`, the position a current V8 hangs on a parse error. */
+const JSON_LINE_COLUMN = /\(line (\d+) column (\d+)\)/u;
+/** `at position 12`, the same position as older V8 spells it — and all it gives. */
+const JSON_POSITION = /at position (\d+)/u;
+/**
+ * The engine's offset tail, replaced by a position rendered in one shape. ` in
+ * JSON` is optional because only some of its messages say it — the one for text
+ * after the end of the document says `after JSON at position 7 (line 1 column
+ * 8)` — and the tail is the same fact either way.
+ */
+const JSON_OFFSET_TAIL = /(?: in JSON)? at position \d+(?: \(line \d+ column \d+\))?$/u;
+/**
+ * The engine quoting the file back at the reader, after its diagnosis. It is
+ * cut rather than matched whole because V8 truncates it — `, "..."`, `, ..."..."`
+ * and `, "..."...` all occur — and because it carries the file's own text,
+ * newlines included, into a message rendered as one line.
+ */
+const JSON_QUOTED_FILE = /, (?:\.\.\.)?"[\s\S]*$/u;
+/** The same quote with no diagnosis in front of it: `"NaN" is not valid JSON`. */
+const JSON_BARE_QUOTED_FILE = /^"[\s\S]*$/u;
+
+/** The text of a thrown value, whatever was thrown: a parser error is not
+ * always an `Error`, and a fault must not come out as `undefined`. */
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Where in the file the parse stopped, or `undefined` when the engine named no
+ * place.
+ *
+ * A line and a column are what a reader opens an editor with; the offset is a
+ * number they would have to count the whole file to use. Both are 1-based, so
+ * the engine's own line and column go straight through and only its offset
+ * spelling needs converting — and the engine reports no place at all when it
+ * quotes the offending character, which `notJsonFault` cannot do anything
+ * about.
+ *
+ * `message` must already have the engine's quote of the file cut out of it: that
+ * quote is the file's own text, so a config whose value happens to read `at
+ * position 5` would otherwise be read as the engine saying where the failure
+ * was.
+ */
+function jsonParseLocation(text: string, message: string): ConfigPosition | undefined {
+  const lineColumn = JSON_LINE_COLUMN.exec(message);
+  if (lineColumn) return { line: Number(lineColumn[1]), column: Number(lineColumn[2]) };
+  const position = JSON_POSITION.exec(message);
+  if (!position) return undefined;
+  const offset = Number(position[1]);
+  const before = text.slice(0, offset);
+  return { line: before.split("\n").length, column: offset - before.lastIndexOf("\n") };
+}
+
+/**
+ * The engine's account of the fault with its quote of the file cut out, its
+ * offset and line-and-column still in place.
+ */
+function withoutQuotedFile(message: string): string {
+  return message.replace(JSON_QUOTED_FILE, "").replace(JSON_BARE_QUOTED_FILE, "");
+}
+
+/**
+ * The parser's diagnosis, with its two ways of speaking about the file removed:
+ * the quoted copy of the file, and the offset this seam renders as a position.
+ * What is left is what the engine has to say about the fault itself —
+ * `Expected double-quoted property name` is a trailing comma — or nothing at
+ * all, when the quote was the whole message.
+ */
+function jsonParseDetail(diagnosis: string): string {
+  return diagnosis.replace(JSON_OFFSET_TAIL, "").trim();
+}
+
+/**
+ * The fault for a file whose bytes are not JSON.
+ *
+ * Exported because it is a table of engine spellings — a line and a column, a
+ * bare offset, and the quoted character with no position at all — and a test can
+ * pin the whole table without depending on whichever Node it runs under.
+ */
+export function notJsonFault(text: string, err: unknown): ConfigFileFault {
+  const diagnosis = withoutQuotedFile(errorText(err));
+  const detail = jsonParseDetail(diagnosis);
+  const at = jsonParseLocation(text, diagnosis);
+  return at === undefined ? { kind: "not-json", detail } : { kind: "not-json", detail, at };
+}
+
+/** The fault for a file that is there and could not be read at all.
+ *
+ * The error's own message is carried whole: it names the mechanism — a
+ * permission, a directory where a file was expected — and that is the most
+ * there is to say about it.
+ */
+function unreadableFault(err: unknown): ConfigFileFault {
+  return { kind: "unreadable", detail: errorText(err) };
+}
+
+const NOT_AN_OBJECT: ConfigFileFault = { kind: "not-an-object" };
+
+/**
+ * The diagnosis alone — no path, no consequence.
+ *
+ * The path and the consequence are the same for every fault and are applied in
+ * one place (`unusableConfigFileLines`), so a fault cannot be rendered with one
+ * of them missing or spelled a second way.
+ */
+function faultText(fault: ConfigFileFault): string {
+  switch (fault.kind) {
+    case "unreadable":
+      return `could not be read (${escapeInvisible(fault.detail)})`;
+    case "not-an-object":
+      return "config must be a JSON object";
+    case "not-json": {
+      const at = fault.at === undefined ? undefined : `line ${fault.at.line}, column ${fault.at.column}`;
+      const where = [at, escapeInvisible(fault.detail)].filter(Boolean).join(": ");
+      return `not valid JSON${where === "" ? "" : ` (${where})`}`;
+    }
+  }
+}
+
+/** A message with its invisible characters spelled out, so one warning stays
+ * one line and a character the reader cannot see is a character they can read. */
+function escapeInvisible(text: string): string {
+  return text.replace(INVISIBLE, (ch) => {
+    if (ch === " ") return ch;
+    const code = ch.codePointAt(0) ?? 0;
+    // Braces above the basic plane, because four digits cannot hold a code point
+    // that needs five — and `\uD834` for the half of a non-BMP character the
+    // engine quotes is exactly what the four-digit form is for.
+    return code > 0xffff
+      ? `\\u{${code.toString(16).toUpperCase()}}`
+      : `\\u${code.toString(16).toUpperCase().padStart(4, "0")}`;
+  });
+}
+
+/**
  * Resolve the effective config from the three layers.
  *
  * Absent files are skipped silently. An unparseable file warns and is skipped
- * whole — a half-applied config is harder to reason about than the defaults.
- * An invalid value warns and the previous layer's value stands, so a typo in a
- * project file cannot undo a correct global one.
+ * whole — a half-applied config is harder to reason about than the defaults —
+ * and the warning says so: someone who has just lost a whole file needs the
+ * place in it and the fact that the layers below it are now what they are
+ * running on, not a bare `JSON.parse` message. An invalid value warns and the
+ * previous layer's value stands, so a typo in a project file cannot undo a
+ * correct global one.
  *
  * Warnings are returned *and* passed to `warn` (default `console.error`), so
  * the extension logs on load and tests can collect instead of printing.
@@ -547,6 +765,7 @@ export async function loadConfig(deps: LoadConfigDeps = {}): Promise<LoadedConfi
   const layers: MergeLayer[] = [];
 
   for (const entry of entries) {
+    const file = { source: entry.source, path: entry.path };
     let text: string;
     try {
       text = await read(entry.path);
@@ -554,33 +773,37 @@ export async function loadConfig(deps: LoadConfigDeps = {}): Promise<LoadedConfi
       // An absent file is ordinary; anything else is worth reporting but must
       // not stop the other layer from applying.
       if ((err as { code?: unknown }).code === "ENOENT") {
-        files.push({ source: entry.source, path: entry.path, present: false });
+        files.push({ ...file, state: { kind: "absent" } });
         continue;
       }
-      warnings.push(`${entry.path}: ${(err as Error).message}`);
-      files.push({ source: entry.source, path: entry.path, present: true });
+      files.push({ ...file, state: { kind: "unusable", fault: unreadableFault(err) } });
       continue;
     }
-
-    // The file was there, whether or not its contents are usable. Reporting it
-    // as absent would send someone looking for a file that is right there.
-    files.push({ source: entry.source, path: entry.path, present: true });
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
     } catch (err) {
-      warnings.push(`${entry.path}: ${(err as Error).message}`);
+      files.push({ ...file, state: { kind: "unusable", fault: notJsonFault(text, err) } });
       continue;
     }
     if (!isPlainObject(parsed)) {
-      warnings.push(`${entry.path}: config must be a JSON object`);
+      files.push({ ...file, state: { kind: "unusable", fault: NOT_AN_OBJECT } });
       continue;
     }
+    // It read, parsed, and is an object: this *is* the layer. Every other way
+    // out of this loop left a file that was there but unusable.
+    files.push({ ...file, state: { kind: "applied" } });
     // Each layer labels its warnings with the file path, so `mergeConfig`
     // outputs them in the shape a reader needs to act on directly.
     layers.push({ source: entry.source, label: entry.path, data: parsed });
   }
+
+  // Derived from the states rather than pushed as each fault is found, so the
+  // log line, the report's warning tail and the startup notice are one
+  // rendering of one fact. In layer order, which is the order they were found
+  // in.
+  warnings.push(...unusableConfigFileLines(files));
 
   const merged = mergeConfig(defaultConfig(agentDir), layers);
   warnings.push(...merged.warnings);
@@ -1337,7 +1560,8 @@ export function thinkingFor(
  */
 export function describeConfigLayers(loaded: LoadedConfig): string {
   const [globalFile, projectFile] = loaded.files;
-  const found = (file: ConfigFile | undefined): string => (file?.present ? "present" : "absent");
+  const found = (file: ConfigFile | undefined): string =>
+    file !== undefined && file.state.kind !== "absent" ? "present" : "absent";
   return (
     `config: built-in < global ${globalFile?.path ?? globalConfigPath()} (${found(globalFile)})` +
     ` < project ${projectFile?.path ?? projectConfigPath()} (${found(projectFile)})`
