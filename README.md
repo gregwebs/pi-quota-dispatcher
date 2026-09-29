@@ -159,6 +159,10 @@ stays the durable record. More in
 | `/quota-dispatch config` | Print where each configured value came from. Local, so it reads no quota and touches no file. |
 | `/quota-dispatch apply` | Write the decisions out now. The only form that touches a file. |
 
+The argument is a form name and nothing else, matched whole: `/quota-dispatch
+refresh apply` is not read as `apply`, and a word that names no form is answered
+with the list above rather than silently showing the report.
+
 The two reporting forms are read-only by construction — `report()` has no way to
 be asked to write, so "show me the state" cannot rewrite your agents — and
 `config` never gets as far as a rail: it is answered from the config files, so it

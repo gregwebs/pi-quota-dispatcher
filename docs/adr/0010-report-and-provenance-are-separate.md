@@ -43,9 +43,9 @@ my files is this ignoring?" from its first line and its last.
 ## Considered options
 
 **A flag on one form** (`/quota-dispatch --config`). Rejected as a different
-spelling of the same capability. The existing forms already parse by substring —
-`apply`, `refresh` — and `config` reads as the question it answers, so a flag
-would buy a second syntax and no new behaviour.
+spelling of the same capability. The forms are single words matched whole, and
+`config` reads as the question it answers, so a flag would buy a second syntax
+and no new behaviour.
 
 **Condensing the block instead of moving it.** A report that printed provenance
 only where a value was overridden would still be answering two questions on one

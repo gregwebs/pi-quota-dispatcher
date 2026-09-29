@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import extension from "../src/index.ts";
+import extension, { parseInvocation, unknownFormNotice } from "../src/index.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
 // documented literal directly.
@@ -175,6 +175,8 @@ interface Harness {
   /** Everything the extension pushed to the UI, in order. */
   notifications: Array<{ text: string; level: string }>;
   statuses: Array<{ key: string; text: string | undefined }>;
+  /** The help text pi lists the command under. */
+  description: string | undefined;
 }
 
 /**
@@ -201,6 +203,7 @@ async function withExtension(
   const statuses: Array<{ key: string; text: string | undefined }> = [];
   const eventHandlers: Record<string, EventHandler> = {};
   let command: CommandHandler | undefined;
+  let description: string | undefined;
 
   const makeCtx = (): Ctx => ({
     hasUI,
@@ -212,8 +215,9 @@ async function withExtension(
   });
 
   const api = {
-    registerCommand: (_name: string, spec: { handler: CommandHandler }) => {
+    registerCommand: (_name: string, spec: { description?: string; handler: CommandHandler }) => {
       command = spec.handler;
+      description = spec.description;
     },
     on: (event: string, handler: EventHandler) => {
       eventHandlers[event] = handler;
@@ -228,6 +232,7 @@ async function withExtension(
     const harness: Harness = {
       notifications,
       statuses,
+      description,
       run: async (args: string) => {
         notifications.length = 0;
         await handler(args, makeCtx());
@@ -370,6 +375,69 @@ test("the apply command writes the decision, skips missing files, and reports on
   assert.match(after, /^model: "openai-codex\/gpt-6-sol"$/m);
   assert.match(after, /^thinking: high$/m);
   assert.match(after, /^Body\.$/m);
+});
+
+// ---------------------------------------------------------------- invocation parsing
+
+test("the argument is a whole form name, not a substring of one", () => {
+  assert.deepEqual(parseInvocation(""), { form: "report", force: false });
+  assert.deepEqual(parseInvocation("   "), { form: "report", force: false });
+  assert.deepEqual(parseInvocation(" refresh "), { form: "report", force: true });
+  assert.deepEqual(parseInvocation("config"), { form: "config" });
+  assert.deepEqual(parseInvocation("apply"), { form: "apply" });
+});
+
+test("an argument that names no form is unknown rather than a guess", () => {
+  // Under the `includes` test this read as `apply`: a word that could have meant
+  // "just look" selected the one form that writes.
+  assert.deepEqual(parseInvocation("refresh apply"), { form: "unknown", arg: "refresh apply" });
+  // And a typo used to fall through to the plain report without saying so.
+  assert.deepEqual(parseInvocation("applyx"), { form: "unknown", arg: "applyx" });
+  assert.deepEqual(parseInvocation("frobnicate"), { form: "unknown", arg: "frobnicate" });
+});
+
+/**
+ * The description is the only place pi shows the forms: `config` is otherwise
+ * discoverable only by reading the README, which left the provenance form
+ * invisible to exactly the user this change added it for.
+ */
+test("the registered description names every form", async () => {
+  const fx = await fixture();
+
+  await withExtension(fx, async ({ description }) => {
+    for (const form of ["refresh", "config", "apply"]) {
+      assert.ok(description?.includes(form), `the description must name ${form}: ${description}`);
+    }
+  });
+});
+
+/**
+ * The unknown form is answered before the boot, so it costs no config read, no
+ * model check and no request — and the word that could have been `apply` cannot
+ * reach a write.
+ */
+test("an unknown form is reported, reads no quota, and writes nothing", async () => {
+  const fx = await fixture();
+  const before = await readFile(fx.plannerFile, "utf8");
+  let fetches = 0;
+  const refused = (async (url: string | URL) => {
+    fetches++;
+    throw new Error(`an unknown form must not read a quota: ${String(url)}`);
+  }) as unknown as typeof fetch;
+
+  await withExtension(
+    fx,
+    async ({ notifications, run }) => {
+      const text = await run("refresh apply");
+      assert.equal(text, unknownFormNotice("refresh apply").join("\n"));
+      assert.equal(notifications[0].level, "warning");
+      assert.ok(!text.includes("[applied]"), text);
+    },
+    () => refused,
+  );
+
+  assert.equal(fetches, 0, "an unknown form must not read a quota");
+  assert.equal(await readFile(fx.plannerFile, "utf8"), before, "an unknown form must not write");
 });
 
 // ---------------------------------------------------------------- session_start
