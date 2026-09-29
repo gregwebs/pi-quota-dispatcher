@@ -59,6 +59,8 @@ import {
   agentNameRejection,
   configFilesFor,
   describeConfig,
+  describeConfigLayers,
+  describeConfigWarnings,
   globalConfigPath,
   loadConfig,
   railFromModel,
@@ -76,6 +78,8 @@ export {
   configFilesFor,
   defaultConfig,
   describeConfig,
+  describeConfigLayers,
+  describeConfigWarnings,
   globalConfigPath,
   isClaudeRefreshMode,
   isThinkingLevel,
@@ -1037,9 +1041,9 @@ const UNKNOWN_MODEL_SUMMARY = "quota-dispatcher: a configured model is unknown t
  * edit.
  *
  * The miss lines are `unknownModelNote`'s, verbatim, so the reader meets the
- * same sentence here as in the log and in `/quota-dispatch`'s provenance block —
- * the startup warning is a shortcut to that record, not a third telling of the
- * same fact. Pure, and separate from the UI call, for the same reason
+ * same sentence here as in the log and in the report's warning tail — the
+ * startup warning is a shortcut to that record, not a third telling of the same
+ * fact. Pure, and separate from the UI call, for the same reason
  * `unconfiguredNotice` is.
  */
 export function unknownModelsNotice(misses: ModelMiss[], configPaths: string[]): string[] {
@@ -2312,8 +2316,11 @@ export function createDispatcher(
         lines.push(`${rail}: ${windows}${s.note === undefined ? "" : ` — ${s.note}`}`);
       }
     }
-    lines.push("");
-    for (const { decision, outcome } of await decideAll(rails, true)) {
+    const decisions = await decideAll(rails, true);
+    // No separator without decisions: an unconfigured install has nothing
+    // between the rail lines and whatever the caller appends.
+    if (decisions.length) lines.push("");
+    for (const { decision, outcome } of decisions) {
       lines.push(...describeDecisionLines(decision, outcome));
     }
 
@@ -2432,6 +2439,51 @@ function announceUnknownModels(
   ctx.ui.notify(unknownModelsNotice(misses, unknownModelConfigPaths(misses, loaded)).join("\n"), "warning");
 }
 
+/**
+ * Which form `/quota-dispatch` was invoked in.
+ *
+ * `report` carries its own `force` rather than being two variants because the
+ * plain and `refresh` forms differ in that one boolean and in nothing else.
+ */
+export type Invocation =
+  | { form: "report"; force: boolean }
+  | { form: "config" }
+  | { form: "apply" }
+  | { form: "unknown"; arg: string };
+
+/**
+ * What the command's argument asks for.
+ *
+ * The argument is a form name and nothing else: the whole trimmed argument is
+ * matched, not a substring of it. The `includes` test this replaces had two
+ * failures worth naming. `refresh apply` read as `apply` — a word that could
+ * have meant "just look" selected the one form that writes. And any typo fell
+ * through to the plain report without saying so, which is the quiet-wrong-answer
+ * shape the rest of this extension works to avoid. An argument naming no form is
+ * now `unknown`, and the caller answers it with the list of forms rather than a
+ * guess.
+ */
+export function parseInvocation(args: string): Invocation {
+  const arg = args.trim();
+  if (arg === "") return { form: "report", force: false };
+  if (arg === "refresh") return { form: "report", force: true };
+  if (arg === "config") return { form: "config" };
+  if (arg === "apply") return { form: "apply" };
+  return { form: "unknown", arg };
+}
+
+/**
+ * What an argument that names no form is told: the offending text, then the
+ * forms. Listing them is the point — the failure being fixed is a form the user
+ * could not discover, so the answer to a typo is the catalogue.
+ */
+export function unknownFormNotice(arg: string): string[] {
+  return [
+    `quota-dispatcher: "${arg}" is not a form.`,
+    "Forms: /quota-dispatch, /quota-dispatch refresh, /quota-dispatch config, /quota-dispatch apply.",
+  ];
+}
+
 export default function (pi: ExtensionAPI) {
   /**
    * Config is resolved once per extension load, and the command reports which
@@ -2453,8 +2505,8 @@ export default function (pi: ExtensionAPI) {
    * Booting is where the running pi's model registry is consulted:
    * `checkModels` drops candidates this pi cannot spawn before any decision is
    * made. Its warnings ride along with the load warnings, so `/quota-dispatch`
-   * prints them in the same provenance block, and its `held` record is what
-   * makes an unresolvable primary hold rather than be written.
+   * prints them whichever form was run, and its `held` record is what makes an
+   * unresolvable primary hold rather than be written.
    *
    * This is why a boot needs the context, and why the timer reads the cached
    * `boot` rather than starting one of its own: a boot without a registry skips
@@ -2492,28 +2544,47 @@ export default function (pi: ExtensionAPI) {
   let stopped = false;
 
   pi.registerCommand("quota-dispatch", {
-    description: "Show subscription headroom and which model each agent is dispatched to",
+    // The forms are named here because this is the only place pi shows them:
+    // a user who never opens the README would not otherwise learn that the
+    // provenance form exists.
+    description: "Show subscription headroom and each agent's model; forms: refresh, config, apply",
     handler: async (args, ctx) => {
-      const a = (args ?? "").trim();
+      const invocation = parseInvocation(args ?? "");
+
+      // Answered before the boot, so a typo costs no config read, no model check
+      // and no quota request — and cannot reach a write.
+      if (invocation.form === "unknown") {
+        ctx.ui.notify(unknownFormNotice(invocation.arg).join("\n"), "warning");
+        return;
+      }
+
       const { loaded, dispatcher } = await bootOnce(ctx);
 
-      // Only this form writes. The plain and `refresh` forms are read-only.
+      // Only `apply` writes, and only `config` skips the quota read: it is about
+      // the files on this machine, so it answers without costing a request.
       let lines: string[];
-      if (a.includes("apply")) {
+      if (invocation.form === "apply") {
         const rows = await dispatcher.evaluate({ force: true });
         lines = [
           "[applied]",
           ...rows.flatMap((r) => describeDecisionLines(r.decision, r.outcome)),
         ];
+      } else if (invocation.form === "config") {
+        lines = describeConfig(loaded);
       } else {
-        const force = a.includes("refresh");
-        lines = await dispatcher.report({ force });
+        // The report carries the install's shape and its warnings, not where
+        // each value came from: provenance is a question asked deliberately,
+        // and `config` is the form that answers it. The warnings stay because a
+        // config that is not doing what the user meant has to say so on the run
+        // that read it, whichever form that was.
+        lines = [
+          ...(await dispatcher.report({ force: invocation.force })),
+          "",
+          describeConfigLayers(loaded),
+          ...describeConfigWarnings(loaded),
+        ];
       }
 
-      // Every form ends with the provenance block, so "where did this value
-      // come from?" is answerable from whichever one you ran. Both branches
-      // build the body first and share this tail rather than duplicating it.
-      lines.push("", ...describeConfig(loaded));
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });

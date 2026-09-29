@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import extension from "../src/index.ts";
+import extension, { parseInvocation, unknownFormNotice } from "../src/index.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
 // documented literal directly.
@@ -175,6 +175,8 @@ interface Harness {
   /** Everything the extension pushed to the UI, in order. */
   notifications: Array<{ text: string; level: string }>;
   statuses: Array<{ key: string; text: string | undefined }>;
+  /** The help text pi lists the command under. */
+  description: string | undefined;
 }
 
 /**
@@ -201,6 +203,7 @@ async function withExtension(
   const statuses: Array<{ key: string; text: string | undefined }> = [];
   const eventHandlers: Record<string, EventHandler> = {};
   let command: CommandHandler | undefined;
+  let description: string | undefined;
 
   const makeCtx = (): Ctx => ({
     hasUI,
@@ -212,8 +215,9 @@ async function withExtension(
   });
 
   const api = {
-    registerCommand: (_name: string, spec: { handler: CommandHandler }) => {
+    registerCommand: (_name: string, spec: { description?: string; handler: CommandHandler }) => {
       command = spec.handler;
+      description = spec.description;
     },
     on: (event: string, handler: EventHandler) => {
       eventHandlers[event] = handler;
@@ -228,6 +232,7 @@ async function withExtension(
     const harness: Harness = {
       notifications,
       statuses,
+      description,
       run: async (args: string) => {
         notifications.length = 0;
         await handler(args, makeCtx());
@@ -256,7 +261,20 @@ async function withExtension(
 
 // ---------------------------------------------------------------- commands
 
-test("the plain command reports where each value came from and writes nothing", async () => {
+/**
+ * The per-value provenance lines the report must never carry. `sessionSwitchAt`
+ * is a built-in scalar and `agents.planner.primary.model` a global agent slot,
+ * so a report that leaked any part of the block trips one of them.
+ *
+ * `describeConfig` still renders both — `/quota-dispatch config` is the form
+ * that prints it, and its own test below pins the lines whole.
+ */
+function assertNoProvenance(text: string): void {
+  assert.ok(!text.includes("sessionSwitchAt ="), text);
+  assert.ok(!text.includes("agents.planner.primary.model ="), text);
+}
+
+test("the plain command reports the state and the layers, and writes nothing", async () => {
   const fx = await fixture();
   const before = await readFile(fx.plannerFile, "utf8");
 
@@ -264,15 +282,19 @@ test("the plain command reports where each value came from and writes nothing", 
     const text = await run("");
     const projectFile = join(process.cwd(), CONFIG_DIR_NAME, CONFIG_FILE_NAME);
 
+    // Which files were read is part of the state, so the layers line stays.
+    // Where each value came from is a question asked deliberately, and this form
+    // is not where it is answered.
     assert.ok(text.includes("config: built-in < global"), text);
     assert.ok(text.includes(projectFile), text);
+    assertNoProvenance(text);
     assert.ok(!text.includes("[applied]"), text);
   });
 
   assert.equal(await readFile(fx.plannerFile, "utf8"), before, "the plain report must not write");
 });
 
-test("the refresh command reports provenance and still writes nothing", async () => {
+test("the refresh command reports the state and still writes nothing", async () => {
   const fx = await fixture();
   const before = await readFile(fx.plannerFile, "utf8");
 
@@ -282,33 +304,140 @@ test("the refresh command reports provenance and still writes nothing", async ()
 
     assert.ok(text.includes("config: built-in < global"), text);
     assert.ok(text.includes(projectFile), text);
+    assertNoProvenance(text);
     assert.ok(!text.includes("[applied]"), text);
   });
 
   assert.equal(await readFile(fx.plannerFile, "utf8"), before, "refresh must not write");
 });
 
-test("the apply command reports provenance, writes the decision, and skips missing files", async () => {
+/**
+ * `/quota-dispatch config` is the provenance form: the per-value lines the
+ * report refuses to carry, and nothing else. The counting fetch that throws
+ * pins the other half of "local" — answering where a value came from must not
+ * cost a vendor request, which is what makes it safe to run off-network.
+ */
+test("the config command prints where each value came from without reading a quota", async () => {
+  const fx = await fixture();
+  const before = await readFile(fx.plannerFile, "utf8");
+  let fetches = 0;
+  const refused = (async (url: string | URL) => {
+    fetches++;
+    throw new Error(`the config form must not read a quota: ${String(url)}`);
+  }) as unknown as typeof fetch;
+
+  await withExtension(
+    fx,
+    async ({ run }) => {
+      const text = await run("config");
+      const projectFile = join(process.cwd(), CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+
+      assert.ok(text.includes("config: built-in < global"), text);
+      assert.ok(text.includes(projectFile), text);
+      assert.ok(text.includes("sessionSwitchAt = 75  [built-in]"), text);
+      assert.ok(
+        text.includes("agents.planner.primary.model = claude-bridge/claude-opus-5-5  [global]"),
+        text,
+      );
+      assert.ok(
+        text.includes("agents.planner.alternates[0].model = openai-codex/gpt-6-sol  [global]"),
+        text,
+      );
+
+      // Not the report: the form answers a question about the config files, so
+      // it prints no rail reading and no decision.
+      assert.ok(!text.includes("claude: 5h"), text);
+      assert.ok(!text.includes("planner -> "), text);
+      assert.ok(!text.includes("[applied]"), text);
+    },
+    () => refused,
+  );
+
+  assert.equal(fetches, 0, "the config form is local and must fetch nothing");
+  assert.equal(await readFile(fx.plannerFile, "utf8"), before, "the config form must not write");
+});
+
+test("the apply command writes the decision, skips missing files, and reports only what it did", async () => {
   const fx = await fixture();
 
   await withExtension(fx, async ({ run }) => {
     const text = await run("apply");
-    const projectFile = join(process.cwd(), CONFIG_DIR_NAME, CONFIG_FILE_NAME);
-
-    // Provenance reaches the user through the apply branch too: deleting the
-    // `describeConfig` push from that branch must fail this test.
-    assert.ok(text.includes("config: built-in < global"), text);
-    assert.ok(text.includes(projectFile), text);
 
     assert.ok(text.includes("[applied]"), text);
     assert.ok(text.includes("planner -> openai-codex/gpt-6-sol"), text);
     assert.ok(text.includes("[skipped (no file)]"), text);
+    // `apply` ends at what it wrote. Provenance is a separate question, and
+    // `/quota-dispatch config` is the form that answers it.
+    assertNoProvenance(text);
   });
 
   const after = await readFile(fx.plannerFile, "utf8");
   assert.match(after, /^model: "openai-codex\/gpt-6-sol"$/m);
   assert.match(after, /^thinking: high$/m);
   assert.match(after, /^Body\.$/m);
+});
+
+// ---------------------------------------------------------------- invocation parsing
+
+test("the argument is a whole form name, not a substring of one", () => {
+  assert.deepEqual(parseInvocation(""), { form: "report", force: false });
+  assert.deepEqual(parseInvocation("   "), { form: "report", force: false });
+  assert.deepEqual(parseInvocation(" refresh "), { form: "report", force: true });
+  assert.deepEqual(parseInvocation("config"), { form: "config" });
+  assert.deepEqual(parseInvocation("apply"), { form: "apply" });
+});
+
+test("an argument that names no form is unknown rather than a guess", () => {
+  // Under the `includes` test this read as `apply`: a word that could have meant
+  // "just look" selected the one form that writes.
+  assert.deepEqual(parseInvocation("refresh apply"), { form: "unknown", arg: "refresh apply" });
+  // And a typo used to fall through to the plain report without saying so.
+  assert.deepEqual(parseInvocation("applyx"), { form: "unknown", arg: "applyx" });
+  assert.deepEqual(parseInvocation("frobnicate"), { form: "unknown", arg: "frobnicate" });
+});
+
+/**
+ * The description is the only place pi shows the forms: `config` is otherwise
+ * discoverable only by reading the README, which left the provenance form
+ * invisible to exactly the user this change added it for.
+ */
+test("the registered description names every form", async () => {
+  const fx = await fixture();
+
+  await withExtension(fx, async ({ description }) => {
+    for (const form of ["refresh", "config", "apply"]) {
+      assert.ok(description?.includes(form), `the description must name ${form}: ${description}`);
+    }
+  });
+});
+
+/**
+ * The unknown form is answered before the boot, so it costs no config read, no
+ * model check and no request — and the word that could have been `apply` cannot
+ * reach a write.
+ */
+test("an unknown form is reported, reads no quota, and writes nothing", async () => {
+  const fx = await fixture();
+  const before = await readFile(fx.plannerFile, "utf8");
+  let fetches = 0;
+  const refused = (async (url: string | URL) => {
+    fetches++;
+    throw new Error(`an unknown form must not read a quota: ${String(url)}`);
+  }) as unknown as typeof fetch;
+
+  await withExtension(
+    fx,
+    async ({ notifications, run }) => {
+      const text = await run("refresh apply");
+      assert.equal(text, unknownFormNotice("refresh apply").join("\n"));
+      assert.equal(notifications[0].level, "warning");
+      assert.ok(!text.includes("[applied]"), text);
+    },
+    () => refused,
+  );
+
+  assert.equal(fetches, 0, "an unknown form must not read a quota");
+  assert.equal(await readFile(fx.plannerFile, "utf8"), before, "an unknown form must not write");
 });
 
 // ---------------------------------------------------------------- session_start
@@ -519,9 +648,10 @@ test("the read-only forms report the files no route names", async () => {
     for (const form of ["", "refresh"]) {
       const text = await run(form);
       // Scope the assertions to the unmanaged listing itself — its header line is
-      // followed by one `  <name>.md — model: …` line per file. The config dump
-      // further down also names `planner`, so slicing to the end of the text
-      // would report a routed file as unmanaged.
+      // followed by one `  <name>.md — model: …` line per file, and then the
+      // report's tail, which is not indented. Slicing to the end of the text
+      // would let a later line that happens to name `planner` pass a routed file
+      // off as unmanaged.
       const header = "unmanaged agent files";
       const at = text.indexOf(header);
       assert.notEqual(at, -1, `${form || "plain"} must have an unmanaged section:\n${text}`);
@@ -750,16 +880,21 @@ test("the decision line names the alternates boot dropped instead of claiming no
       assert.ok(scribe, text);
       assert.ok(scribe.includes("(no alternate configured)"), scribe);
 
-      // The boot warning is still replayed in the provenance block, which is the
-      // duplication ADR 0008 argues for: the decision explains the agent, the
-      // block stays a faithful log of every warning. Filtering the replay because
-      // a decision already said it is the tempting tidy-up this pins against.
-      assert.ok(
-        lines.includes(
-          "  warning: agents.planner.alternates[0].model: this pi does not know model openai-codex/gpt-sol-6 — a newer pi may",
-        ),
-        text,
-      );
+      // The boot warning is still replayed, which is the duplication ADR 0008
+      // argues for: the decision explains the agent, the warning stays a faithful
+      // log of every one raised. Filtering the replay because a decision already
+      // said it is the tempting tidy-up this pins against.
+      const replay =
+        "  warning: agents.planner.alternates[0].model: this pi does not know model openai-codex/gpt-sol-6 — a newer pi may";
+      assert.ok(lines.includes(replay), text);
+
+      // Both surfaces replay it: the report carries the warnings because a
+      // config that is not doing what the user meant has to say so on the run
+      // that read it, and `/quota-dispatch config` is the provenance block the
+      // warnings have always been the tail of.
+      const configText = (await runAll("config")).join("\n");
+      assert.ok(configText.includes(replay), configText);
+      assert.ok(configText.includes("sessionSwitchAt = 75  [built-in]"), configText);
     },
     stubFetch,
     { modelRegistry: registry({ "claude-bridge": ["claude-opus-5-5"] }) },

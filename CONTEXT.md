@@ -115,3 +115,16 @@ a token to read. What the extension delegates is the refresh, not the credential
 it never posts a refresh token and never writes the store, because that token
 rotates and a second writer is a way to end the user's session.
 _Avoid_: token refresh, credential refresh, re-login, keepalive
+
+**Report**:
+The answer to "what is my state?": the rail readings, one decision line per
+agent, the files no route names, and every warning. Printed by `/quota-dispatch`
+and its `refresh` form; the per-value **provenance** is deliberately not part of
+it.
+_Avoid_: output, status, summary, dump
+
+**Provenance**:
+The record of which config layer supplied each effective value, printed by
+`/quota-dispatch config`. A warning is not provenance: the **report** and the
+provenance block both carry it.
+_Avoid_: config dump, debug output, source block

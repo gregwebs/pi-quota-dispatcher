@@ -1325,16 +1325,43 @@ export function thinkingFor(
 }
 
 /**
- * Provenance block for `/quota-dispatch`, so "where did this value come from?"
- * is answerable without opening three files.
- *
- * First line names the layers and whether each file was found:
+ * The first line of the provenance block: the layers consulted, in precedence
+ * order, and whether each file was found.
  *
  *   `config: built-in < global <path> (present|absent) < project <path> (present|absent)`
  *
- * Then one line per effective value, scalars in a fixed order, then the
- * `models` table sorted by model id — each entry's `rail` before its `thinking`
- * — then the agents sorted by name, each
+ * Split out of `describeConfig` because it is the one line of the block that
+ * belongs to the report as well: "which files am I actually reading?" is a
+ * question about the install rather than about a value, and it costs a line. The
+ * per-value lines under it are the ones worth asking for by name.
+ */
+export function describeConfigLayers(loaded: LoadedConfig): string {
+  const [globalFile, projectFile] = loaded.files;
+  const found = (file: ConfigFile | undefined): string => (file?.present ? "present" : "absent");
+  return (
+    `config: built-in < global ${globalFile?.path ?? globalConfigPath()} (${found(globalFile)})` +
+    ` < project ${projectFile?.path ?? projectConfigPath()} (${found(projectFile)})`
+  );
+}
+
+/**
+ * One `  warning: <text>` line per warning, if any.
+ *
+ * Not provenance, and both surfaces carry it: a warning is a fact about a value
+ * the config rejected or a model this pi cannot spawn, which the report has to
+ * say whether or not anyone asked where its values came from.
+ */
+export function describeConfigWarnings(loaded: LoadedConfig): string[] {
+  return loaded.warnings.map((warning) => `  warning: ${warning}`);
+}
+
+/**
+ * Provenance block for `/quota-dispatch config`, so "where did this value come
+ * from?" is answerable without opening three files.
+ *
+ * `describeConfigLayers`'s line first, then one line per effective value: the
+ * scalars in a fixed order, then the `models` table sorted by model id — each
+ * entry's `rail` before its `thinking` — then the agents sorted by name, each
  * rendered `<dotted-key> = <value>  [<source>]`:
  *
  *   `  sessionSwitchAt = 75  [built-in]`
@@ -1349,15 +1376,15 @@ export function thinkingFor(
  * the single line `  agents.<name> = disabled  [<source>]`, which is what makes
  * "why is this agent not managed?" answerable from the same block.
  *
- * Finally one `  warning: <text>` line per warning, if any.
+ * Finally `describeConfigWarnings`.
+ *
+ * The report answers the other question — what is my state right now — and
+ * carries the layers line and the warnings only. These per-value lines are what
+ * this block adds, and they are why it is a form of its own rather than the tail
+ * of every form.
  */
 export function describeConfig(loaded: LoadedConfig): string[] {
-  const [globalFile, projectFile] = loaded.files;
-  const found = (file: ConfigFile | undefined): string => (file?.present ? "present" : "absent");
-  const lines: string[] = [
-    `config: built-in < global ${globalFile?.path ?? globalConfigPath()} (${found(globalFile)})` +
-      ` < project ${projectFile?.path ?? projectConfigPath()} (${found(projectFile)})`,
-  ];
+  const lines: string[] = [describeConfigLayers(loaded)];
 
   const sourceOf = (key: string): ConfigSource => loaded.sources[key] ?? "built-in";
 
@@ -1419,7 +1446,7 @@ export function describeConfig(loaded: LoadedConfig): string[] {
     }
   }
 
-  for (const warning of loaded.warnings) lines.push(`  warning: ${warning}`);
+  lines.push(...describeConfigWarnings(loaded));
   return lines;
 }
 

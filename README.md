@@ -18,6 +18,15 @@ planner -> claude-bridge/claude-opus-5-5 (thinking: high)  [unchanged]  (claude 
 reviewer -> openai-codex/gpt-6-astra      [unchanged]  (codex ok (session 0%, weekly 64%))
 
 config: built-in < global ~/.pi/agent/quota-dispatch.json (present) < project .pi/quota-dispatch.json (absent)
+```
+
+The last line says which config layers were read. Where each *value* came from is
+one command further, because it is a question you ask deliberately rather than
+one you want on every run:
+
+```
+$ /quota-dispatch config
+config: built-in < global ~/.pi/agent/quota-dispatch.json (present) < project .pi/quota-dispatch.json (absent)
   sessionSwitchAt = 75  [built-in]
   weeklySwitchAt = 80  [global]
   models.openai-codex/gpt-6-sol.rail = codex  [global]
@@ -136,7 +145,8 @@ stepping over a model. A pi with no model registry cannot answer the question at
 all: the check does not run, so no warning is raised and the footer is only
 cleared, as on any configured install. Everything here is an addition to the
 log, never a replacement for it: each miss is still written to `console.error`,
-and `/quota-dispatch` ends with the same lines in its provenance block, which
+`/quota-dispatch` ends with the same lines as its warning tail, and
+`/quota-dispatch config` repeats them at the end of its provenance block — which
 stays the durable record. More in
 [0009](docs/adr/0009-unknown-models-at-startup.md).
 
@@ -146,13 +156,23 @@ stays the durable record. More in
 |---|---|
 | `/quota-dispatch` | Show rail budgets and the current decision per agent, plus any agent files no route names. Read-only. |
 | `/quota-dispatch refresh` | Force a re-fetch, then show. Read-only. |
+| `/quota-dispatch config` | Print where each configured value came from. Local, so it reads no quota and touches no file. |
 | `/quota-dispatch apply` | Write the decisions out now. The only form that touches a file. |
 
-The two reporting forms are read-only by construction — `report()` has no way to
-be asked to write, so "show me the state" cannot rewrite your agents.
+The argument is a form name and nothing else, matched whole: `/quota-dispatch
+refresh apply` is not read as `apply`, and a word that names no form is answered
+with the list above rather than silently showing the report.
 
-Every form also prints where each configured value came from, so "why is
-reviewer on gpt-6-astra?" is answerable without opening three files.
+The two reporting forms are read-only by construction — `report()` has no way to
+be asked to write, so "show me the state" cannot rewrite your agents — and
+`config` never gets as far as a rail: it is answered from the config files, so it
+works when a vendor is unreachable or you would rather not spend a request.
+
+`/quota-dispatch config` is also what answers "why is reviewer on gpt-6-astra?"
+without opening three files. The report keeps the one line that says which layers
+were read, and every warning: neither is provenance, and a config that is not
+doing what you meant has to say so on the run that read it. More in
+[0010](docs/adr/0010-report-and-provenance-are-separate.md).
 
 ## Configuration
 
@@ -333,11 +353,11 @@ a mistyped value do either by accident. A `false` flag asserts nothing, so an
 entry carrying only flags names no agent route at all: on an agent no lower layer
 defines it changes nothing and gets no `has no primary` warning (the only warning
 such an entry can produce is about a non-boolean flag, and that one is the flag's
-own), and the provenance block simply does not mention the agent. `agent
-"<name>" has no primary` is for an entry that named a field of an agent route —
-`primary`, `alternates`, or a `thinking` default — and could not complete one: a
-candidate with no rail, or an `alternates` list with nothing for it to hang
-from. There is **no `null`** anywhere: a `null` at the agent or candidate level
+own), and `/quota-dispatch config`'s provenance block simply does not mention the
+agent. `agent "<name>" has no primary` is for an entry that named a field of an
+agent route — `primary`, `alternates`, or a `thinking` default — and could not
+complete one: a candidate with no rail, or an `alternates` list with nothing for
+it to hang from. There is **no `null`** anywhere: a `null` at the agent or candidate level
 warns and leaves the previous layer's value standing — it removes nothing.
 
 `alternates` is a **priority list**, consulted in order, and it replaces whole:
@@ -437,8 +457,9 @@ milliseconds in Node's timer range (1–2147483647); the switching thresholds an
 range it enforced.
 
 Every warning names the file it came from, and the `/quota-dispatch` report ends
-with the same provenance listing, so a config that is not doing what you meant
-says so instead of quietly routing you somewhere else.
+with the same warning lines — the provenance block repeats them — so a config
+that is not doing what you meant says so instead of quietly routing you
+somewhere else.
 
 Config is read once when the extension loads; `/reload` after editing.
 
