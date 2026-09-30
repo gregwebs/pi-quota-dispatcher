@@ -10,12 +10,15 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import extension, {
   type AgentFile,
+  type ConfigFile,
+  type ConfigFileFault,
   type ModelMiss,
   agentTableSnippet,
   describeAgentFiles,
   readAgentFiles,
   unconfiguredNotice,
   unknownModelsNotice,
+  unusableConfigNotice,
 } from "../src/index.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
@@ -258,6 +261,50 @@ test("unconfiguredNotice gives no snippet when no file can seed one", () => {
   assert.ok(!text.includes('"agents"'), `no empty snippet may be offered:\n${text}`);
   assert.ok(text.includes("blank") && text.includes("mystery"), text);
   assert.match(text, /no snippet to paste/, text);
+});
+
+// ---------------------------------------------------------------- unusableConfigNotice
+
+/** A config file that is there and produced no layer. */
+function unusable(path: string, fault: ConfigFileFault): ConfigFile {
+  return { source: "global", path, state: { kind: "unusable", fault } };
+}
+
+// The install this notice exists for: the file is right there and names agents,
+// so `unconfiguredNotice` would tell the reader to name agents in a file they
+// have already written. The fault lines are the log's and the report's own, so
+// the notice is a shortcut to that record rather than a third wording of it.
+test("unusableConfigNotice leads with the fault lines verbatim and ends with the fix", () => {
+  const configPath = "/a/quota-dispatch.json";
+  const lines = unusableConfigNotice([
+    unusable(configPath, { kind: "not-json", detail: "Expected double-quoted property name", at: { line: 3, column: 1 } }),
+  ]);
+
+  assert.ok(lines[0].includes("could not be used"), lines[0]);
+  assert.ok(
+    lines.includes(
+      `${configPath}: not valid JSON (line 3, column 1: Expected double-quoted property name) — ` +
+        "the file is skipped whole, so the layers below it still apply",
+    ),
+    lines.join("\n"),
+  );
+  assert.match(lines.at(-1) ?? "", /\/reload/, lines.join("\n"));
+
+  const text = lines.join("\n");
+  assert.ok(!text.includes("no agents are configured"), `the ask must not be repeated:\n${text}`);
+  assert.ok(!text.includes('"agents"'), `no paste-ready snippet belongs here:\n${text}`);
+});
+
+// Both layers can be unusable at once, and each has to be named: a reader who
+// repairs one and reloads has to know the other is still costing them routes.
+test("unusableConfigNotice names every file that was skipped", () => {
+  const text = unusableConfigNotice([
+    unusable("/home/g/quota-dispatch.json", { kind: "unreadable", detail: "EACCES: permission denied" }),
+    unusable("/repo/.pi/quota-dispatch.json", { kind: "not-an-object" }),
+  ]).join("\n");
+
+  assert.ok(text.includes("/home/g/quota-dispatch.json"), text);
+  assert.ok(text.includes("/repo/.pi/quota-dispatch.json"), text);
 });
 
 // ---------------------------------------------------------------- unknownModelsNotice
@@ -526,6 +573,94 @@ for (const reason of ["resume", "fork"]) {
     });
   });
 }
+
+// The message this install most needs is not "you have no config": the file is
+// there, it names agents, and a stray comma threw the whole thing away. Saying
+// "no agents are configured" would send its owner off to write what they
+// already wrote, and the table being empty is the only symptom they would
+// otherwise see — the parse error goes to a console line that scrolls past at
+// session start.
+test("an unparseable config file is reported instead of the unconfigured ask", async () => {
+  const fx = await freshFixture();
+  await writeFile(fx.configPath, '{ "agents": {\n  "planner": {,}\n}', "utf8");
+
+  await withExtension(fx, async (h) => {
+    await h.start("startup");
+
+    assert.equal(h.fetchCalls(), 0, "an unusable file is not something to fetch quota for");
+    assert.equal(h.notify.length, 1, "expected exactly one notify");
+    assert.equal(h.notify[0].level, "warning");
+
+    const text = h.notify[0].text;
+    assert.ok(text.includes(fx.configPath), `the notice must name ${fx.configPath}:\n${text}`);
+    assert.ok(text.includes("not valid JSON"), text);
+    assert.ok(text.includes("line 2"), `the line to go to is the point:\n${text}`);
+    assert.ok(!text.includes("no agents are configured"), `the ask is the wrong answer here:\n${text}`);
+    assert.ok(!text.includes('"agents"'), `no paste-ready snippet belongs here:\n${text}`);
+    // The table is empty either way, so the footer is still the unconfigured one:
+    // the notice has said why, and the ask's status is the standing fact.
+    assert.ok(
+      h.statuses.some((s) => s.text !== undefined && s.text.includes("no agents configured")),
+      `expected the unconfigured footer: ${JSON.stringify(h.statuses)}`,
+    );
+  });
+});
+
+// A skipped layer is not the whole config: the routes below it still manage
+// agents, so the only symptom is a route that is quietly not the one the reader
+// wrote. That is the state ADR 0009 raised for a model this pi cannot spawn, and
+// it gets the same notification rather than a console line that scrolls past.
+test("a skipped project layer is reported even though the global one still manages agents", async () => {
+  const fx = await freshFixture({
+    planner: { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } },
+  });
+  await writeFile(join(fx.projectDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), "[1,2]", "utf8");
+
+  await withExtension(fx, async (h) => {
+    await h.start("startup");
+
+    assert.equal(h.notify.length, 1, `expected one notify: ${JSON.stringify(h.notify)}`);
+    assert.equal(h.notify[0].level, "warning");
+
+    const text = h.notify[0].text;
+    assert.ok(text.includes(join(fx.projectDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME)), text);
+    assert.ok(text.includes("config must be a JSON object"), text);
+    assert.ok(!text.includes("no agents are configured"), `this install is configured:\n${text}`);
+  });
+});
+
+// The notification asks for setup, so it obeys the same reasons the ask does: a
+// session resuming work does not want to be interrupted about a file it read
+// yesterday, and there is a report for asking.
+for (const reason of ["resume", "fork"]) {
+  test(`a skipped config file stays silent on ${reason}`, async () => {
+    const fx = await freshFixture();
+    await writeFile(fx.configPath, "{ broken", "utf8");
+
+    await withExtension(fx, async (h) => {
+      await h.start(reason);
+      assert.equal(h.notify.length, 0, `no notify on ${reason}: ${JSON.stringify(h.notify)}`);
+    });
+  });
+}
+
+// The notification is a rendering, so it obeys `hasUI` exactly as the ask does.
+// A parse error is the case where it would be easiest to forget: the fault is
+// reported from a helper of its own, not from the branch that guards the ask.
+test("no notify for a skipped config file when ctx.hasUI is false", async () => {
+  const fx = await freshFixture();
+  await writeFile(fx.configPath, "{ broken", "utf8");
+
+  await withExtension(
+    fx,
+    async (h) => {
+      await h.start("startup");
+      assert.equal(h.notify.length, 0, "no notify without a UI");
+      assert.equal(h.statuses.length, 0, "no status without a UI");
+    },
+    { hasUI: false },
+  );
+});
 
 test("the footer status is set while the table is empty", async () => {
   const fx = await freshFixture();

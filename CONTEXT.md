@@ -104,6 +104,13 @@ model is *known bad* rather than *unknown*, no reading could change the answer,
 and it is dropped from consideration instead of waited on.
 _Avoid_: skip, no-op, hold-off, fall back
 
+**Unusable file**:
+A config file that is there but produced no layer: it is not JSON, it is JSON but
+not an object, or it could not be read. The dispatcher skips it whole. Distinct
+from an *absent* file, which is simply not a layer, and from an unconfigured
+install: the file names routes, and those routes were thrown away.
+_Avoid_: invalid config, bad config, missing file, absent file
+
 **Refresh ping**:
 One throwaway Claude Code process run for a single purpose: to make Claude Code
 refresh its own access token, which is the only thing that can. In its diverted
