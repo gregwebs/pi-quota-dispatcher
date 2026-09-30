@@ -44,7 +44,7 @@ import { existsSync, type Stats } from "node:fs";
 import { open, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { userInfo } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_CONFIG,
@@ -57,6 +57,7 @@ import {
   type ModelDefault,
   type Rail,
   type ThinkingLevel,
+  agentKey,
   agentNameRejection,
   configFilesFor,
   describeConfig,
@@ -77,6 +78,7 @@ export {
   CONFIG_FILE_NAME,
   DEFAULT_CONFIG,
   THINKING_LEVELS,
+  agentKey,
   configFilesFor,
   defaultConfig,
   describeConfig,
@@ -203,17 +205,19 @@ export type Outcome =
  * not a level of "none" but the absence of an opinion — the file's `thinking:`
  * line is then left as it is, whether that is what the user wrote or what an
  * earlier pass wrote.
+ *
+ * A hold carries neither a model nor a file. An agent definition names the file
+ * to write, and a hold writes nothing, so a file on it could only be wrong — the
+ * same argument as for the model.
  */
 export type Decision =
-  | {
-      agent: string;
-      file: string;
+  | (AgentDefinition & {
       kind: "assign";
       model: string;
       thinking?: ThinkingLevel;
       why: string;
-    }
-  | { agent: string; file: string; kind: "hold"; why: string };
+    })
+  | { agent: string; kind: "hold"; why: string };
 
 // ---------------------------------------------------------------- parsing
 
@@ -406,11 +410,12 @@ function isInside(dir: string, file: string): boolean {
  * moved off in the same pass.
  *
  * Containment is checked here even though the config seam validates names:
- * `decide` is handed a `DispatcherConfig` that need not have come through
- * `mergeConfig`, so the name is not trusted. This path check is the guarantee
- * that a write lands inside `agentDir`; the regex upstream only makes a name
- * conventional. A name that resolves outside holds rather than assigning,
- * because a hold writes nothing and the file stays as the user left it.
+ * `decide` is handed a hand-built `AgentDefinition` and a `DispatcherConfig`
+ * that need not have come through `mergeConfig`, so `definition.file` is not
+ * trusted. The seam only guarantees that a name is a single path segment; this
+ * path check is the guarantee that a write lands inside `agentDir`. A
+ * definition that resolves outside holds rather than assigning, because a hold
+ * writes nothing and the file stays as the user left it.
  *
  * `droppedAlternates` is the one fact `route` cannot carry: boot may have
  * removed alternates this pi cannot spawn, and the route it handed over is
@@ -418,17 +423,16 @@ function isInside(dir: string, file: string): boolean {
  * nothing was dropped, so an empty `alternates` is the user's own `[]`.
  */
 export function decide(
-  agent: string,
+  definition: AgentDefinition,
   route: AgentRoute,
   rails: Map<Rail, RailState>,
   cfg: DispatcherConfig,
   droppedAlternates: readonly DroppedAlternate[] = [],
 ): Decision {
-  const file = join(cfg.agentDir, `${agent}.md`);
+  const { agent, file } = definition;
   if (!isInside(cfg.agentDir, file)) {
     return {
       agent,
-      file,
       kind: "hold",
       why: `"${agent}" resolves outside the agents directory (${file}) — holding`,
     };
@@ -464,7 +468,6 @@ export function decide(
   if (!primary || !primary.ok) {
     return {
       agent,
-      file,
       kind: "hold",
       why: `${route.primary.rail} unreadable (${primary?.note ?? "unknown"}) — holding`,
     };
@@ -478,7 +481,6 @@ export function decide(
   if (primaryAbsent.length) {
     return {
       agent,
-      file,
       kind: "hold",
       why: `${primary.rail} did not report its ${primaryAbsent.join(" and ")} budget (${budgetSummary(primary)}) — holding`,
     };
@@ -575,7 +577,6 @@ export function decide(
       if (missing.length) {
         return {
           agent,
-          file,
           kind: "hold",
           why: withNotes(
             `an unreadable candidate could have won before ${winner.model} on ${winner.rail} — holding`,
@@ -598,7 +599,6 @@ export function decide(
     if (missing.length) {
       return {
         agent,
-        file,
         kind: "hold",
         why: withNotes(
           `an unreadable candidate could have won on ${budget} (${primary.rail} ${pct(used)} >= ${pct(threshold)}) — holding`,
@@ -656,17 +656,31 @@ function pinnedWhy(droppedAlternates: readonly DroppedAlternate[]): string {
  *
  * Pure, and a decision like any other, so the report and the `apply` output
  * render it without a special case: `agent -> (left as is)  [held]  (...)`.
+ *
+ * The pair travels as a record because two bare strings in a row — an agent and
+ * a model — are the same type in the same position, so a swapped call site
+ * compiles and reports a model by an agent's name.
  */
-export function heldDecision(agent: string, cfg: DispatcherConfig, model: string): Decision {
+export function heldDecision(held: { agent: string; model: string }): Decision {
   return {
-    agent,
-    file: join(cfg.agentDir, `${agent}.md`),
+    agent: held.agent,
     kind: "hold",
     // The primary's own key, so the reader gets the line to edit rather than
     // having to work out which of the agent's candidates this is. The wording is
     // the model check's, shared with the note a dropped alternate earns.
-    why: `${unknownModelNote(`agents.${agent}.primary.model`, model)}; holding`,
+    why: `${unknownModelNote(`${agentKey(held.agent)}.primary.model`, held.model)}; holding`,
   };
+}
+
+/**
+ * The hold for a contested name: two or more files claim it, so pi spawns
+ * whichever it loads last and writing either would be a guess about which one
+ * that is. A `held` outcome writes nothing, which is exactly right when there is
+ * no one file to write. The note is the boot warning's, so the reader meets one
+ * sentence for one fact however they arrive at it.
+ */
+export function contestedDecision(contest: ContestedAgent): Decision {
+  return { agent: contest.agent, kind: "hold", why: `${contestedNote(contest)} — holding` };
 }
 
 // ---------------------------------------------------------------- frontmatter
@@ -844,26 +858,33 @@ export function upsertThinking(src: string, thinking: ThinkingLevel | undefined)
   return src;
 }
 
-/**
- * One `<agentDir>/<name>.md` file found on disk, with the model its frontmatter
- * currently declares.
- *
- * `model` is the value of the uncommented `model:` line, decoded — the same
- * value `upsertModel` compares against — and is absent when the file has no
- * usable frontmatter or declares no model. A file is listed without one all the
- * same: the ask names every file it found, including the ones it could not build
- * a candidate from.
- */
-export interface AgentFile {
+/** One `.md` file in the agent dir. */
+export type AgentFile = NamedAgentFile | ScopedNameFile;
+
+/** A file pi registers an agent for, named as pi names it (see `AgentFile.name`). */
+export interface NamedAgentFile {
+  kind: "agent";
+  /** The pi-visible name: declared `name:` trimmed when non-empty, else the filename stem. */
   name: string;
+  /** Absolute path, `<agentDir>/<filename>`. */
   file: string;
   model?: string;
-  /**
-   * The file is there but its frontmatter could not be read. Distinct from a
-   * file that declares no model: one is a fact about the file, the other is a
-   * fact about us, and the listing says which.
-   */
+  /** The file is there but its frontmatter could not be read; it names no agent either. */
   unreadable?: boolean;
+}
+
+/**
+ * A file pi registers no agent for, because its declared `name:` contains `:`,
+ * which the subagents plugin reserves for its own scoped ids — it skips such a
+ * file whole. Still listed, and it can still occupy the path a route's file
+ * would be created at, but it names no agent, contests none, and no route can
+ * target it.
+ */
+export interface ScopedNameFile {
+  kind: "scoped";
+  /** The declared name, as pi read it. */
+  declared: string;
+  file: string;
 }
 
 /**
@@ -886,8 +907,35 @@ async function readPrefix(file: string): Promise<string> {
   }
 }
 
+/** The uncommented `name:` line, capturing everything after the colon. */
+const NAME_LINE = /^name:[ \t]*(.*?)[ \t]*$/m;
+
 /**
- * Every agent definition in `agentDir`, sorted by name.
+ * The pi-visible name an agent file declares, or `undefined` when it declares
+ * none.
+ *
+ * `decodeScalar` strips a trailing comment and one layer of quotes, and the
+ * trim that follows it is pi-subagents' own: `name: "  Plan  "` is the agent
+ * `Plan`, and a route keyed `Plan` has to reach it. A value that is empty or
+ * only whitespace declares nothing, so the caller falls back to the stem, the
+ * way `declared || filenameType` does in the plugin.
+ */
+function declaredName(head: string): string | undefined {
+  const match = NAME_LINE.exec(head);
+  return match ? decodeScalar(match[1]).trim() : undefined;
+}
+
+/**
+ * Every agent file in `agentDir`, sorted by filename.
+ *
+ * The name is the pi-visible one (see `AgentFile`), so a route keyed by a
+ * declared name reaches the file that declares it. A declared name containing
+ * `:` is pi's one refusal — it reserves that for plugin-scoped ids — so such a
+ * file names no agent, is not proposed, and no route can target it; it is still
+ * listed, because it is a file in the dir and can occupy the path a route's
+ * file would be created at. The sort is by filename and not by name because two
+ * files can claim one name, and a stable, order-independent list is what keeps
+ * every report of that state the same whichever way `readdir` ordered them.
  *
  * A directory that is not there reads as no files: on a fresh install it usually
  * is not there yet, and that is the state the ask is for. Reading never throws,
@@ -901,17 +949,17 @@ async function readPrefix(file: string): Promise<string> {
  * a regular file is not an agent definition and is skipped.
  */
 export async function readAgentFiles(agentDir: string): Promise<AgentFile[]> {
-  let names: string[];
+  let entries: string[];
   try {
-    names = await readdir(agentDir);
+    entries = await readdir(agentDir);
   } catch {
     return [];
   }
 
   const files: AgentFile[] = [];
-  for (const name of names) {
-    if (!name.endsWith(".md")) continue;
-    const file = join(agentDir, name);
+  for (const entry of entries) {
+    if (!entry.endsWith(".md")) continue;
+    const file = join(agentDir, entry);
 
     let info: Stats;
     try {
@@ -922,18 +970,184 @@ export async function readAgentFiles(agentDir: string): Promise<AgentFile[]> {
     }
     if (!info.isFile()) continue;
 
-    const entry: AgentFile = { name: name.slice(0, -".md".length), file };
+    let name = entry.slice(0, -".md".length);
+    let model: string | undefined;
+    let unreadable = false;
     try {
       const head = frontmatter(await readPrefix(file));
-      const model = head === undefined ? undefined : activeModel(head);
-      if (model !== undefined) entry.model = model;
+      if (head !== undefined) {
+        const declared = declaredName(head);
+        // pi refuses a declared `:` and skips the file whole, so it names no
+        // agent — but the file is still there, and it can still occupy the path
+        // another route's file would be created at, so it is listed as the file
+        // it is.
+        if (declared?.includes(":")) {
+          files.push({ kind: "scoped", declared, file });
+          continue;
+        }
+        if (declared) name = declared;
+        model = activeModel(head);
+      }
     } catch {
-      entry.unreadable = true;
+      unreadable = true;
     }
-    files.push(entry);
+    files.push({
+      kind: "agent",
+      name,
+      file,
+      ...(model !== undefined ? { model } : {}),
+      ...(unreadable ? { unreadable } : {}),
+    });
   }
 
-  return files.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return files.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+}
+
+/** An agent as pi spawns it: its name, and the file a write for it lands in. */
+export interface AgentDefinition {
+  /** The pi-visible name, which is also the route key. */
+  agent: string;
+  /**
+   * The `.md` file a write for this agent lands in — for a `missing`
+   * resolution, the path `/agents` would create, which is never written.
+   */
+  file: string;
+}
+
+/** The agent dir as read once, for one pass or one boot. */
+export interface AgentDirectory {
+  /** The agent dir itself (`cfg.agentDir`). */
+  dir: string;
+  /** `readAgentFiles(dir)`. */
+  files: readonly AgentFile[];
+}
+
+/** The one read of the agent dir a pass or a boot needs. */
+export async function readAgentDirectory(dir: string): Promise<AgentDirectory> {
+  return { dir, files: await readAgentFiles(dir) };
+}
+
+/** More than one readable file claims the same name. */
+export interface ContestedAgent {
+  kind: "contested";
+  agent: string;
+  /** Every readable file whose `name` is `agent`, in filename order; always ≥ 2. */
+  files: readonly AgentFile[];
+}
+
+export type AgentResolution =
+  /** Exactly one readable file claims the name: a route for it writes that file. */
+  | { kind: "defined"; definition: AgentDefinition }
+  /**
+   * No readable file claims the name. `definition.file` is
+   * `join(dir, `${agent}.md`)`, the path `/agents` would create. It is never
+   * written. `occupant` is the `AgentFile` already at that exact path, if any:
+   * a file that is some other agent, a scoped file, or an unreadable one.
+   */
+  | { kind: "missing"; definition: AgentDefinition; occupant?: AgentFile }
+  | ContestedAgent;
+
+/**
+ * Resolve a route key against the dir. Pure and sync.
+ *
+ * Only a readable file that names an agent can define or contest a name: a
+ * scoped file names no agent, and an unreadable file could name anything — pi
+ * cannot read it either — so neither can be the agent a route reaches. Both can
+ * still be the `occupant` of the path `/agents` would create, which is why the
+ * occupant lookup asks for a file at that exact path whatever kind it is.
+ * Matching is exact and case-sensitive: the name is the one pi spawns, and pi
+ * does not fold case for us.
+ */
+export function resolveAgent(directory: AgentDirectory, agent: string): AgentResolution {
+  const claimants = directory.files.filter(
+    (file): file is NamedAgentFile =>
+      file.kind === "agent" && !file.unreadable && file.name === agent,
+  );
+  if (claimants.length === 1) {
+    return { kind: "defined", definition: { agent, file: claimants[0].file } };
+  }
+  // `directory.files` is in filename order, so the claimants are too, and the
+  // outcome does not depend on which way `readdir` listed them.
+  if (claimants.length > 1) return { kind: "contested", agent, files: claimants };
+  const file = join(directory.dir, `${agent}.md`);
+  const occupant = directory.files.find((candidate) => candidate.file === file);
+  return { kind: "missing", definition: { agent, file }, ...(occupant ? { occupant } : {}) };
+}
+
+/** One sentence for a contested name, shared by the boot warning and the `held` line. */
+function contestedNote(contest: ContestedAgent): string {
+  const claimants = contest.files.map((file) => basename(file.file)).join(", ");
+  return `${contest.files.length} agent files claim the name "${contest.agent}" (${claimants}) and pi spawns whichever it loads last`;
+}
+
+/**
+ * What to say about the file already sitting at the path `/agents` would
+ * create, and what to do about it.
+ *
+ * The remedy has to change with the occupant. `/agents` creates
+ * `<agentDir>/<name>.md` and offers to overwrite what is there, so telling
+ * someone to run it at an occupied path is telling them to destroy the file
+ * this same line just named.
+ */
+function occupantNote(occupant: AgentFile | undefined): { why: string; remedy: string } {
+  if (occupant === undefined) {
+    return { why: "", remedy: "run the /agents command to create a new agent" };
+  }
+  switch (occupant.kind) {
+    case "scoped":
+      return {
+        why: ` (the file there is not an agent: its declared name "${occupant.declared}" is scoped)`,
+        remedy: "give that file a name pi registers, or drop this route",
+      };
+    case "agent":
+      if (occupant.unreadable) {
+        return {
+          why: " (the file there could not be read)",
+          remedy: "make that file readable, or remove it",
+        };
+      }
+      return {
+        why: ` (the file there is agent "${occupant.name}")`,
+        remedy: "name the route after that agent, or rename that file",
+      };
+  }
+}
+
+/**
+ * The boot check: one warning per configured agent that resolves `missing` or
+ * `contested`, in sorted name order, and nothing for `defined`.
+ *
+ * Beside `checkModels`, and for the same reason: the question needs something
+ * `config.ts` cannot know — the agent files, whose frontmatter parser lives in
+ * this module — so it is asked once at boot and its lines join
+ * `loaded.warnings`, which is what feeds the log, the report's warning tail and
+ * `describeConfig`. A throwing sink is swallowed, as in `checkModels`.
+ */
+export function checkAgentFiles(
+  config: DispatcherConfig,
+  directory: AgentDirectory,
+  warn: (message: string) => void = console.error,
+): string[] {
+  const warnings: string[] = [];
+  for (const agent of Object.keys(config.agents).sort()) {
+    const resolution = resolveAgent(directory, agent);
+    let line: string;
+    if (resolution.kind === "contested") {
+      line = `${directory.dir}: configured agent "${agent}" is contested: ${contestedNote(resolution)} — give each file its own name`;
+    } else if (resolution.kind === "missing") {
+      const { why, remedy } = occupantNote(resolution.occupant);
+      line = `${resolution.definition.file}: configured agent "${agent}" has no file${why} — ${remedy}`;
+    } else {
+      continue;
+    }
+    warnings.push(line);
+    try {
+      warn(line);
+    } catch {
+      // Warning sinks are callers' code; a throwing one must not sink a boot.
+    }
+  }
+  return warnings;
 }
 
 /**
@@ -941,14 +1155,24 @@ export async function readAgentFiles(agentDir: string): Promise<AgentFile[]> {
  *
  * Shared by the snippet and the check for whether there is anything to paste, so
  * the two cannot disagree about what counts as derivable. A file is left out —
- * not guessed at — when it declares no model, when its prefix names a rail we do
- * not know, or when the config seam would reject its name; every one of those
- * would produce a table that warns the moment it is pasted.
+ * not guessed at — when it names no agent (a scoped file, which no route can
+ * target), when a second readable file claims its name, when it declares no
+ * model, when its prefix names a rail we do not know, or when the config seam
+ * would reject its name. Every one of those would produce a table that warns the
+ * moment it was pasted: a contested name would be held, not dispatched.
  */
 function derivableCandidates(files: AgentFile[]): Array<[string, Candidate]> {
+  const claims = new Map<string, number>();
+  for (const file of files) {
+    if (file.kind !== "agent" || file.unreadable) continue;
+    claims.set(file.name, (claims.get(file.name) ?? 0) + 1);
+  }
+
   const candidates: Array<[string, Candidate]> = [];
   for (const file of files) {
+    if (file.kind !== "agent") continue;
     if (file.model === undefined) continue;
+    if ((claims.get(file.name) ?? 0) > 1) continue;
     if (agentNameRejection(file.name) !== undefined) continue;
     const rail = railFromModel(file.model);
     if (rail === undefined) continue;
@@ -981,13 +1205,27 @@ export function agentTableSnippet(files: AgentFile[]): string[] {
 /**
  * One line per agent file found, with the model it declares, so a reader can
  * see which names exist and which of them are already pinned somewhere.
+ *
+ * The filename leads, because that is the thing to open; when the agent's pi
+ * name differs from the filename stem — a file that declares `name:` — the name
+ * is named as well, otherwise the line would suggest the file's agent is called
+ * something it is not. A file pi registers no agent for says so, because a
+ * reader asking "which of my files does this ignore?" is owed that answer.
  */
 export function describeAgentFiles(files: AgentFile[]): string[] {
-  return files.map((file) =>
-    file.unreadable
-      ? `  ${file.name}.md — unreadable`
-      : `  ${file.name}.md — model: ${file.model ?? "(none)"}`,
-  );
+  return files.map((file) => {
+    const filename = basename(file.file);
+    if (file.kind === "scoped") {
+      return `  ${filename} — not an agent: its declared name "${file.declared}" is scoped`;
+    }
+    const label =
+      file.name === filename.slice(0, -".md".length)
+        ? filename
+        : `${filename} (name: ${file.name})`;
+    return file.unreadable
+      ? `  ${label} — unreadable`
+      : `  ${label} — model: ${file.model ?? "(none)"}`;
+  });
 }
 
 /**
@@ -1015,7 +1253,7 @@ export function unconfiguredNotice(
     // A snippet of `{"agents": {}}` would configure nothing, so say why there
     // is nothing to paste rather than print it.
     lines.push(
-      "None of the agent files below declares a model whose rail can be derived, so there is no snippet to paste yet.",
+      "None of the files below is an agent that declares a model whose rail can be derived, so there is no snippet to paste yet.",
     );
   }
 
@@ -2296,29 +2534,56 @@ export function createDispatcher(
   async function decideAll(
     rails: Map<Rail, RailState>,
     dry: boolean,
+    directory: AgentDirectory,
   ): Promise<Array<{ decision: Decision; outcome: Outcome }>> {
-    const decisions = Object.entries(cfg.agents).map(([agent, route]) =>
-      deps.held && Object.hasOwn(deps.held, agent)
-        ? heldDecision(agent, cfg, deps.held[agent])
-        : decide(agent, route, rails, cfg, deps.droppedAlternates?.[agent] ?? []),
-    );
+    // One directory per pass, shared by the decisions and — in `report` — the
+    // unmanaged list, so the two cannot disagree about which file defines which
+    // agent. Reading per pass rather than once at boot is deliberate: a file
+    // created with `/agents` after the boot warning is picked up on the next
+    // pass, and so is a `name:` edited mid-session.
     return Promise.all(
-      decisions.map(async (decision) => ({
-        decision,
-        // A hold carries no model, so there is nothing to write and the file
-        // is left exactly as the user left it.
-        outcome:
-          decision.kind === "hold"
-            ? ("held" as const)
-            : await applyDecision(decision.file, decision.model, decision.thinking, dry),
-      })),
+      Object.entries(cfg.agents).map(async ([agent, route]) => {
+        const resolution = resolveAgent(directory, agent);
+        // A contested name has no single file to write, and no reading could
+        // change which file that is, so it is answered before the model check.
+        if (resolution.kind === "contested") {
+          return { decision: contestedDecision(resolution), outcome: "held" as const };
+        }
+        if (deps.held && Object.hasOwn(deps.held, agent)) {
+          return {
+            decision: heldDecision({ agent, model: deps.held[agent] }),
+            outcome: "held" as const,
+          };
+        }
+        const decision = decide(
+          resolution.definition,
+          route,
+          rails,
+          cfg,
+          deps.droppedAlternates?.[agent] ?? [],
+        );
+        // A hold writes nothing, whether it came from a reading or from a
+        // definition `decide` refused.
+        if (decision.kind === "hold") return { decision, outcome: "held" as const };
+        // The path `/agents` would create is not the agent's file, so it is
+        // never written: the write is refused here rather than by
+        // `applyDecision` finding no file.
+        if (resolution.kind === "missing") {
+          return { decision, outcome: "skipped (no file)" as const };
+        }
+        return {
+          decision,
+          outcome: await applyDecision(decision.file, decision.model, decision.thinking, dry),
+        };
+      }),
     );
   }
 
   async function evaluate(
     opts: { force?: boolean; dry?: boolean } = {},
   ): Promise<Array<{ decision: Decision; outcome: Outcome }>> {
-    return decideAll(await allRails(opts.force), opts.dry ?? false);
+    const directory = await readAgentDirectory(cfg.agentDir);
+    return decideAll(await allRails(opts.force), opts.dry ?? false, directory);
   }
 
   /**
@@ -2338,6 +2603,10 @@ export function createDispatcher(
    */
   async function report(opts: { force?: boolean } = {}): Promise<string[]> {
     const rails = await allRails(opts.force);
+    // Read before the decisions, and shared with them and with the unmanaged
+    // list below, so the pass makes one read of the agent dir rather than two
+    // that could disagree.
+    const directory = await readAgentDirectory(cfg.agentDir);
     const lines: string[] = [];
     for (const rail of ["claude", "codex", "deepseek"] as Rail[]) {
       const s = rails.get(rail)!;
@@ -2351,7 +2620,7 @@ export function createDispatcher(
         lines.push(`${rail}: ${windows}${s.note === undefined ? "" : ` — ${s.note}`}`);
       }
     }
-    const decisions = await decideAll(rails, true);
+    const decisions = await decideAll(rails, true, directory);
     // No separator without decisions: an unconfigured install has nothing
     // between the rail lines and whatever the caller appends.
     if (decisions.length) lines.push("");
@@ -2362,9 +2631,11 @@ export function createDispatcher(
     // Unlike the startup ask, this form reports unmanaged files whenever there
     // are any. It is the diagnostic, and "which of my files is this ignoring?"
     // is a question a configured install asks too; the ask stays quiet about
-    // them because a configured install deliberately does not manage them.
-    const unmanaged = (await readAgentFiles(cfg.agentDir)).filter(
-      (file) => !Object.hasOwn(cfg.agents, file.name),
+    // them because a configured install deliberately does not manage them. A
+    // scoped file names no agent, so no route can name it and it is always
+    // listed.
+    const unmanaged = directory.files.filter(
+      (file) => file.kind !== "agent" || !Object.hasOwn(cfg.agents, file.name),
     );
     if (unmanaged.length) {
       lines.push(
@@ -2559,32 +2830,39 @@ export default function (pi: ExtensionAPI) {
   /**
    * Boot the extension against a context, once per extension load.
    *
-   * Booting is where the running pi's model registry is consulted:
-   * `checkModels` drops candidates this pi cannot spawn before any decision is
-   * made. Its warnings ride along with the load warnings, so `/quota-dispatch`
-   * prints them whichever form was run, and its `held` record is what makes an
-   * unresolvable primary hold rather than be written.
+   * Booting is where the two checks that need more than the config file run.
+   * `checkModels` consults the running pi's model registry and drops candidates
+   * this pi cannot spawn before any decision is made; `checkAgentFiles` reads
+   * the agent dir and reports every configured agent no single file defines.
+   * Their warnings both ride along with the load warnings, so `/quota-dispatch`
+   * prints them whichever form was run, and the model check's `held` record is
+   * what makes an unresolvable primary hold rather than be written.
    *
    * This is why a boot needs the context, and why the timer reads the cached
    * `boot` rather than starting one of its own: a boot without a registry skips
-   * the check silently, which would pin agents to models this pi cannot spawn.
-   * `session_start` always precedes the first tick, so the cache is warm by
-   * then; a tick before any session is a no-op rather than a ctx-less boot.
+   * the model check silently, which would pin agents to models this pi cannot
+   * spawn. `session_start` always precedes the first tick, so the cache is warm
+   * by then; a tick before any session is a no-op rather than a ctx-less boot.
    */
   let boot:
     | Promise<{ loaded: LoadedConfig; dispatcher: Dispatcher; misses: ModelMiss[] }>
     | undefined;
   const bootOnce = (ctx: ExtensionContext) =>
-    (boot ??= loadedOnce().then((base) => {
+    (boot ??= loadedOnce().then(async (base) => {
+      const directory = await readAgentDirectory(base.config.agentDir);
+      // Both checks join the load warnings, so the log, the report's warning
+      // tail and `describeConfig` carry them: the agent-file check first, in the
+      // place its warning used to sit when `loadConfig` still made it.
+      const agentFileWarnings = checkAgentFiles(base.config, directory);
       const checked = checkModels(base.config, modelLookup(ctx));
       return {
-        // The checked config is the effective one, and the model warnings join
-        // the load warnings; `sources` still describe the config that resulted,
-        // because the check only drops candidates it cannot spawn.
+        // The checked config is the effective one; `sources` still describe the
+        // config that resulted, because the check only drops candidates it
+        // cannot spawn.
         loaded: {
           ...base,
           config: checked.config,
-          warnings: [...base.warnings, ...checked.warnings],
+          warnings: [...base.warnings, ...agentFileWarnings, ...checked.warnings],
         },
         dispatcher: createDispatcher(checked.config, {
           held: checked.held,

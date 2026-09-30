@@ -1327,7 +1327,7 @@ test("a project layer can name an agent, leaving the scalars at their defaults",
       agents: { planner: { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } } },
     }),
   });
-  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {}, fileExists: () => true });
+  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
   assert.deepEqual(loaded.warnings, []);
   assert.equal(loaded.config.sessionSwitchAt, 75);
   assert.deepEqual(Object.keys(loaded.config.agents), ["planner"]);
@@ -1336,29 +1336,17 @@ test("a project layer can name an agent, leaving the scalars at their defaults",
   assert.equal(loaded.sources["agents.planner.primary.model"], "project");
 });
 
-// A configured agent with no file would otherwise silently do nothing: it is
-// reported at load, and it stays configured so a file can be created later.
-test("loadConfig warns about a configured agent whose file is absent and keeps it configured", async () => {
-  const missing = join(AGENT_DIR, "agents", "planner.md");
+// Agent-file diagnostics belong to the boot check, not config-file loading.
+test("loadConfig keeps an absent configured agent without emitting an agent-file warning", async () => {
   const fs = fakeFs({
     [PROJECT_PATH]: JSON.stringify({
       agents: { planner: { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } } },
     }),
   });
-  const loaded = await loadConfig({
-    agentDir: AGENT_DIR,
-    cwd: CWD,
-    readFile: fs.readFile,
-    warn: () => {},
-    fileExists: (path) => path !== missing,
-  });
-  // One line carrying the path to create, the agent it is for, and the command
-  // that creates one: a reader who has just been told a file is missing needs
-  // the remedy, not a diagnostic.
-  const warning = loaded.warnings.find((w) => w.includes(missing));
-  assert.ok(warning, loaded.warnings.join("\n"));
-  assert.ok(warning.includes("planner"), warning);
-  assert.ok(warning.includes("run the /agents command to create a new agent"), warning);
+  const logged: string[] = [];
+  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: (w) => logged.push(w) });
+  assert.deepEqual(loaded.warnings, []);
+  assert.deepEqual(logged, []);
   assert.ok(loaded.config.agents.planner, "the agent stays configured");
   assert.equal(loaded.sources["agents.planner.primary.model"], "project");
 });
@@ -1374,7 +1362,6 @@ test("loadConfig stays silent when a configured agent's file exists", async () =
     cwd: CWD,
     readFile: fs.readFile,
     warn: () => {},
-    fileExists: () => true,
   });
   assert.deepEqual(loaded.warnings, []);
 });
@@ -1512,7 +1499,6 @@ async function loadedWithAgents(): Promise<LoadedConfig> {
     cwd: CWD,
     readFile: fs.readFile,
     warn: () => {},
-    fileExists: () => true,
   });
 }
 
@@ -1911,7 +1897,6 @@ test("the value a rejected override leaves standing keeps its real source in des
     cwd: CWD,
     readFile: fs.readFile,
     warn: () => {},
-    fileExists: () => true,
   });
   assert.equal(loaded.config.agents.planner.primary.model, "claude-bridge/claude-opus-5-6");
   assert.equal(loaded.sources["agents.planner.primary.model"], "global");
@@ -1938,7 +1923,6 @@ test("configFilesFor names each key's layer file, deduped in layer order", async
     cwd: CWD,
     readFile: fs.readFile,
     warn: () => {},
-    fileExists: () => true,
   });
 
   // Each key names the file that wrote it, and a key no layer set names none.
@@ -2203,7 +2187,6 @@ test("describeConfig renders a level only where something states one", async () 
     cwd: CWD,
     readFile: fs.readFile,
     warn: () => {},
-    fileExists: () => true,
   });
 
   const lines = describeConfig(loaded);
@@ -2395,7 +2378,6 @@ test("describeConfig renders a registered rail with the model and per candidate"
     cwd: CWD,
     readFile: fs.readFile,
     warn: () => {},
-    fileExists: () => true,
   });
 
   const lines = describeConfig(loaded);

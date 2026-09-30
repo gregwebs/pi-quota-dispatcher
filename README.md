@@ -110,7 +110,7 @@ shown.
 
 `/quota-dispatch` still works while unconfigured: it prints one line per rail,
 which is the diagnostic you want when the quotas are what you came for. It is
-also where **unmanaged** files are reported — any `<agent dir>/<name>.md` that no
+also where **unmanaged** files are reported — any agent file whose agent no
 route names is listed by the plain and `refresh` forms. The startup ask mentions
 them only while the table is empty; a configured install does not narrate the
 files it deliberately does not manage.
@@ -251,13 +251,21 @@ A fresh install says so and offers a snippet built from the files it found — s
 }
 ```
 
-Each agent is keyed by its **name** — the filename stem, `<agent dir>/<name>.md`
-— and each route gives a `primary` and an `alternates` list. A candidate names a
+Each agent is keyed by its **name** — the name pi spawns it under: the file's
+`name:` when it declares one, otherwise the filename stem (`Plan.md` → `Plan`;
+`plan-work.md` declaring `name: Architect` → `Architect`). A route writes the
+file that defines its agent, wherever that file sits in the agent dir. Each route
+gives a `primary` and an `alternates` list. A candidate names a
 `model`; the `rail` it draws on is registered once for that model under
 `models`, so a route never repeats the account. A candidate may still state its
 own `rail` (which outranks the registration) and a `thinking` level, and a route
 or a model may state a thinking default — see [Model rails](#model-rails) and
 [Thinking levels](#thinking-levels).
+
+An agent name outside letters, digits, `_` and `-` is quoted wherever a
+configured value is named — `agents["v1.2"].primary.model`,
+`agents["v1.2"] = disabled [project]` — so that a dotted key always names
+exactly one agent.
 
 **Precedence: built-in < global < project**, deep-merged per agent. A file only
 has to state what it changes:
@@ -469,9 +477,13 @@ Bad configuration never stops the dispatcher from starting:
   agent stays explicit (`disable: true`).
 - **A skip flag that is not `true` or `false`, or a `null` anywhere** — logged
   and treated as absent, so the previous layer's value stands.
-- **A configured agent with no file** at `<agent dir>/<name>.md` — logged at
-  load, naming the path that has to exist and the `/agents` command that creates
-  one, and the agent stays configured in the meantime.
+- **A configured agent no agent file defines** — logged at boot, naming
+  `<agent dir>/<name>.md`, the path `/agents` would create, and, when a file
+  already sits there, what it is: another agent, a file pi skips as scoped, or
+  one it could not read. Nothing is written for it.
+- **Two agent files claiming one name** — logged at boot, and the agent is
+  **contested**, so it is **held** on every pass until one is renamed: pi spawns
+  whichever it loads last, so writing either would be a guess.
 - **A model id this pi does not know** — a config can outlive the pi that
   validated it: an id renamed upstream, a typo, a config copied from another
   machine. Every configured candidate is resolved at boot against the running
@@ -491,12 +503,14 @@ Bad configuration never stops the dispatcher from starting:
   [0008](docs/adr/0008-dropped-alternates-explained.md) and
   [0009](docs/adr/0009-unknown-models-at-startup.md).
 
-Agent names are filenames (`<agent dir>/<name>.md`), so they must be lowercase
-letters, digits and dashes, starting with a letter (`planner`,
-`code-reviewer`); anything else is ignored. `ttlMs` and `pollMs` must be whole
-milliseconds in Node's timer range (1–2147483647); the switching thresholds and
-`margin` are used-percentages in 0–100. A numeric warning always states the
-range it enforced.
+An agent name is the name pi spawns it under, any case or characters pi accepts
+(`Plan`, `Explore`, `code-reviewer`). It is refused only when it cannot be a
+single filename — empty, `.`, `..`, or containing `/`, `\` or NUL — or when it
+is a built-in object property such as `constructor`. See
+[0012](docs/adr/0012-an-agent-is-named-as-pi-spawns-it.md). `ttlMs` and `pollMs`
+must be whole milliseconds in Node's timer range (1–2147483647); the switching
+thresholds and `margin` are used-percentages in 0–100. A numeric warning always
+states the range it enforced.
 
 Every warning names the file it came from, and the `/quota-dispatch` report ends
 with the same warning lines — the provenance block repeats them — so a config

@@ -10,6 +10,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import extension, {
   type AgentFile,
+  type NamedAgentFile,
   type ConfigFile,
   type ConfigFileFault,
   type ModelMiss,
@@ -33,6 +34,13 @@ const TEMPLATE = (name: string, model: string) =>
 // careless hyphen cannot slip into an assertion.
 const DASH = "\u2014";
 
+// These fixtures define agents; fail rather than silently dropping a scoped result.
+function named(file: AgentFile): NamedAgentFile {
+  assert.equal(file.kind, "agent");
+  if (file.kind !== "agent") assert.fail("expected an agent definition");
+  return file;
+}
+
 // ---------------------------------------------------------------- readAgentFiles
 
 test("readAgentFiles lists only *.md files, sorted, with the active model unquoted", async () => {
@@ -46,12 +54,12 @@ test("readAgentFiles lists only *.md files, sorted, with the active model unquot
   const files = await readAgentFiles(dir);
 
   assert.deepEqual(
-    files.map((f) => f.name),
+    files.map((f) => named(f).name),
     ["alpha", "zulu"],
     "only *.md regular files, sorted by name",
   );
   assert.equal(files[0].file, join(dir, "alpha.md"));
-  assert.equal(files[0].model, "claude-bridge/claude-opus-5-5", "the value is unquoted");
+  assert.equal(named(files[0]).model, "claude-bridge/claude-opus-5-5", "the value is unquoted");
 });
 
 test("readAgentFiles leaves model absent when the file declares none", async () => {
@@ -61,7 +69,7 @@ test("readAgentFiles leaves model absent when the file declares none", async () 
   await writeFile(join(dir, "commented.md"), `---\nname: commented\n# model: "a/b"\n---\n`, "utf8");
 
   const files = await readAgentFiles(dir);
-  const byName = Object.fromEntries(files.map((f) => [f.name, f]));
+  const byName = Object.fromEntries(files.map((f) => [named(f).name, named(f)]));
 
   assert.equal(byName.nomodel.model, undefined);
   assert.equal(byName.commented.model, undefined, "a commented model is not the active one");
@@ -84,7 +92,7 @@ test("readAgentFiles decodes a commented or escaped model to the bare id", async
   );
 
   const files = await readAgentFiles(dir);
-  const byName = Object.fromEntries(files.map((f) => [f.name, f]));
+  const byName = Object.fromEntries(files.map((f) => [named(f).name, named(f)]));
   assert.equal(byName.comment.model, "claude-bridge/claude-opus-5-5");
   assert.equal(byName.escape.model, "openai-codex/gpt-6-sol");
 
@@ -106,7 +114,7 @@ test("readAgentFiles skips a file it cannot read rather than throwing", async ()
 
   const files = await readAgentFiles(dir);
   assert.deepEqual(
-    files.map((f) => f.name),
+    files.map((f) => named(f).name),
     ["ok"],
   );
 });
@@ -131,9 +139,9 @@ test("readAgentFiles skips non-regular files and follows a symlink to one", asyn
   }
 
   const files = await readAgentFiles(dir);
-  assert.deepEqual(files.map((f) => f.name), ["link", "ok", "target"]);
+  assert.deepEqual(files.map((f) => named(f).name), ["target", "ok", "target"]);
   assert.equal(
-    files.find((f) => f.name === "link")?.model,
+    named(files.find((f) => f.file === join(dir, "link.md"))!).model,
     "deepseek/deepseek-flash",
     "a symlink to a regular file is read through",
   );
@@ -154,9 +162,9 @@ test("readAgentFiles lists a present-but-unreadable file and says so", async (t)
   try {
     const files = await readAgentFiles(dir);
     assert.equal(files.length, 1, "an unreadable file is still listed");
-    assert.equal(files[0].name, "secret");
-    assert.equal(files[0].unreadable, true);
-    assert.equal(files[0].model, undefined);
+    assert.equal(named(files[0]).name, "secret");
+    assert.equal(named(files[0]).unreadable, true);
+    assert.equal(named(files[0]).model, undefined);
     assert.deepEqual(describeAgentFiles(files), ["  secret.md — unreadable"]);
   } finally {
     await chmod(secret, 0o600);
@@ -166,14 +174,14 @@ test("readAgentFiles lists a present-but-unreadable file and says so", async (t)
 // ---------------------------------------------------------------- agentTableSnippet
 
 const SNIPPET_FILES: AgentFile[] = [
-  { name: "planner", file: "/a/planner.md", model: "claude-bridge/claude-opus-5-5" },
-  { name: "reviewer", file: "/a/reviewer.md", model: "openai-codex/gpt-6-astra" },
-  { name: "writer", file: "/a/writer.md", model: "anthropic/claude-sonnet" },
-  { name: "rest", file: "/a/rest.md", model: "deepseek/deepseek-flash" },
-  { name: "mystery", file: "/a/mystery.md", model: "mystery/thing" },
-  { name: "blank", file: "/a/blank.md" },
+  { kind: "agent", name: "planner", file: "/a/planner.md", model: "claude-bridge/claude-opus-5-5" },
+  { kind: "agent", name: "reviewer", file: "/a/reviewer.md", model: "openai-codex/gpt-6-astra" },
+  { kind: "agent", name: "writer", file: "/a/writer.md", model: "anthropic/claude-sonnet" },
+  { kind: "agent", name: "rest", file: "/a/rest.md", model: "deepseek/deepseek-flash" },
+  { kind: "agent", name: "mystery", file: "/a/mystery.md", model: "mystery/thing" },
+  { kind: "agent", name: "blank", file: "/a/blank.md" },
   // A name the config would reject: not a safe filename.
-  { name: "Bad_Name", file: "/a/Bad_Name.md", model: "openai-codex/gpt-6-sol" },
+  { kind: "agent", name: "a/b", file: "/a/unsafe.md", model: "openai-codex/gpt-6-sol" },
 ];
 
 test("agentTableSnippet registers each rail once and names only models in the routes", () => {
@@ -199,7 +207,7 @@ test("agentTableSnippet registers each rail once and names only models in the ro
 
 test("agentTableSnippet drops a file with no model, an unknown prefix, or an unusable name", () => {
   const { agents } = JSON.parse(agentTableSnippet(SNIPPET_FILES).join("\n"));
-  for (const excluded of ["mystery", "blank", "Bad_Name"]) {
+  for (const excluded of ["mystery", "blank", "a/b"]) {
     assert.equal(excluded in agents, false, `${excluded} must contribute nothing`);
   }
 });
@@ -208,8 +216,8 @@ test("agentTableSnippet drops a file with no model, an unknown prefix, or an unu
 
 test("describeAgentFiles names each file and the model it declares", () => {
   const files: AgentFile[] = [
-    { name: "planner", file: "/a/planner.md", model: "claude-bridge/claude-opus-5-5" },
-    { name: "blank", file: "/a/blank.md" },
+    { kind: "agent", name: "planner", file: "/a/planner.md", model: "claude-bridge/claude-opus-5-5" },
+    { kind: "agent", name: "blank", file: "/a/blank.md" },
   ];
 
   const lines = describeAgentFiles(files);
@@ -223,8 +231,8 @@ test("describeAgentFiles names each file and the model it declares", () => {
 
 test("unconfiguredNotice names the config file, lists the files, and carries the snippet", () => {
   const files: AgentFile[] = [
-    { name: "planner", file: "/a/planner.md", model: "claude-bridge/claude-opus-5-5" },
-    { name: "reviewer", file: "/a/reviewer.md", model: "openai-codex/gpt-6-astra" },
+    { kind: "agent", name: "planner", file: "/a/planner.md", model: "claude-bridge/claude-opus-5-5" },
+    { kind: "agent", name: "reviewer", file: "/a/reviewer.md", model: "openai-codex/gpt-6-astra" },
   ];
   const configPath = "/a/quota-dispatch.json";
 
@@ -252,8 +260,8 @@ test("unconfiguredNotice still points at the config file when no agent files wer
 // nothing, so the notice must say why there is nothing to paste instead.
 test("unconfiguredNotice gives no snippet when no file can seed one", () => {
   const files: AgentFile[] = [
-    { name: "blank", file: "/a/blank.md" },
-    { name: "mystery", file: "/a/mystery.md", model: "mystery/thing" },
+    { kind: "agent", name: "blank", file: "/a/blank.md" },
+    { kind: "agent", name: "mystery", file: "/a/mystery.md", model: "mystery/thing" },
   ];
 
   const text = unconfiguredNotice("/a/quota-dispatch.json", "/a", files).join("\n");

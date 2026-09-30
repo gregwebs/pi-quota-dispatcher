@@ -6,6 +6,7 @@ import { test } from "node:test";
 
 import {
   type AgentRoute,
+  type AgentDefinition,
   type Candidate,
   type DispatcherConfig,
   type ModelLookup,
@@ -19,6 +20,8 @@ import {
   heldDecision,
   modelLookup,
 } from "../src/index.ts";
+
+const definitionOf = (agent: string, cfg: DispatcherConfig): AgentDefinition => ({ agent, file: join(cfg.agentDir, `${agent}.md`) });
 
 // ---------------------------------------------------------------- helpers
 
@@ -494,11 +497,11 @@ test("the transposed gpt-sol-6 / gpt-astra-6 ids are both reported", () => {
 
 test("heldDecision is a hold that names the unknown model and leaves no model to write", () => {
   const cfg = config({});
-  const d = heldDecision("planner", cfg, "claude-bridge/claude-sol-9");
+  const d = heldDecision({ agent: "planner", model: "claude-bridge/claude-sol-9" });
 
   assert.equal(d.kind, "hold");
+  assert.equal("file" in d, false, "a hold has no file to write");
   assert.equal(d.agent, "planner");
-  assert.equal(d.file, join(cfg.agentDir, "planner.md"));
   assert.equal(
     d.why,
     `agents.planner.primary.model: this pi does not know model claude-bridge/claude-sol-9 ${DASH} a newer pi may; holding`,
@@ -623,6 +626,7 @@ test("a held unknown primary leaves the agent's file byte-for-byte alone even wh
 
   assert.equal(planner.outcome, "held");
   assert.equal(planner.decision.kind, "hold");
+  assert.equal("file" in planner.decision, false, "a hold has no file to write");
   assert.equal(await readFile(path, "utf8"), before, "a held agent's file must not be touched");
   assert.match(before, /^model: "claude-bridge\/claude-opus-5-5"$/m);
 });
@@ -648,7 +652,7 @@ test("a skipped unknown alternate does not hold: the next alternate is assigned"
   assert.deepEqual(checked.held, {}, "a skipped alternate must not hold the agent");
 
   const d = decide(
-    "planner",
+    definitionOf("planner", checked.config),
     checked.config.agents.planner,
     railMap(railState("claude", { session: 90, weekly: 0 }), railState("codex", { session: 10, weekly: 0 })),
     checked.config,
@@ -684,7 +688,7 @@ test("a model-id miss is dropped while an unreadable rail holds — the asymmetr
     "the unknown model is dropped from the route",
   );
   const a = decide(
-    "planner",
+    definitionOf("planner", checkedA.config),
     checkedA.config.agents.planner,
     railMap(tightPrimary, railState("codex", { session: 10, weekly: 0 }), healthyDeepseek),
     checkedA.config,
@@ -705,10 +709,11 @@ test("a model-id miss is dropped while an unreadable rail holds — the asymmetr
   );
   const unreadableCodex: RailState = { rail: "codex", ok: false, windows: [], note: "HTTP 500" };
   const b = decide(
-    "planner",
+    definitionOf("planner", checkedB.config),
     checkedB.config.agents.planner,
     railMap(tightPrimary, unreadableCodex, healthyDeepseek),
     checkedB.config,
   );
   assert.equal(b.kind, "hold", `an unreadable rail must hold, got ${b.kind}: ${b.why}`);
+  assert.equal("file" in b, false, "a hold has no file to write");
 });
