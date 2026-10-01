@@ -27,6 +27,7 @@ import {
   upsertModel,
   upsertThinking,
 } from "../src/index.ts";
+import { startHolder } from "./fixtures/agent-write-child.ts";
 
 const definitionOf = (agent: string, cfg: DispatcherConfig): AgentDefinition => ({ agent, file: join(cfg.agentDir, `${agent}.md`) });
 
@@ -227,7 +228,10 @@ test("applyDecision reports unchanged, and writes nothing, when only the quoting
   const src = `---\nname: agent\nmodel: 'claude-bridge/claude-opus-5-5'\n---\n\nBody.\n`;
   await writeFile(file, src, "utf8");
 
-  assert.equal(await applyDecision(file, "claude-bridge/claude-opus-5-5", undefined, false), "unchanged");
+  assert.deepEqual(
+    await applyDecision({ file, model: "claude-bridge/claude-opus-5-5", base: "claude-bridge/claude-opus-5-5", dry: false }),
+    { kind: "unchanged" },
+  );
   assert.equal(await readFile(file, "utf8"), src, "an unchanged pass must not touch the file");
 });
 
@@ -239,7 +243,10 @@ test("applyDecision leaves a commented model line alone", async () => {
   const src = `---\nname: agent\nmodel: claude-bridge/claude-opus-5-5 # pinned\n---\n\nBody.\n`;
   await writeFile(file, src, "utf8");
 
-  assert.equal(await applyDecision(file, "claude-bridge/claude-opus-5-5", undefined, false), "unchanged");
+  assert.deepEqual(
+    await applyDecision({ file, model: "claude-bridge/claude-opus-5-5", base: "claude-bridge/claude-opus-5-5", dry: false }),
+    { kind: "unchanged" },
+  );
   assert.equal(await readFile(file, "utf8"), src, "a commented line already naming the model must not change");
 });
 
@@ -249,7 +256,10 @@ test("applyDecision reports would-write on a dry run when the model differs", as
   const src = `---\nname: agent\nmodel: "claude-bridge/claude-opus-5-5"\n---\n\nBody.\n`;
   await writeFile(file, src, "utf8");
 
-  assert.equal(await applyDecision(file, "openai-codex/gpt-6-sol", undefined, true), "would-write");
+  assert.deepEqual(
+    await applyDecision({ file, model: "openai-codex/gpt-6-sol", base: "claude-bridge/claude-opus-5-5", dry: true }),
+    { kind: "would-write" },
+  );
   assert.equal(await readFile(file, "utf8"), src);
 });
 
@@ -300,7 +310,10 @@ test("applyDecision writes the model and its level together", async () => {
   const file = join(dir, "agent.md");
   await writeFile(file, `---\nname: agent\nmodel: "a/b"\nthinking: low\n---\n\nBody.\n`, "utf8");
 
-  assert.equal(await applyDecision(file, "openai-codex/gpt-6-sol", "high", false), "written");
+  assert.deepEqual(
+    await applyDecision({ file, model: "openai-codex/gpt-6-sol", thinking: "high", base: "a/b", dry: false }),
+    { kind: "written" },
+  );
   const after = await readFile(file, "utf8");
   assert.match(after, /^model: "openai-codex\/gpt-6-sol"$/m);
   assert.match(after, /^thinking: high$/m);
@@ -313,12 +326,18 @@ test("applyDecision is unchanged when the file already says both", async () => {
   const src = `---\nname: agent\nmodel: "a/b"\nthinking: high\n---\n\nBody.\n`;
   await writeFile(file, src, "utf8");
 
-  assert.equal(await applyDecision(file, "a/b", "high", false), "unchanged");
+  assert.deepEqual(
+    await applyDecision({ file, model: "a/b", thinking: "high", base: "a/b", dry: false }),
+    { kind: "unchanged" },
+  );
   assert.equal(await readFile(file, "utf8"), src);
   // The same pass with no level resolves writes nothing either — including for
   // an agent whose file already states one, which is the whole of the "no
   // restore" contract: the dispatcher has no opinion, so it does not remove it.
-  assert.equal(await applyDecision(file, "a/b", undefined, false), "unchanged");
+  assert.deepEqual(
+    await applyDecision({ file, model: "a/b", base: "a/b", dry: false }),
+    { kind: "unchanged" },
+  );
   assert.equal(await readFile(file, "utf8"), src);
 });
 
@@ -327,12 +346,18 @@ test("a level already in the file survives a pass that resolves none", async () 
   const file = join(dir, "agent.md");
   await writeFile(file, `---\nname: agent\nmodel: "a/b"\n---\n\nBody.\n`, "utf8");
 
-  assert.equal(await applyDecision(file, "a/b", "low", false), "written");
+  assert.deepEqual(
+    await applyDecision({ file, model: "a/b", thinking: "low", base: "a/b", dry: false }),
+    { kind: "written" },
+  );
   assert.match(await readFile(file, "utf8"), /^thinking: low$/m);
   // A pass with no level to resolve changes the model and leaves the line where
   // it was — the one case where the file does not converge on the decision.
   // Deliberate, and documented: only a forward guarantee is made.
-  assert.equal(await applyDecision(file, "c/d", undefined, false), "written");
+  assert.deepEqual(
+    await applyDecision({ file, model: "c/d", base: "a/b", dry: false }),
+    { kind: "written" },
+  );
   const after = await readFile(file, "utf8");
   assert.match(after, /^model: "c\/d"$/m);
   assert.match(after, /^thinking: low$/m);
@@ -343,8 +368,14 @@ test("a level that has to be inserted lands beside the model line", async () => 
   const file = join(dir, "agent.md");
   await writeFile(file, `---\nname: agent\nmodel: "a/b"\ntools: read\n---\n\nBody.\n`, "utf8");
 
-  assert.equal(await applyDecision(file, "c/d", "max", true), "would-write");
-  assert.equal(await applyDecision(file, "c/d", "max", false), "written");
+  assert.deepEqual(
+    await applyDecision({ file, model: "c/d", thinking: "max", base: "a/b", dry: true }),
+    { kind: "would-write" },
+  );
+  assert.deepEqual(
+    await applyDecision({ file, model: "c/d", thinking: "max", base: "a/b", dry: false }),
+    { kind: "written" },
+  );
   const after = await readFile(file, "utf8");
   assert.match(after, /^model: "c\/d"\nthinking: max$/m);
   assert.match(after, /^tools: read$/m);
@@ -1322,6 +1353,53 @@ test("re-evaluation is idempotent and reports unchanged", async () => {
   const d = dispatcherFor(fx, { claude: { session: 90 }, codex: { session: 10 } });
   const results = await d.evaluate({ force: true });
   assert.equal(results.find((r) => r.decision.agent === "planner")!.outcome, "unchanged");
+});
+
+/**
+ * A write a pass cannot make is a hold, and it is reported as every other hold
+ * is. The reason is the interesting part: it has to carry the assignment the
+ * pass declined to write, because "left as is" on its own does not say that
+ * this pass had an answer. The lock is held the way a second pi holds one — by a
+ * second process, on the real file.
+ */
+test("a pass holds, and says why, when another process holds the file's lock", async () => {
+  const fx = await fixture({
+    planner: "claude-bridge/claude-opus-5-5",
+    reviewer: "openai-codex/gpt-6-astra",
+    implementer: "deepseek/deepseek-flash",
+  });
+  const d = createDispatcher(
+    { ...DEFAULT_CONFIG, ...fx, agents: AGENT_ROUTES },
+    {
+      fetchImpl: stubFetch({ claude: { session: 90 }, codex: { session: 10 } }),
+      fileWrite: { waitMs: 40, pollMs: 2 },
+    },
+  );
+  const planner = join(fx.agentDir, "planner.md");
+  const holder = await startHolder(planner);
+  try {
+    const results = await d.evaluate({ force: true });
+    const held = results.find((r) => r.decision.agent === "planner")!;
+    assert.equal(held.outcome, "held");
+    if (held.decision.kind !== "hold") {
+      assert.fail(`expected a hold, got ${JSON.stringify(held.decision)}`);
+    }
+    assert.match(held.decision.why, /another pi process holds this file's lock/);
+    assert.match(held.decision.why, new RegExp(`pid ${holder.pid}`));
+    assert.deepEqual(describeDecisionLines(held.decision, held.outcome), [
+      `planner -> (left as is)  [held]  (${held.decision.why})`,
+    ]);
+
+    // One file's contention is that file's: the others are still evaluated, and
+    // the file that could not be written is exactly as it was.
+    assert.equal(results.find((r) => r.decision.agent === "reviewer")!.outcome, "unchanged");
+    assert.equal(
+      await readFile(planner, "utf8"),
+      TEMPLATE("planner", "claude-bridge/claude-opus-5-5"),
+    );
+  } finally {
+    await holder.release();
+  }
 });
 
 test("a missing agent file is skipped, not created", async () => {

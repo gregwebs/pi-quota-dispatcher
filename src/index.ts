@@ -41,7 +41,7 @@
  */
 import { execFile } from "node:child_process";
 import { existsSync, type Stats } from "node:fs";
-import { open, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { open, readFile, readdir, stat } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { userInfo } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
@@ -115,6 +115,25 @@ export type {
 } from "./config.ts";
 
 import { checkModels, modelLookup, type DroppedAlternate, type ModelMiss, unknownModelNote } from "./models.ts";
+import {
+  type Coordination,
+  type FileWritePacing,
+  errnoIs,
+  replaceFileAtomically,
+  withFileLock,
+} from "./agent-file.ts";
+
+// The coordination module is where a write to a shared agent file is made safe;
+// re-exported here for the same reason as the config and models modules.
+export {
+  ABANDONED_LOCK_MS,
+  DEFAULT_FILE_WRITE,
+  agentFileTarget,
+  lockPathFor,
+  replaceFileAtomically,
+  withFileLock,
+} from "./agent-file.ts";
+export type { Coordination, FileWritePacing, LockAttempt, LockHolder } from "./agent-file.ts";
 
 // The models module is where a config's model ids are resolved against the pi
 // that is running; re-exported here for the same reason as the config module.
@@ -1147,6 +1166,22 @@ export function resolveAgent(directory: AgentDirectory, agent: string): AgentRes
   return { kind: "missing", definition: { agent, file }, ...(occupant ? { occupant } : {}) };
 }
 
+/**
+ * The `model:` a pass read out of `file`, from the one directory read it made.
+ *
+ * This is the write's `base`: the line a decision is allowed to replace. Reading
+ * it from the pass's own listing rather than from the file at write time is what
+ * makes a concurrent assignment detectable at all — a fresh read would already
+ * have the other process's model in it and would look like the state the
+ * decision had always been made against.
+ */
+function passModel(directory: AgentDirectory, file: string): string | undefined {
+  for (const candidate of directory.files) {
+    if (candidate.kind === "agent" && candidate.file === file) return candidate.model;
+  }
+  return undefined;
+}
+
 /** One sentence for a contested name, shared by the boot warning and the `held` line. */
 function contestedNote(contest: ContestedAgent): string {
   const claimants = contest.files.map((file) => basename(file.file)).join(", ");
@@ -1402,25 +1437,146 @@ export function unknownModelsNotice(misses: ModelMiss[], configPaths: string[]):
   ];
 }
 
-export async function applyDecision(
-  file: string,
-  model: string,
-  thinking: ThinkingLevel | undefined,
-  dry: boolean,
-): Promise<Outcome> {
-  if (!existsSync(file)) return "skipped (no file)";
-  const src = await readFile(file, "utf8");
-  const withModel = upsertModel(src, model);
-  if (withModel === null) return "skipped (no frontmatter)";
-  // The model first, so a `thinking:` line that has to be inserted lands beside
-  // the model line rather than beside `name:`. `next` is compared against the
-  // original source, not against `withModel`, so a pass that changed nothing at
-  // all still reports `unchanged` and writes nothing.
-  const next = upsertThinking(withModel, thinking);
-  if (next === src) return "unchanged";
-  if (dry) return "would-write";
-  await writeFile(file, next, "utf8");
-  return "written";
+/**
+ * One agent file's write, as a pass decided it.
+ *
+ * `base` is the `model:` the pass read out of the file when it listed the agent
+ * dir, and it is what makes a conflicting assignment detectable: a write may
+ * only replace the line the decision was made against, so a model that appeared
+ * between the pass's read and the write is somebody else's answer rather than
+ * this pass's to overwrite. It is required rather than optional for that reason
+ * — a caller that has not read the file has not made a decision that can be
+ * checked, and an omitted base would silently turn every write into "overwrite
+ * whatever is there", which is the behaviour this exists to remove.
+ */
+export interface AgentWrite {
+  file: string;
+  model: string;
+  /** The level the pass resolved; absent when nothing stated one. */
+  thinking?: ThinkingLevel;
+  /** The model the pass read out of `file`; `undefined` when it read none. */
+  base: string | undefined;
+  /** Report what a write would do, and write nothing. */
+  dry: boolean;
+}
+
+/** Every outcome a write reaches on its own; the rest is a hold, which needs a reason. */
+export type WriteOutcome = Exclude<Outcome, "held">;
+
+/**
+ * What one coordinated write did, or why it declined to write at all.
+ *
+ * A refusal is a hold and not a failure: the file is left exactly as it was,
+ * which is the vocabulary this extension already uses for "I have no opinion I
+ * can act on". The caller renders `why` into the hold it reports, so a refusal
+ * reads on the report line the same way every other hold does.
+ */
+export type WriteResult = { kind: WriteOutcome } | { kind: "held"; why: string };
+
+export async function applyDecision(write: AgentWrite, coordination: Coordination = {}): Promise<WriteResult> {
+  // Decided first as a dry pass, which writes nothing by construction: this is a
+  // probe, and a probe that can write is how the write below would come to
+  // happen outside the lock it is meant to be inside.
+  //
+  // A pass with nothing to write needs no coordination at all — the file already
+  // says what was decided, which is most passes. The lock exists to serialize
+  // writes, and reading the file is what this extension did before any of this,
+  // so two things follow, both wanted: a poll does not create and delete a lock
+  // file per agent for no write, and an agent dir that cannot hold a new file is
+  // still reportable rather than failing every pass.
+  const read = await applyWrite({ ...write, dry: true });
+  if (write.dry || read.kind !== "would-write") return read;
+
+  // A write is needed, so it is decided again from inside the lock: between the
+  // read above and this one another process may have assigned something, and the
+  // text that gets written has to be composed from the bytes on disk now —
+  // otherwise that process's edit is lost to a write that never saw it.
+  const attempt = await withFileLock(write.file, coordination, (target) =>
+    applyWrite({ ...write, file: target }),
+  );
+  if (attempt.ok) return attempt.value;
+  // The target vanished before the lock could be keyed off it: nothing to write
+  // to, which is the same skip the missing-file pre-check reports rather than a
+  // hold on a file that is not there.
+  if (attempt.reason === "gone") return { kind: "skipped (no file)" };
+  const pid = attempt.holder?.pid;
+  return {
+    kind: "held",
+    why:
+      pid === undefined
+        ? "another pi process holds this file's lock — holding"
+        : `another pi process holds this file's lock (pid ${pid}) — holding`,
+  };
+}
+
+/**
+ * The one place a decision becomes text.
+ *
+ * Shared by the locked real write and the unlocked dry probe on purpose, so the
+ * two cannot disagree about `unchanged` or about the conflict rule and report a
+ * write the real pass then refuses. It works from the bytes on disk at this
+ * moment, which is what lets an edit that landed earlier survive.
+ */
+async function applyWrite(write: AgentWrite): Promise<WriteResult> {
+  let src: string;
+  try {
+    src = await readFile(write.file, "utf8");
+  } catch (err) {
+    if (errnoIs(err, "ENOENT")) return { kind: "skipped (no file)" };
+    throw err;
+  }
+
+  // Everything below works from the same immutable `src`, though `upsertModel`
+  // and `upsertThinking` each parse the frontmatter again themselves. What
+  // matters is that the conflict check reads the *same* text the write was
+  // composed from, or it would be checking a model that is not the one on disk.
+  const head = frontmatter(src);
+  const withModel = upsertModel(src, write.model);
+  if (head === undefined || withModel === null) return { kind: "skipped (no frontmatter)" };
+  const next = upsertThinking(withModel, write.thinking);
+  // `unchanged` is decided against what is on disk now rather than against the
+  // pass's read: two passes that agree converge, and a `model:` line the user
+  // re-quoted to the same value is left alone.
+  if (next === src) return { kind: "unchanged" };
+
+  // Both transformations read the fresh text, so an edit that landed before this
+  // read — a body change, a new key, a `model:` the user re-quoted — survives
+  // byte-for-byte and only the lines the dispatcher owns move. An edit landing
+  // in the instant between this read and the rename is the one thing a
+  // read-modify-write cannot keep; the lock is what keeps another *pass* out of
+  // that instant, which is the part that can be arranged.
+  //
+  // The decision was made against `base`, and the file may have moved since. If
+  // its decoded model is neither what the pass decided against nor what it wants
+  // to write, another process answered first, and overwriting would discard that
+  // answer — so this pass holds and names both models instead.
+  const freshModel = activeModel(head);
+  if (freshModel !== write.base && freshModel !== write.model) {
+    // A file left with no model line at all is the same refusal: the line this
+    // pass was going to replace is gone, and whatever removed it did so under
+    // this pass. It gets its own sentence because `undefined` is not a model,
+    // and a note that names one would send the reader hunting for it.
+    const change =
+      freshModel === undefined
+        ? "another pi process removed the model line from this file mid-pass"
+        : `another pi process wrote "${freshModel}" into this file mid-pass`;
+    return {
+      kind: "held",
+      why: `${change}, so "${write.model}" was not written — holding`,
+    };
+  }
+
+  if (write.dry) return { kind: "would-write" };
+  try {
+    await replaceFileAtomically(write.file, next);
+  } catch (err) {
+    // The file, or its directory, was removed while this pass held the lock:
+    // there is nothing left to land on, which is the same skip a missing file
+    // gets rather than a failure the caller cannot act on.
+    if (errnoIs(err, "ENOENT")) return { kind: "skipped (no file)" };
+    throw err;
+  }
+  return { kind: "written" };
 }
 
 /**
@@ -2335,6 +2491,14 @@ export interface DispatcherDeps {
    * they are a seam here rather than config-file keys — see `QuotaReadPacing`.
    */
   quotaRead?: Partial<QuotaReadPacing>;
+  /**
+   * Timings for the per-file lock a write to a shared agent file takes,
+   * overriding `DEFAULT_FILE_WRITE` field by field. A seam for the same reason
+   * `quotaRead` is one: how long a lock may sit before it is a crash, and how
+   * long a writer waits for one, are facts about the machine and the tests, not
+   * routing preferences, and the numbers only mean anything together.
+   */
+  fileWrite?: Partial<FileWritePacing>;
 }
 
 export interface Dispatcher {
@@ -2358,6 +2522,12 @@ export function createDispatcher(
     attempts: deps.quotaRead?.attempts ?? DEFAULT_QUOTA_READ.attempts,
     backoffMs: deps.quotaRead?.backoffMs ?? DEFAULT_QUOTA_READ.backoffMs,
   };
+  // One coordination per dispatcher, so every write a dispatcher makes takes its
+  // lock on the same clock, and the injected `now` stays the only clock a test
+  // has to know about. The timings are handed over as they were stated — the
+  // module owns their defaults, and merging them here as well would be a second
+  // copy of that rule to keep in step.
+  const fileWrite: Coordination = { pacing: deps.fileWrite, now };
   const cache = new Map<Rail, { at: number; state: RailState }>();
   // A `claudeCredsPath` naming anything but the default file belongs to another
   // profile, whose credential the login keychain never holds — so the fallback
@@ -2644,10 +2814,26 @@ export function createDispatcher(
         if (resolution.kind === "missing") {
           return { decision, outcome: "skipped (no file)" as const };
         }
-        return {
-          decision,
-          outcome: await applyDecision(decision.file, decision.model, decision.thinking, dry),
-        };
+        const written = await applyDecision(
+          {
+            file: decision.file,
+            model: decision.model,
+            thinking: decision.thinking,
+            // The pass's own read of the file, not a fresh one: this is the
+            // line the decision is allowed to replace, and the whole of what
+            // makes another process's assignment mid-pass detectable.
+            base: passModel(directory, decision.file),
+            dry,
+          },
+          fileWrite,
+        );
+        if (written.kind === "held") {
+          // A refused write is a hold, and it is reported as one: the model the
+          // pass wanted rides in the reason, because "left as is" on its own
+          // would not say that this pass had an answer it declined to write.
+          return { decision: { agent, kind: "hold", why: written.why }, outcome: "held" as const };
+        }
+        return { decision, outcome: written.kind };
       }),
     );
   }

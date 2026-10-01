@@ -121,7 +121,9 @@ reported — and when no single file could carry a write: a **contested** name,
 where two or more files claim it. It is also the decision for an agent whose
 **primary** this pi cannot spawn: there the model is *known bad* rather than
 *unknown*, no reading could change the answer, and it is dropped from
-consideration instead of waited on.
+consideration instead of waited on. A pass also holds when the write itself
+cannot be made: a **conflicting assignment**, or a **lock** another process still
+holds.
 _Avoid_: skip, no-op, hold-off, fall back
 
 **Unusable file**:
@@ -130,6 +132,33 @@ not an object, or it could not be read. The dispatcher skips it whole. Distinct
 from an *absent* file, which is simply not a layer, and from an unconfigured
 install: the file names routes, and those routes were thrown away.
 _Avoid_: invalid config, bad config, missing file, absent file
+
+**Lock**:
+The per-file claim a pass holds while it rewrites an agent file, so that two
+cooperating pi processes do not rewrite one agent file at once. Only a pass with
+a write to make takes one: a pass that finds the file already right needs no
+coordination, and reports **unchanged**. Separate from the file being *replaced*
+in one step, which is what keeps a reader — pi's own agent loader included, since
+it takes no locks — from ever seeing a half-written file. A lock is held on the
+**resolved target**, so two names for one file share one claim. A lock left by a
+crashed process is recovered rather than waited on: a holder whose pid is gone is
+taken over at once, and one with no confirmable holder — no pid, another host —
+once it is older than the configured staleness. A holder whose local live pid the
+lock confirms is not taken over by that staleness, whatever its age; the pass
+waits and then **holds**, naming it. Only once such a lock is older than the
+abandoned-release bound — ten minutes, far past the millisecond critical section
+— is it taken over, as an abandoned release rather than active work.
+_Avoid_: mutex, semaphore, claim, lease
+
+**Conflicting assignment**:
+The state of an agent file whose `model:` was changed by another cooperating pass
+while this pass was deciding. The pass **holds** — it does not overwrite an
+answer at least as fresh as its own — and its reason names both models. Detected,
+never resolved: two project overrides that disagree have no principle that makes
+either win, so each writes its own answer on its own poll and the report is where
+the disagreement is visible. Distinct from a *contested* name, where two files
+claim one agent and no single file could carry a write at all.
+_Avoid_: overwrite, race, lost update, merge conflict
 
 **Refresh ping**:
 One throwaway Claude Code process run for a single purpose: to make Claude Code
