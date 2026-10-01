@@ -48,6 +48,26 @@ That is a routing problem, not a compression problem. It is also the kind of
 routing decision that is easy to make deliberately and tedious to make
 repeatedly, which is exactly what automation is for.
 
+## Requires `@tintinweb/pi-subagents`
+
+The files this extension edits are not a pi core concept. The agent dir holding
+`<agent-dir>/agents/*.md`, the `name:`/`model:`/`thinking:` frontmatter read from
+them, and the rule for which name an agent is spawned under all come from
+[`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents) — the
+plugin that reads those files on every spawn, and the one this extension writes
+them for.
+
+Install it alongside this extension:
+
+```bash
+pi install npm:@tintinweb/pi-subagents
+```
+
+Without it there are no agent files and nothing to route. The formats the
+dispatcher depends on are that plugin's, not pi's, so a different subagents
+implementation could read and name its agents differently; see
+ADR [0012](docs/adr/0012-an-agent-is-named-as-pi-spawns-it.md).
+
 ## Install
 
 ```bash
