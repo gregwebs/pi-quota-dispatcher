@@ -101,7 +101,11 @@ _Avoid_: hot, exhausted, blocked, over
 **Switch**:
 Moving an agent off its primary onto one of its alternates, because the primary is
 tight. Applies to the next spawn; work already in flight keeps the model it
-started on.
+started on. On the session budget a switch normally needs an alternate `margin`
+points healthier, but once the primary reaches a configured
+`sessionAlwaysSwitchAt` an alternate only has to be strictly below that same
+threshold — the margin is replaced, not widened, and an alternate at or above it
+is not a destination.
 _Avoid_: failover, migration, rotation
 
 **Contested**:

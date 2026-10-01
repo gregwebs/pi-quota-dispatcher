@@ -1287,3 +1287,127 @@ for (const occupant of ["none", "agent", "scoped", "unreadable"] as const) {
     });
   });
 }
+
+// ---------------------------------------------------------------- #47 end-to-end override
+async function sessionOverrideFixture(project: Record<string, unknown> = {}): Promise<Fixture> {
+  const fx = await fixture(2_147_483_647, { planner: CONFIGURED_AGENTS.planner });
+  await writeFile(join(fx.projectDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), JSON.stringify({
+    sessionSwitchAt: 70, margin: 30, sessionAlwaysSwitchAt: 90, ...project,
+  }));
+  return fx;
+}
+
+test("report and refresh are read-only even when override would switch", async () => {
+  const fx = await sessionOverrideFixture();
+  const before = await readFile(fx.plannerFile);
+  await withExtension(fx, async ({ run }) => {
+    for (const form of ["", "refresh"]) {
+      const text = await run(form);
+      // Assert read-only independently of selection, so a failing selection
+      // cannot conceal a write from the report form.
+      assert.deepEqual(await readFile(fx.plannerFile), before);
+      assertNoProvenance(text);
+      assert.ok(!text.includes("sessionAlwaysSwitchAt ="), text);
+      assert.ok(text.includes("planner -> openai-codex/gpt-6-sol"), text);
+      assert.ok(text.includes("sessionAlwaysSwitchAt"), text);
+    }
+    const text = await run("config");
+    assert.ok(text.split("\n").includes("  sessionAlwaysSwitchAt = 90  [project]"), text);
+    assert.deepEqual(await readFile(fx.plannerFile), before);
+  }, () => stubFetch({ claudeSession: 90, codexSession: 85 }));
+});
+
+test("apply persists the override model while preserving thinking and body", async () => {
+  const fx = await sessionOverrideFixture();
+  const before = await readFile(fx.plannerFile, "utf8");
+  assert.equal(before, TEMPLATE("planner", "claude-bridge/claude-opus-5-5"));
+  await withExtension(fx, async ({ run }) => {
+    const text = await run("apply");
+    const after = await readFile(fx.plannerFile, "utf8");
+    assert.notEqual(after, before, "apply must change the persisted agent definition");
+    assert.equal(after, TEMPLATE("planner", "openai-codex/gpt-6-sol"));
+    assert.match(after, /^model: "openai-codex\/gpt-6-sol"$/m);
+    assert.match(after, /^thinking: high$/m);
+    assert.match(after, /^Body\.$/m);
+    assert.ok(text.includes("[applied]"), text);
+    assert.ok(text.includes("sessionAlwaysSwitchAt"), text);
+  }, () => stubFetch({ claudeSession: 90, codexSession: 85 }));
+});
+
+test("session_start existing evaluation writes override choice", async () => {
+  const fx = await sessionOverrideFixture();
+  await withExtension(fx, async ({ sessionStart }) => {
+    await sessionStart("resume");
+    assert.match(await readFile(fx.plannerFile, "utf8"), /^model: "openai-codex\/gpt-6-sol"$/m);
+  }, () => stubFetch({ claudeSession: 95, codexSession: 89 }));
+});
+
+test("successive evaluations write margin switch return override switch and capped return", async () => {
+  const fx = await sessionOverrideFixture();
+  let readings = { claudeSession: 70, codexSession: 39 };
+  const changingFetch = (async (...args: Parameters<typeof fetch>) => stubFetch(readings)(...args)) as typeof fetch;
+  await withExtension(fx, async ({ run }) => {
+    for (const [primary, alternate, model] of [
+      [70, 39, "openai-codex/gpt-6-sol"],
+      [70, 40, "claude-bridge/claude-opus-5-5"],
+      [90, 85, "openai-codex/gpt-6-sol"],
+      [100, 90, "claude-bridge/claude-opus-5-5"],
+    ] as const) {
+      readings = { claudeSession: primary, codexSession: alternate };
+      const beforeRefresh = await readFile(fx.plannerFile);
+      await run("refresh"); // force fresh stub readings, still never writes
+      assert.deepEqual(await readFile(fx.plannerFile), beforeRefresh);
+      const text = await run("apply");
+      const after = await readFile(fx.plannerFile, "utf8");
+      assert.ok(after.includes(`model: "${model}"`), `${primary}/${alternate}: ${after}`);
+      assert.ok(text.includes("[applied]"), text);
+    }
+  }, () => changingFetch);
+});
+
+test("hold on unreadable primary leaves already-alternate bytes unchanged", async () => {
+  const fx = await sessionOverrideFixture();
+  const original = TEMPLATE("planner", "openai-codex/gpt-6-sol") + "\nPreserve these bytes.\n";
+  await writeFile(fx.plannerFile, original);
+  const before = await readFile(fx.plannerFile);
+  const unreadable = (async (...args: Parameters<typeof fetch>) => {
+    if (String(args[0]).includes("anthropic.com")) throw new Error("fixture unreadable primary");
+    return stubFetch({ codexSession: 85 })(...args);
+  }) as typeof fetch;
+  await withExtension(fx, async ({ run, sessionStart }) => {
+    const text = await run("apply");
+    assert.ok(text.includes("[held]"), text);
+    assert.ok(text.includes("planner -> (left as is)"), text);
+    assert.deepEqual(await readFile(fx.plannerFile), before);
+    await sessionStart("resume");
+    assert.deepEqual(await readFile(fx.plannerFile), before);
+  }, () => unreadable);
+});
+
+test("disabled ordering warning reaches report refresh and config without leaking provenance", async () => {
+  const fx = await sessionOverrideFixture({ sessionSwitchAt: 95 });
+  const globalPath = join(fx.agentDir, CONFIG_FILE_NAME);
+  const data = JSON.parse(await readFile(globalPath, "utf8"));
+  await writeFile(globalPath, JSON.stringify({ ...data, sessionSwitchAt: 70, sessionAlwaysSwitchAt: 90 }));
+  // Project omits the override, inheriting the conflicting global 90.
+  const projectPath = join(fx.projectDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+  await writeFile(projectPath, JSON.stringify({ sessionSwitchAt: 95, margin: 30 }));
+  const before = await readFile(fx.plannerFile);
+  await withExtension(fx, async ({ runAll }) => {
+    for (const form of ["", "refresh", "config"]) {
+      const text = (await runAll(form)).join("\n");
+      assert.deepEqual(await readFile(fx.plannerFile), before);
+      if (form !== "config") {
+        assertNoProvenance(text);
+        assert.ok(!text.includes("sessionAlwaysSwitchAt ="), text);
+        assert.ok(text.includes("planner -> claude-bridge/claude-opus-5-5"), text);
+      } else {
+        assert.ok(text.split("\n").includes("  sessionAlwaysSwitchAt = disabled  [built-in]"), text);
+        assert.ok(text.split("\n").includes("  sessionSwitchAt = 95  [project]"), text);
+      }
+      const warnings = text.split("\n").filter((line) => line.includes("warning:") && line.includes("sessionAlwaysSwitchAt"));
+      assert.equal(warnings.length, 1, text);
+      for (const word of ["sessionSwitchAt", "90", "95", globalPath, projectPath, "disabled"]) assert.ok(warnings[0].includes(word), warnings[0]);
+    }
+  }, () => stubFetch({ claudeSession: 95, codexSession: 85 }));
+});

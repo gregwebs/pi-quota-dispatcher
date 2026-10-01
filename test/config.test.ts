@@ -2450,3 +2450,134 @@ test("a layer that changes only a level does not re-warn a registered mismatch",
   assert.equal(mismatches.length, 1, r.warnings.join("\n"));
   assert.ok(mismatches[0].startsWith("global: "), mismatches[0]);
 });
+
+// ---------------------------------------------------------------- #47 optional session override
+function sessionOverrideLines(r: ReturnType<typeof mergeConfig>): string[] {
+  return describeConfig({ ...r, files: [] }).filter((line) => line.includes("sessionAlwaysSwitchAt ="));
+}
+test("omitted scalar has no effective value or source and reports disabled", () => {
+  const r = mergeConfig(base(), []);
+  assert.equal(r.config.sessionAlwaysSwitchAt, undefined);
+  assert.equal("sessionAlwaysSwitchAt" in r.config, false);
+  assert.equal("sessionAlwaysSwitchAt" in r.sources, false);
+  assert.deepEqual(r.warnings, []);
+  assert.deepEqual(sessionOverrideLines(r), ["  sessionAlwaysSwitchAt = disabled  [built-in]"]);
+});
+for (const value of [0, 70, 90.5, 100]) {
+  test(`valid override scalar ${value} and exact provenance`, () => {
+    const r = mergeConfig(base(), [{ source: "project", data: { sessionSwitchAt: 0, sessionAlwaysSwitchAt: value } }]);
+    assert.equal(r.config.sessionAlwaysSwitchAt, value);
+    assert.equal(r.sources.sessionAlwaysSwitchAt, "project");
+    assert.deepEqual(r.warnings, []);
+    assert.deepEqual(sessionOverrideLines(r), [`  sessionAlwaysSwitchAt = ${value}  [project]`]);
+  });
+}
+for (const [label, value] of [
+  ["string", "90"], ["boolean", true], ["null", null], ["object", {}],
+  ["negative", -0.1], ["above 100", 100.1], ["NaN", NaN], ["Infinity", Infinity], ["-Infinity", -Infinity],
+] as const) {
+  test(`invalid upper scalar ${label} retains valid inherited override`, () => {
+    const r = mergeConfig(base(), [
+      { source: "global", data: { sessionSwitchAt: 70, sessionAlwaysSwitchAt: 90 } },
+      { source: "project", label: "project-file", data: { sessionAlwaysSwitchAt: value } },
+    ]);
+    assert.equal(r.config.sessionAlwaysSwitchAt, 90);
+    assert.equal(r.sources.sessionAlwaysSwitchAt, "global");
+    assert.equal(r.warnings.length, 1);
+    for (const text of ["sessionAlwaysSwitchAt", "[0, 100]", "project-file"]) assert.ok(r.warnings[0].includes(text), r.warnings[0]);
+    assert.deepEqual(sessionOverrideLines(r), ["  sessionAlwaysSwitchAt = 90  [global]"]);
+  });
+}
+test("invalid scalar without lower value remains omitted", () => {
+  const r = mergeConfig(base(), [{ source: "project", data: { sessionAlwaysSwitchAt: "90" } }]);
+  assert.equal(r.config.sessionAlwaysSwitchAt, undefined);
+  assert.equal("sessionAlwaysSwitchAt" in r.sources, false);
+  assert.equal(r.warnings.length, 1);
+  assert.deepEqual(sessionOverrideLines(r), ["  sessionAlwaysSwitchAt = disabled  [built-in]"]);
+});
+test("project override wins and project omission inherits global", () => {
+  for (const [data, value, source] of [[{ sessionAlwaysSwitchAt: 95 }, 95, "project"], [{ margin: 25 }, 90, "global"]] as const) {
+    const r = mergeConfig(base(), [
+      { source: "global", data: { sessionSwitchAt: 70, sessionAlwaysSwitchAt: 90 } },
+      { source: "project", data },
+    ]);
+    assert.equal(r.config.sessionAlwaysSwitchAt, value);
+    assert.equal(r.sources.sessionAlwaysSwitchAt, source);
+    assert.deepEqual(r.warnings, []);
+    assert.deepEqual(sessionOverrideLines(r), [`  sessionAlwaysSwitchAt = ${value}  [${source}]`]);
+  }
+});
+test("final ordering ignores same-object key order including equality", () => {
+  for (const value of [70, 80]) for (const data of [
+    { sessionAlwaysSwitchAt: value, sessionSwitchAt: 70 },
+    { sessionSwitchAt: 70, sessionAlwaysSwitchAt: value },
+  ]) {
+    const r = mergeConfig(base(), [{ source: "project", data }]);
+    assert.equal(r.config.sessionAlwaysSwitchAt, value);
+    assert.deepEqual(r.warnings, []);
+  }
+});
+test("validation waits for later layer to repair temporarily invalid ordering", () => {
+  const r = mergeConfig(base(), [
+    { source: "global", data: { sessionAlwaysSwitchAt: 60 } },
+    { source: "project", data: { sessionSwitchAt: 50 } },
+  ]);
+  assert.equal(r.config.sessionAlwaysSwitchAt, 60);
+  assert.equal(r.sources.sessionAlwaysSwitchAt, "global");
+  assert.deepEqual(r.warnings, []);
+});
+for (const reverse of [false, true]) {
+  test(`invalid same-object ordering disables only override key order ${reverse}`, () => {
+    const data = reverse ? { sessionAlwaysSwitchAt: 60, sessionSwitchAt: 70, margin: 30 }
+      : { sessionSwitchAt: 70, sessionAlwaysSwitchAt: 60, margin: 30 };
+    const r = mergeConfig(base(), [{ source: "project", label: "project-file", data }]);
+    assert.equal(r.config.sessionAlwaysSwitchAt, undefined);
+    assert.equal("sessionAlwaysSwitchAt" in r.sources, false);
+    assert.equal(r.config.sessionSwitchAt, 70);
+    assert.equal(r.sources.sessionSwitchAt, "project");
+    assert.equal(r.config.margin, 30);
+    assert.equal(r.config.weeklySwitchAt, base().weeklySwitchAt);
+    assert.deepEqual(r.config.agents, base().agents);
+    assert.equal(r.warnings.length, 1);
+    for (const text of ["sessionAlwaysSwitchAt", "sessionSwitchAt", "60", "70", "project-file", "disabled"]) assert.ok(r.warnings[0].includes(text), r.warnings[0]);
+    assert.deepEqual(sessionOverrideLines(r), ["  sessionAlwaysSwitchAt = disabled  [built-in]"]);
+  });
+}
+test("inherited global 90 below project normal 95 disables override with both file labels", async () => {
+  const fs = fakeFs({
+    [GLOBAL_PATH]: JSON.stringify({ sessionSwitchAt: 70, sessionAlwaysSwitchAt: 90, margin: 30 }),
+    [PROJECT_PATH]: JSON.stringify({ sessionSwitchAt: 95 }),
+  });
+  const r = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
+  assert.equal(r.config.sessionAlwaysSwitchAt, undefined);
+  assert.equal("sessionAlwaysSwitchAt" in r.sources, false);
+  assert.equal(r.config.sessionSwitchAt, 95);
+  assert.equal(r.sources.sessionSwitchAt, "project");
+  assert.equal(r.config.margin, 30);
+  assert.equal(r.sources.margin, "global");
+  assert.equal(r.warnings.length, 1);
+  for (const text of ["sessionAlwaysSwitchAt", "sessionSwitchAt", "90", "95", GLOBAL_PATH, PROJECT_PATH, "disabled"]) assert.ok(r.warnings[0].includes(text), r.warnings[0]);
+  const lines = describeConfig(r);
+  assert.ok(lines.includes("  sessionSwitchAt = 95  [project]"));
+  assert.deepEqual(lines.filter((line) => line.includes("sessionAlwaysSwitchAt =")), ["  sessionAlwaysSwitchAt = disabled  [built-in]"]);
+  assert.ok(lines.some((line) => line.includes("warning:") && line.includes("disabled")));
+});
+test("ordering conflict with built-in normal names built-in label", () => {
+  const r = mergeConfig(base(), [{ source: "global", label: "global-file", data: { sessionAlwaysSwitchAt: 60 } }]);
+  assert.equal(r.config.sessionAlwaysSwitchAt, undefined);
+  assert.equal(r.warnings.length, 1);
+  for (const text of ["60", "75", "built-in", "global-file", "disabled"]) assert.ok(r.warnings[0].includes(text), r.warnings[0]);
+});
+test("loadConfig applies project override with exact active provenance", async () => {
+  const fs = fakeFs({
+    [GLOBAL_PATH]: JSON.stringify({ sessionSwitchAt: 70, sessionAlwaysSwitchAt: 90 }),
+    [PROJECT_PATH]: JSON.stringify({ sessionAlwaysSwitchAt: 95 }),
+  });
+  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
+  assert.equal(loaded.config.sessionAlwaysSwitchAt, 95);
+  assert.equal(loaded.sources.sessionAlwaysSwitchAt, "project");
+  assert.equal(loaded.config.sessionSwitchAt, 70);
+  assert.equal(loaded.sources.sessionSwitchAt, "global");
+  assert.deepEqual(loaded.warnings, []);
+  assert.ok(describeConfig(loaded).includes("  sessionAlwaysSwitchAt = 95  [project]"));
+});

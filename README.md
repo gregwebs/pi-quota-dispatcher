@@ -448,6 +448,7 @@ for a one-element list.
 | `sessionSwitchAt` | `75` | Used-percent at which the primary's **session** budget is considered tight |
 | `weeklySwitchAt` | `90` | The same for its **weekly** budget, deliberately higher — see [the policy](#the-policy) |
 | `margin` | `10` | An alternate must be **more than** this many points healthier, on the budget that triggered the move |
+| `sessionAlwaysSwitchAt` | unset — off | At or above it the primary's **session** margin is set aside and the first alternate, **in the order you listed**, whose session budget is strictly below it is chosen. Must be at least `sessionSwitchAt`; 0–100, fractional allowed. An invalid ordering in the final merged config warns and disables this override alone. |
 | `ttlMs` | `180000` | How long a quota reading is reused |
 | `pollMs` | `300000` | How often to re-evaluate while a session is open |
 | `claudeRefresh` | `off` | Whether an expired Claude token is refreshed by running Claude Code once — see [Keeping the Claude token fresh](#keeping-the-claude-token-fresh) |
@@ -497,6 +498,12 @@ Bad configuration never stops the dispatcher from starting:
   agent stays explicit (`disable: true`).
 - **A skip flag that is not `true` or `false`, or a `null` anywhere** — logged
   and treated as absent, so the previous layer's value stands.
+- **A final `sessionAlwaysSwitchAt` below the effective `sessionSwitchAt`** —
+  logged once, naming both values and both supplying layers, and it disables
+  only the override: `sessionSwitchAt` and every other value are untouched and
+  the normal margin policy keeps running. It is a whole-config relationship
+  rather than a per-layer mistake — a project `sessionSwitchAt` can overtake a
+  global `sessionAlwaysSwitchAt`, and neither layer was wrong on its own.
 - **A configured agent no agent file defines** — logged at boot, naming
   `<agent dir>/<name>.md`, the path `/agents` would create, and, when a file
   already sits there, what it is: another agent, a file pi skips as scoped, or
@@ -529,8 +536,8 @@ single filename — empty, `.`, `..`, or containing `/`, `\` or NUL — or when 
 is a built-in object property such as `constructor`. See
 [0012](docs/adr/0012-an-agent-is-named-as-pi-spawns-it.md). `ttlMs` and `pollMs`
 must be whole milliseconds in Node's timer range (1–2147483647); the switching
-thresholds and `margin` are used-percentages in 0–100. A numeric warning always
-states the range it enforced.
+thresholds, `margin` and `sessionAlwaysSwitchAt` are used-percentages in 0–100. A
+numeric warning always states the range it enforced.
 
 Every warning names the file it came from, and the `/quota-dispatch` report ends
 with the same warning lines — the provenance block repeats them — so a config
@@ -566,7 +573,17 @@ are weighed separately:
 1. **Session first.** If the primary's session budget is at or above
    `sessionSwitchAt`, the alternates are walked **in the order you listed them**
    and the first one whose session budget is more than `margin` points healthier
-   wins.
+   wins. When `sessionAlwaysSwitchAt` is configured and the primary's session
+   budget has also reached it, that margin is set aside for the rest of the
+   walk: an alternate is eligible as soon as its session budget is **strictly
+   below** `sessionAlwaysSwitchAt`, and one at or above it is refused whatever
+   the margin would have said. The override activates at exactly the threshold —
+   inclusive on the primary, exclusive on the destination — and it *replaces*
+   the margin rather than widening it, so it never lands work on a rail already
+   under the same pressure. It stays a priority walk, not a healthiest-rail
+   rule. It reaches the session budget only: the weekly pass, the destination's
+   other-budget guard and every hold still apply, and when no alternate
+   qualifies the primary is preferred again.
 2. **Weekly is a backstop.** If the session walk did not switch, the same walk
    runs on the weekly budget under its own `weeklySwitchAt`. Each comparison is
    like with like — session against the alternate's session, weekly against its
@@ -610,6 +627,28 @@ are weighed separately:
    other kind: a rail that was asked twice and given up on. Both hold — the
    reading is missing either way — but a hold that says which one it was is
    explainable rather than looking like a refusal.
+
+Worked through with `sessionSwitchAt: 70`, `margin: 30` and
+`sessionAlwaysSwitchAt: 90`, one alternate, both rails readable:
+
+| Primary session | Alternate session | Selected | Why |
+| ---: | ---: | --- | --- |
+| 69 | 0 | Primary | below the normal threshold — no switch considered |
+| 70 | 39 | Alternate | gap strictly greater than `margin` |
+| 70 | 40 | Primary | gap exactly `margin` does not qualify |
+| 70 | 50 | Primary | alternate within `margin` |
+| 89 | 85 | Primary | override not yet active; gap insufficient |
+| 90 | 85 | Alternate | override active; the margin is ignored |
+| 95 | 89 | Alternate | alternate strictly below the override threshold |
+| 95 | 90 | Primary | alternate has reached the override threshold |
+| 100 | 90 | Primary | both at or above it; primary preference restored |
+
+With two alternates, **order** decides rather than headroom. Primary 95 / first
+92 / second 85: the first is at or above the threshold, so it is skipped and the
+second is chosen. Primary 95 / first 89 / second 20: the first is strictly below
+the threshold, so it wins and the healthier second is never consulted — priority
+order is the intent the numbers cannot express, see
+[0002](docs/adr/0002-removal-and-alternates.md).
 
 A model this pi cannot spawn is the opposite case: it is *known bad*, not a
 missing reading, so it is dropped from consideration — a primary that cannot be
@@ -784,7 +823,10 @@ the alternatives that were rejected.
   against each other only, with no memory of what an agent is currently assigned
   to. So when a budget hovers around its threshold — primary session at 90,
   alternate oscillating either side of 80 — an agent can alternate between rails
-  on successive polls. Making the policy stateful is a known open improvement.
+  on successive polls. `sessionAlwaysSwitchAt` does not change that: it is a
+  second threshold evaluated on the same comparison, not a second force with
+  memory, so a reading oscillating around it can flap the switch just as one
+  around the margin can. Making the policy stateful is a known open improvement.
 - **A stalled endpoint delays session start, but only briefly.** Each quota read
   is abandoned after 5s and retried once after 250ms, so a vendor that has gone
   quiet costs a session about 10s — a few seconds more on macOS, where a Claude
