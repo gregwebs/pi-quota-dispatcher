@@ -1721,3 +1721,115 @@ test("a body that stalls mid-stream is abandoned by the same deadline", async ()
   assert.equal(state.note, "no answer within 20ms after 2 attempts");
   assert.equal(calls.length, 2);
 });
+
+// ---------------------------------------------------------------- #47 session override
+const sessionOverrideConfig: DispatcherConfig = { ...cfg, sessionSwitchAt: 70, margin: 30, sessionAlwaysSwitchAt: 90 };
+const sessionPrimaryModel = AGENT_ROUTES.planner.primary.model;
+const sessionAlternateModel = AGENT_ROUTES.planner.alternates[0].model;
+function sessionOverrideDecision(primary: Readings, first: Readings, second?: Readings, config = sessionOverrideConfig): Decision {
+  return decide(definitionOf("planner", config), second ? MULTI : AGENT_ROUTES.planner,
+    railMap(railState("claude", primary), railState("codex", first),
+      ...(second ? [railState("deepseek", second)] : [])), config);
+}
+
+for (const [p, a, expected] of [
+  [69, 0, sessionPrimaryModel], [70, 39, sessionAlternateModel], [70, 40, sessionPrimaryModel],
+  [70, 50, sessionPrimaryModel], [89, 85, sessionPrimaryModel], [90, 85, sessionAlternateModel],
+  [95, 89, sessionAlternateModel], [95, 90, sessionPrimaryModel], [100, 90, sessionPrimaryModel],
+] as const) {
+  test(`session override selects ${expected === sessionPrimaryModel ? "primary" : "alternate"} at session ${p}/${a}`, () => {
+    assert.equal(assignedModel(sessionOverrideDecision({ session: p, weekly: 0 }, { session: a, weekly: 0 })), expected);
+  });
+}
+
+test("override REPLACES the margin predicate at 100/90 with margin 5", () => {
+  assert.equal(assignedModel(sessionOverrideDecision({ session: 100, weekly: 0 }, { session: 90, weekly: 0 }, undefined,
+    { ...sessionOverrideConfig, margin: 5 })), sessionPrimaryModel);
+});
+for (const [p, a, margin, expected] of [[90, 85, 30, sessionPrimaryModel], [100, 90, 5, sessionAlternateModel], [100, 99, 30, sessionPrimaryModel]] as const) {
+  test(`omitted override preserves legacy ${p}/${a} margin ${margin}`, () => {
+    const legacy: DispatcherConfig = { ...cfg, sessionSwitchAt: 70, margin };
+    assert.equal(assignedModel(sessionOverrideDecision({ session: p, weekly: 0 }, { session: a, weekly: 0 }, undefined, legacy)), expected);
+  });
+}
+test("equal thresholds bypass margin immediately at 70", () => {
+  assert.equal(assignedModel(sessionOverrideDecision({ session: 70, weekly: 0 }, { session: 69.9, weekly: 0 }, undefined,
+    { ...sessionOverrideConfig, sessionAlwaysSwitchAt: 70 })), sessionAlternateModel);
+});
+for (const [p, a, expected] of [
+  [69.9, 0, sessionPrimaryModel], [70, 39.9, sessionAlternateModel], [70, 40.1, sessionPrimaryModel],
+  [89.9, 85, sessionPrimaryModel], [89.9, 90, sessionPrimaryModel], [90, 89.9, sessionAlternateModel],
+] as const) {
+  test(`fractional session ${p}/${a} precisely selects ${expected === sessionPrimaryModel ? "primary" : "alternate"}`, () => {
+    assert.equal(assignedModel(sessionOverrideDecision({ session: p, weekly: 0 }, { session: a, weekly: 0 })), expected);
+  });
+}
+for (const [p, a, expected] of [[99.9, 99, sessionPrimaryModel], [100, 99.9, sessionAlternateModel], [100, 100, sessionPrimaryModel]] as const) {
+  test(`override endpoint 100 selects ${expected === sessionPrimaryModel ? "primary" : "alternate"} at ${p}/${a}`, () => {
+    assert.equal(assignedModel(sessionOverrideDecision({ session: p, weekly: 0 }, { session: a, weekly: 0 }, undefined,
+      { ...sessionOverrideConfig, sessionAlwaysSwitchAt: 100 })), expected);
+  });
+}
+test("override endpoint zero admits no nonnegative alternate", () => {
+  for (const p of [0, 0.1, 100]) for (const a of [0, 0.1, 100]) {
+    assert.equal(assignedModel(sessionOverrideDecision({ session: p, weekly: 0 }, { session: a, weekly: 0 }, undefined,
+      { ...sessionOverrideConfig, sessionSwitchAt: 0, sessionAlwaysSwitchAt: 0, margin: 0 })), sessionPrimaryModel, `${p}/${a}`);
+  }
+});
+for (const [first, second, expected] of [[92, 85, "deepseek/deepseek-flash"], [89, 20, sessionAlternateModel], [90, 95, sessionPrimaryModel]] as const) {
+  test(`override priority walk selects ${expected} at 95/${first}/${second}`, () => {
+    assert.equal(assignedModel(sessionOverrideDecision({ session: 95, weekly: 0 }, { session: first, weekly: 0 },
+      { session: second, weekly: 0 })), expected);
+  });
+}
+test("weekly-tight first alternate rejected for later override winner", () => {
+  assert.equal(assignedModel(sessionOverrideDecision({ session: 95, weekly: 0 }, { session: 85, weekly: 90 },
+    { session: 89, weekly: 89.9 })), "deepseek/deepseek-flash");
+});
+for (const [label, p, a, expected, config] of [
+  ["weekly-only", { session: 10, weekly: 95 }, { session: 69.9, weekly: 10 }, sessionAlternateModel, sessionOverrideConfig],
+  ["weekly destination normal session guard", { session: 10, weekly: 95 }, { session: 70, weekly: 10 }, sessionPrimaryModel, sessionOverrideConfig],
+  ["weekly strict margin", { session: 10, weekly: 95 }, { session: 0, weekly: 65 }, sessionPrimaryModel, sessionOverrideConfig],
+  // The session destination fails the weekly guard (90); with margin 5
+  // the independent weekly pass can still select it (100 - 90).
+  ["session rejection falls through to weekly", { session: 95, weekly: 100 }, { session: 0, weekly: 90 }, sessionAlternateModel, { ...sessionOverrideConfig, margin: 5 }],
+] as const) {
+  test(`session override preserves ${label}`, () => {
+    assert.equal(assignedModel(sessionOverrideDecision(p, a, undefined, config)), expected);
+  });
+}
+for (const [label, p, a, b, kind, model] of [
+  ["unreadable primary", { ok: false }, { session: 85, weekly: 0 }, undefined, "hold", undefined],
+  ["unreported source session", { weekly: 0 }, { session: 85, weekly: 0 }, undefined, "hold", undefined],
+  ["unreported source weekly", { session: 95 }, { session: 85, weekly: 0 }, undefined, "hold", undefined],
+  ["higher-priority unreadable alternate", { session: 95, weekly: 0 }, { ok: false }, { session: 85, weekly: 0 }, "hold", undefined],
+  ["unreported alternate session", { session: 95, weekly: 0 }, { weekly: 0 }, { session: 85, weekly: 0 }, "hold", undefined],
+  ["unreadable with no winner", { session: 95, weekly: 0 }, { session: 90, weekly: 0 }, { ok: false }, "hold", undefined],
+  ["lower-priority unreadable after winner", { session: 95, weekly: 0 }, { session: 85, weekly: 0 }, { ok: false }, "assign", sessionAlternateModel],
+] as const) {
+  test(`override sensitivity ${label} produces ${kind}`, () => {
+    const d = sessionOverrideDecision(p, a, b);
+    assert.equal(d.kind, kind, d.why);
+    if (model) assert.equal(assignedModel(d), model);
+    else {
+      assert.equal("file" in d, false);
+      assert.equal("model" in d, false);
+    }
+  });
+}
+test("empty alternates remain pinned even without readings", () => {
+  assert.equal(assignedModel(decide(definitionOf("planner", sessionOverrideConfig),
+    { primary: MULTI.primary, alternates: [] }, new Map(), sessionOverrideConfig)), sessionPrimaryModel);
+});
+test("override winner explains activation rather than ordinary margin", () => {
+  const d = sessionOverrideDecision({ session: 90, weekly: 0 }, { session: 85, weekly: 0 });
+  assert.equal(assignedModel(d), sessionAlternateModel);
+  assert.ok(d.why.includes("sessionAlwaysSwitchAt"), d.why);
+});
+test("override rejection names threshold model and rail, not within margin", () => {
+  const d = sessionOverrideDecision({ session: 95, weekly: 0 }, { session: 90, weekly: 0 });
+  assert.equal(assignedModel(d), sessionPrimaryModel);
+  assert.ok(d.why.includes(sessionAlternateModel) && d.why.includes("codex"), d.why);
+  assert.ok(d.why.includes("sessionAlwaysSwitchAt"), d.why);
+  assert.ok(!d.why.includes("within margin"), d.why);
+});

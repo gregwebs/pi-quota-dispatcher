@@ -240,6 +240,19 @@ export interface DispatcherConfig {
   /** ...and only when the alternate is at least this many points healthier. */
   margin: number;
   /**
+   * ...unless the primary's *session* budget has reached this, in which case
+   * the margin is set aside and the first alternate, in priority order, whose
+   * session budget is strictly below this qualifies.
+   *
+   * Opt-in, so optional: omission is the only spelling of "off". No number can
+   * stand in for it — 90 or 100 would each change a decision some reading makes
+   * today — and `null` is not an eraser anywhere in this config (ADR 0002). It
+   * relaxes the session margin only: the weekly pass, the destination's other
+   * budget and every hold apply as before. Must be at least `sessionSwitchAt`
+   * in the final merged config, or it is warned about and disabled.
+   */
+  sessionAlwaysSwitchAt?: number;
+  /**
    * Per-model defaults, keyed by `provider/modelId`.
    *
    * A model is named here so that every candidate using it inherits its rail
@@ -279,6 +292,7 @@ const SCALAR_KEYS = [
   "sessionSwitchAt",
   "weeklySwitchAt",
   "margin",
+  "sessionAlwaysSwitchAt",
 ] as const;
 
 type ScalarKey = (typeof SCALAR_KEYS)[number];
@@ -304,6 +318,7 @@ const NUMBER_RANGES: ReadonlyMap<ScalarKey, NumberRange> = new Map([
   ["sessionSwitchAt", { min: 0, max: 100 }],
   ["weeklySwitchAt", { min: 0, max: 100 }],
   ["margin", { min: 0, max: 100 }],
+  ["sessionAlwaysSwitchAt", { min: 0, max: 100 }],
 ]);
 
 /**
@@ -491,6 +506,9 @@ function mismatchedRail(model: string, rail: Rail): Rail | undefined {
  *   weeklySwitchAt   90
  *   margin           10
  *   models           {}
+ *
+ * `sessionAlwaysSwitchAt` is deliberately absent rather than defaulted: it is
+ * opt-in, and its absence is what keeps the legacy margin policy.
  *
  * `models` and `agents` are both empty, and that is the point. There is no
  * opinion here about which agents exist, where their work should go, or which
@@ -958,6 +976,11 @@ export interface MergeResult {
  *     that agent intact rather than erasing it
  *   - the obsolete `routes` key, which is reported with the name that replaced
  *     it
+ *   - a final `sessionAlwaysSwitchAt` below the effective `sessionSwitchAt`,
+ *     which disables only the override. This one is deliberately not prefixed
+ *     with a layer label: it relates two effective values that may have come
+ *     from different layers, and it names both their values and both their
+ *     supplying layers instead. See `sessionOverrideConflict`.
  *
  * `sources` describes the config that survives: an agent or candidate a layer
  * proposes but validation rejects contributes nothing, so provenance can never
@@ -1101,6 +1124,46 @@ function parseCandidate(
   return undefined;
 }
 
+/** An effective numeric scalar and the label of the layer that supplied it. */
+interface LabelledNumber {
+  value: number;
+  /** The supplying layer's warning label (a file path from `loadConfig`), or `built-in`. */
+  label: string;
+}
+
+/**
+ * The warning for an effective `sessionAlwaysSwitchAt` that cannot stand beside
+ * the effective `sessionSwitchAt`, or `undefined` when the pair is ordered (or
+ * the override is omitted).
+ *
+ * Checked once, on the final merged config, because the rule relates two keys
+ * that may come from different layers: a project `sessionSwitchAt` can overtake
+ * a global override, and neither layer was wrong on its own. Equality is valid.
+ * A conflict disables only the override — nothing is clamped and no other value
+ * is touched — so the legacy policy keeps running on the values that remain.
+ */
+function sessionOverrideConflict(pair: {
+  normal: LabelledNumber;
+  override: LabelledNumber | undefined;
+}): string | undefined {
+  const { normal, override } = pair;
+  if (override === undefined || override.value >= normal.value) return undefined;
+  // Not a per-layer warning, so it carries no single layer prefix: the two
+  // values it relates may come from different layers, and naming them here is
+  // what tells the reader which file to open. The word "disabled" is the
+  // effective state the provenance block then shows.
+  return `"sessionAlwaysSwitchAt" ${override.value} (${override.label}) is below "sessionSwitchAt" ${normal.value} (${normal.label}); sessionAlwaysSwitchAt disabled`;
+}
+
+/**
+ * The name a layer goes by in a warning and in the cross-field check: its
+ * explicit `label` when it has one, else its `source`. `loadConfig` passes the
+ * file path as the label, which is what a reader needs in order to go and fix it.
+ */
+function labelOf(layer: MergeLayer): string {
+  return layer.label ?? layer.source;
+}
+
 export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): MergeResult {
   const warnings: string[] = [];
   const agents: Record<string, AgentRoute> = {};
@@ -1155,7 +1218,21 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
     delete sources[key];
   };
 
-  for (const key of SCALAR_KEYS) setSource(key, "built-in");
+  // An omitted optional scalar is the absence of a value, so it gets no source:
+  // provenance must never point at a value the config does not hold.
+  //
+  // The label of the layer that supplied each scalar is tracked beside its
+  // source, because the cross-field check at the end relates two keys that may
+  // come from different layers and has to name both. It is the same string
+  // `labelWarn` prefixes a layer warning with, so a warning and this check name
+  // one layer the same way.
+  const scalarLabels = new Map<ScalarKey, string>();
+  for (const key of SCALAR_KEYS) {
+    if (config[key] !== undefined) {
+      setSource(key, "built-in");
+      scalarLabels.set(key, "built-in");
+    }
+  }
   for (const [id, entry] of Object.entries(config.models)) {
     if (entry.rail !== undefined) setSource(`models.${id}.rail`, "built-in");
     if (entry.thinking !== undefined) setSource(`models.${id}.thinking`, "built-in");
@@ -1422,7 +1499,7 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
   };
 
   const labelWarn = (layer: MergeLayer): ((message: string) => void) => {
-    const label = layer.label ?? layer.source;
+    const label = labelOf(layer);
     return (message: string) => {
       warnings.push(`${label}: ${message}`);
     };
@@ -1568,7 +1645,32 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       }
       scalarTarget[scalar] = value as string | number;
       setSource(scalar, source);
+      scalarLabels.set(scalar, labelOf(layer));
     }
+  }
+
+  // The relationship between the two session thresholds is checked once, on the
+  // final merged config, because either layer may supply either key. A conflict
+  // disables only the override: `sessionSwitchAt` keeps its effective value and
+  // source, nothing is clamped, and the legacy margin policy keeps running on
+  // the values that remain.
+  const conflict = sessionOverrideConflict({
+    normal: {
+      value: config.sessionSwitchAt,
+      label: scalarLabels.get("sessionSwitchAt") ?? "built-in",
+    },
+    override:
+      config.sessionAlwaysSwitchAt === undefined
+        ? undefined
+        : {
+            value: config.sessionAlwaysSwitchAt,
+            label: scalarLabels.get("sessionAlwaysSwitchAt") ?? "built-in",
+          },
+  });
+  if (conflict !== undefined) {
+    warnings.push(conflict);
+    delete config.sessionAlwaysSwitchAt;
+    clearSource("sessionAlwaysSwitchAt");
   }
 
   return { config, sources, warnings };
@@ -1661,7 +1763,10 @@ export function describeConfigWarnings(loaded: LoadedConfig): string[] {
  * every model a route happens to use would be noise. An agent a layer disabled
  * is not in the effective config and has no candidates to render; it appears as
  * the single line `  agents.<name> = disabled  [<source>]`, which is what makes
- * "why is this agent not managed?" answerable from the same block.
+ * "why is this agent not managed?" answerable from the same block. An optional
+ * scalar that holds no value — `sessionAlwaysSwitchAt` omitted, or disabled by
+ * the cross-field ordering rule — renders as `= disabled  [built-in]` for the
+ * same reason: "is the override on?" is a state, not a number.
  *
  * Finally `describeConfigWarnings`.
  *
@@ -1676,7 +1781,7 @@ export function describeConfig(loaded: LoadedConfig): string[] {
   const sourceOf = (key: string): ConfigSource => loaded.sources[key] ?? "built-in";
 
   for (const key of SCALAR_KEYS) {
-    lines.push(`  ${key} = ${String(loaded.config[key])}  [${sourceOf(key)}]`);
+    lines.push(`  ${key} = ${scalarText(loaded.config[key])}  [${sourceOf(key)}]`);
   }
 
   // The `models` table is the user's own, and an entry no route names is inert
@@ -1736,6 +1841,21 @@ export function describeConfig(loaded: LoadedConfig): string[] {
 
   lines.push(...describeConfigWarnings(loaded));
   return lines;
+}
+
+/**
+ * A scalar as the provenance block renders it.
+ *
+ * An optional scalar's absence is a state rather than a value of `undefined`,
+ * and for `sessionAlwaysSwitchAt` that state is "the override is off" — the
+ * thing a reader asking about it needs to see.
+ */
+function scalarText(value: string | number | undefined): string {
+  // The `disabled` spelling is the same one an agent removed with `disable`
+  // gets, because it is the same fact: the key names no effective value. For
+  // the override that is either omission or the cross-field conflict, and a
+  // reader asking "is this on?" needs one answer for both.
+  return value === undefined ? "disabled" : String(value);
 }
 
 /**

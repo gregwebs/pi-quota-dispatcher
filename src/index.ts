@@ -300,6 +300,48 @@ function thresholdFor(budget: Budget, cfg: DispatcherConfig): number {
 }
 
 /**
+ * What a destination's reading must beat for the source reading that triggered
+ * this pass. The two rules are mutually exclusive per pass: the override does
+ * not widen the margin, so a destination at or above the override threshold is
+ * rejected even where the margin would have passed it. README's "The policy"
+ * has the worked rules.
+ */
+type Eligibility = { kind: "margin"; margin: number } | { kind: "override"; below: number };
+
+function eligibilityFor(budget: Budget, used: number, cfg: DispatcherConfig): Eligibility {
+  // Local invariant: the override is session-only. The weekly pass always weighs
+  // the margin, so a spent week never inherits a session threshold that would
+  // relax it.
+  const alwaysAt = cfg.sessionAlwaysSwitchAt;
+  return budget === "session" && alwaysAt !== undefined && used >= alwaysAt
+    ? { kind: "override", below: alwaysAt }
+    : { kind: "margin", margin: cfg.margin };
+}
+
+function qualifies(rule: Eligibility, readings: { used: number; altUsed: number }): boolean {
+  switch (rule.kind) {
+    case "margin":
+      return readings.altUsed < readings.used - rule.margin;
+    case "override":
+      return readings.altUsed < rule.below;
+  }
+}
+
+/** Why a destination failed `rule`, in the parenthetical a rejection note carries. */
+function unqualifiedText(rule: Eligibility, budget: Budget, altUsed: number): string {
+  switch (rule.kind) {
+    case "margin":
+      return `${budget} ${pct(altUsed)} is within margin`;
+    case "override":
+      // The candidate lost to the override, not to the margin, so this must not
+      // say "within margin". Both numbers are printed exactly, because the
+      // override boundary is strict: rounding the reading while printing the
+      // threshold raw can read as a false statement (90% "is not below" 90.4%).
+      return `${budget} ${pctExact(altUsed)} is not below sessionAlwaysSwitchAt ${pctExact(rule.below)}`;
+  }
+}
+
+/**
  * A headline with one line per note.
  *
  * The priority walk can pass over several alternates — some rejected on a
@@ -315,6 +357,20 @@ function withNotes(headline: string, notes: string[]): string {
 /** Percentages arrive fractional and are only ever read to the point. */
 function pct(n: number): string {
   return `${n.toFixed(0)}%`;
+}
+
+/**
+ * Percentages in override-mode prose, where the fractional boundary is the whole
+ * point: the override compares strictly against the configured threshold, so a
+ * rounded reading can read as a false statement or hide which side of the
+ * boundary a value sat on.
+ *
+ * Six decimals kill the noise a computed reading carries (`92.33333333333333`)
+ * while staying truthful for any percentage this config can hold, and
+ * `Number(...)` trims the trailing zeros `toFixed` would pad.
+ */
+function pctExact(n: number): string {
+  return `${Number(n.toFixed(6))}%`;
 }
 
 /**
@@ -408,6 +464,13 @@ function isInside(dir: string, file: string): boolean {
  * budget, because a rail that is tight there would block the work just as
  * surely. Without that, one agent can be moved onto the very rail another was
  * moved off in the same pass.
+ *
+ * The session pass has one opt-in exception, `sessionAlwaysSwitchAt`, which
+ * replaces the margin rule rather than widening it and applies to the session
+ * pass alone: the weekly pass always weighs the margin, so the override can
+ * never relax the session eligibility of a weekly-triggered switch, and when
+ * nothing qualifies the ordinary fallback restores the primary. README's "The
+ * policy" has the worked rules and boundaries.
  *
  * Containment is checked here even though the config seam validates names:
  * `decide` is handed a hand-built `AgentDefinition` and a `DispatcherConfig`
@@ -507,6 +570,7 @@ export function decide(
 
     const spare = OTHER_BUDGET[budget];
     const spareThreshold = thresholdFor(spare, cfg);
+    const rule = eligibilityFor(budget, used, cfg);
 
     // The alternates are consulted in the priority order the user wrote, never
     // re-sorted by headroom: order is the only intent the numbers cannot
@@ -550,14 +614,14 @@ export function decide(
         );
         continue;
       }
-      if (altUsed < used - cfg.margin) {
+      if (qualifies(rule, { used, altUsed })) {
         winner = candidate;
         winnerUsed = altUsed;
         winnerIndex = index;
         break;
       }
       rejected.push(
-        `rejected ${candidate.model} on ${candidate.rail} (${budget} ${pct(altUsed)} is within margin)`,
+        `rejected ${candidate.model} on ${candidate.rail} (${unqualifiedText(rule, budget, altUsed)})`,
       );
     }
 
@@ -584,10 +648,19 @@ export function decide(
           ),
         };
       }
+      // The trigger and the winner's own figure are worded differently in
+      // override mode so the line says why the margin did not apply and never
+      // reads as a winner sitting at the threshold; margin mode is the legacy
+      // `>= <threshold>` phrasing, unchanged.
+      const override = rule.kind === "override";
+      const trigger = override
+        ? `${pctExact(used)} >= sessionAlwaysSwitchAt ${pctExact(rule.below)}`
+        : `${pct(used)} >= ${pct(threshold)}`;
+      const winnerPct = override ? pctExact(winnerUsed) : pct(winnerUsed);
       return assign(
         winner,
         withNotes(
-          `${primary.rail} ${budget} ${pct(used)} >= ${pct(threshold)}, choosing ${winner.model} on ${winner.rail} (${budget} ${pct(winnerUsed)})`,
+          `${primary.rail} ${budget} ${trigger}, choosing ${winner.model} on ${winner.rail} (${budget} ${winnerPct})`,
           notes,
         ),
       );
