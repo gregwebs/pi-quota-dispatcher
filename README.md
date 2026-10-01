@@ -697,6 +697,21 @@ note, and everything else in the frontmatter and body survive byte-for-byte. See
 and ADR
 [0004](docs/adr/0004-thinking-levels.md) for why it is only ever forward.
 
+**It writes the file under a lock, and replaces it in one step.** The agent dir
+is shared by every pi under your user, so the read → rewrite → write is done
+while holding a per-file lock — keyed off the resolved target, so a symlink and
+its target share one lock — and the result is renamed into place rather than
+written over the old content. Two passes therefore do not interleave on one file,
+and a reader sees the old file or the new one and never a truncated one; the
+documented exceptions are in [Caveats](#caveats). A lock held by a process this
+one can confirm is alive costs a write at most a few seconds of waiting before it
+holds and names that process, rather than taking its file; a lock whose holder is
+gone is recovered at once, one that cannot be confirmed is recovered once it is
+older than the staleness bound, and one left by an abandoned release is recovered
+after ten minutes even though its process lives. A pass with nothing to write
+takes no lock at all. See ADR
+[0013](docs/adr/0013-agent-file-writes-are-coordinated.md).
+
 ## Where the numbers come from
 
 Two endpoints that the vendors' own clients use. Neither is a documented public
@@ -814,7 +829,21 @@ the alternatives that were rejected.
 - **Global state.** The agent files are shared across all sessions and projects,
   exactly as they are when you edit them by hand. A project override therefore
   changes the model written into a file that every project reads; the project
-  layer decides *what* gets written, not *where*.
+  layer decides *what* gets written, not *where*. Writes are coordinated with
+  other pi processes: each agent file is locked while it is rewritten and
+  replaced in one step, so a reader never sees a half-written file and two passes
+  do not interleave on one file — with documented gaps: two processes recovering
+  the same abandoned lock at the same instant, and a lock held by a live process
+  that has passed the ten-minute abandoned-release bound, each of whose cost is
+  an assignment rather than a file. A pass waits on a holder whose local live pid
+  the lock confirms rather than taking its file, and a pass with nothing to write
+  takes no lock. A pass that finds another process assigned a different model to
+  a file while it was deciding **holds** rather than overwriting it, and says so
+  on its report line. That is detection, not arbitration: if two projects override the same
+  agent, each writes its own answer when its own poll comes round and the file
+  settles on whichever ran last — nothing in a shared file says which config put
+  a model there. The fix is to stop the two configs disagreeing. See
+  [0013](docs/adr/0013-agent-file-writes-are-coordinated.md).
 - **A running agent keeps its model.** A switch applies to the next spawn, not to
   work already in flight.
 - **Same-rail congestion is possible.** If both plans are tight, agents can end
