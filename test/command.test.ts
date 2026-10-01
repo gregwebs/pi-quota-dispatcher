@@ -2272,6 +2272,8 @@ const APPLY_FAULTS: Array<{
       ...READS,
       "setModel:openai-codex/gpt-6-astra",
       "setThinkingLevel:low",
+      "getModel",
+      "getThinkingLevel",
       "setModel:deepseek/deepseek-flash",
       "setThinkingLevel:medium",
     ],
@@ -2281,7 +2283,7 @@ const APPLY_FAULTS: Array<{
   {
     name: "setThinkingLevel applies and then fails, and the restore fails too",
     session: { thinkingThrows: new Error("disk failure"), laterSetModelResult: new Error("still failing") },
-    calls: [...READS, "setModel:openai-codex/gpt-6-astra", "setThinkingLevel:low", "setModel:deepseek/deepseek-flash"],
+    calls: [...READS, "setModel:openai-codex/gpt-6-astra", "setThinkingLevel:low", "getModel", "getThinkingLevel", "setModel:deepseek/deepseek-flash"],
     restored: false,
     after: { model: "openai-codex/gpt-6-astra", thinking: "low" },
   },
@@ -2340,6 +2342,45 @@ test("a fault that moved only the level puts the level back without re-selecting
   });
   // A same-model re-selection is not "untouched": the level was reset and put
   // back, and the session's model is where it started.
+  assert.equal(session.model, "openai-codex/gpt-6-astra");
+  assert.equal(session.thinking, "high");
+});
+
+test("a fault applying an explicitly stated level puts the level back without re-selecting the model", async () => {
+  const fx = await skillFixture();
+  await writeFile(join(fx.agentDir, "agents", "reviewer.md"), ASTRA_REVIEWER);
+  // The file states level `low`, so the level is applied explicitly rather than
+  // only re-derived by `setModel`. The session already holds the file's model
+  // object, so `setModel` succeeds without moving the model, then the explicit
+  // level write applies and throws: the model half did not move and the level
+  // half did, so the put-back must write the level and only the level.
+  const session = fakeSession({
+    model: "openai-codex/gpt-6-astra",
+    thinking: "high",
+    switchLevel: "minimal",
+    thinkingThrows: new Error("disk failure"),
+  });
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    assert.equal(await input("/skill:code-review"), undefined);
+    assert.deepEqual(notifications, [
+      {
+        text: `${REVIEWER_BOUND}, but its model openai-codex/gpt-6-astra could not be selected (disk failure)`,
+        level: "warning",
+      },
+    ]);
+    assert.deepEqual(session.calls, [
+      "getModel",
+      "getThinkingLevel",
+      "setModel:openai-codex/gpt-6-astra",
+      "setThinkingLevel:low",
+      "getModel",
+      "getThinkingLevel",
+      "setThinkingLevel:high",
+    ]);
+  });
+  // One `setModel` call above proves the unchanged model was not re-selected;
+  // the level was put back and the session's model is where it started.
   assert.equal(session.model, "openai-codex/gpt-6-astra");
   assert.equal(session.thinking, "high");
 });

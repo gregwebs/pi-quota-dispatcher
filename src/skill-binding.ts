@@ -167,6 +167,19 @@ async function selectFromFile<Model>(deps: SkillBindingDeps<Model>, route: strin
   const previousModel = deps.selection.getModel();
   const previousLevel = deps.selection.getThinkingLevel();
 
+  /**
+   * Which halves of the selection the session actually moved, read live.
+   *
+   * A fault is not proof the session stayed put: pi assigns the model and the
+   * level before its later steps can fail, and it does not short-circuit a
+   * re-selection of the model already in place. So each catch asks the session
+   * rather than assuming, and `restore` writes only the halves that moved.
+   */
+  const movement = (): { model: boolean; level: boolean } => ({
+    model: deps.selection.getModel() !== previousModel,
+    level: deps.selection.getThinkingLevel() !== previousLevel,
+  });
+
   let selected: boolean;
   try {
     selected = await deps.selection.setModel(model);
@@ -177,12 +190,7 @@ async function selectFromFile<Model>(deps: SkillBindingDeps<Model>, route: strin
     // counts as untouched only when *both* halves are where they were, and a
     // fault that moved the level alone is not answered by selecting the model the
     // session is already on — pi would reset the level again on the way.
-    const moved = {
-      model: deps.selection.getModel() !== previousModel,
-      level: deps.selection.getThinkingLevel() !== previousLevel,
-    };
-    const untouched = !moved.model && !moved.level;
-    const restored = untouched || (await restore(deps.selection, previousModel, previousLevel, moved));
+    const restored = await restore(deps.selection, previousModel, previousLevel, movement());
     return { kind: "not-selected", model: read.model, detail: errorText(err), restored };
   }
   // `false` is pi's own answer that the provider has no authentication
@@ -195,8 +203,8 @@ async function selectFromFile<Model>(deps: SkillBindingDeps<Model>, route: strin
   try {
     deps.selection.setThinkingLevel(asked);
   } catch (err) {
-    // The model moved to apply the level, so both halves are put back.
-    const restored = await restore(deps.selection, previousModel, previousLevel, { model: true, level: true });
+    // The probe answers what moved; the model need not have.
+    const restored = await restore(deps.selection, previousModel, previousLevel, movement());
     return { kind: "not-selected", model: read.model, detail: errorText(err), restored };
   }
 
@@ -218,6 +226,9 @@ async function selectFromFile<Model>(deps: SkillBindingDeps<Model>, route: strin
  * session already holds, which would make pi reset the level again on the way.
  * The model goes first when it did move, because re-selecting it re-applies pi's
  * own level rule, and the level is then re-applied for that reason as well.
+ *
+ * A call with neither half moved writes nothing and answers `true`: the session
+ * is already where it was asked to be.
  *
  * `true` means the session holds its previous selection again — never that the
  * session persisted it. Every way this can fail returns `false`: no previous
