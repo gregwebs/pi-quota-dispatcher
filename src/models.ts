@@ -80,10 +80,16 @@ export type DroppedAlternate = ModelMiss;
  *
  * Two spellings of one fact drift, and the reader is meant to recognise the
  * warning's line in the report: naming the dotted config key is what makes it an
- * instruction rather than a diagnosis.
+ * instruction rather than a diagnosis. The clause is `unknownModelClause`, which
+ * a skill binding's warning shares.
  */
 export function unknownModelNote(key: string, model: string): string {
-  return `${key}: this pi does not know model ${model} — a newer pi may`;
+  return `${key}: ${unknownModelClause(model)}`;
+}
+
+/** The clause itself, for a sentence that names the model's place its own way. */
+export function unknownModelClause(model: string): string {
+  return `this pi does not know model ${model} — a newer pi may`;
 }
 
 /**
@@ -173,6 +179,19 @@ export function modelLookup(ctx: { modelRegistry?: ModelRegistryLike }): ModelLo
 }
 
 /**
+ * `provider/modelId` split at the first `/`, or `undefined` when there is no
+ * `/`.
+ *
+ * This is the split pi's own registry is keyed by, `find(provider, modelId)`: a
+ * model with no `/` cannot name a pi model at all. Sharing it keeps `checkModels`
+ * and a skill binding's lookup splitting an id the same way.
+ */
+export function splitModelId(model: string): { provider: string; modelId: string } | undefined {
+  const slash = model.indexOf("/");
+  return slash === -1 ? undefined : { provider: model.slice(0, slash), modelId: model.slice(slash + 1) };
+}
+
+/**
  * Resolve every candidate in `config` against `lookup`, and report each one it
  * does not know.
  *
@@ -215,8 +234,8 @@ export function checkModels(
    * this is the belt-and-braces path rather than a second wording.
    */
   const resolves = (dotted: string, model: string): boolean => {
-    const slash = model.indexOf("/");
-    if (slash !== -1 && lookup(model.slice(0, slash), model.slice(slash + 1))) return true;
+    const split = splitModelId(model);
+    if (split !== undefined && lookup(split.provider, split.modelId)) return true;
 
     const line = unknownModelNote(dotted, model);
     try {

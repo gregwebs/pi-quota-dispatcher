@@ -401,6 +401,51 @@ you want a level on the way home, state one — on the candidate, on the route, 
 in the `models` table. Removing the line is yours to do as well; nothing here
 does it.
 
+### Skill bindings
+
+A skill can borrow an agent's selection. Bind it by name to an agent route you already configure:
+
+```json
+{
+  "skills": {
+    "implementation-plan": "planner",
+    "code-review": "reviewer"
+  }
+}
+```
+
+The value is the name of a route under `agents` — the same name pi spawns the agent under — not a filename and
+not a model. When you type `/skill:implementation-plan …`, the dispatcher reads `planner`'s agent file *as it is
+at that moment* and selects its `model:` and, when it states one, its `thinking:` for your session, before the
+skill runs. Your arguments reach the skill untouched.
+
+- **Only an explicit `/skill:<name>` triggers it.** A skill the model loads by itself, or a prompt that merely
+  mentions one, changes nothing. An unbound skill changes nothing and says nothing.
+- **The file is the authority.** What is selected is what a spawn of that agent would get right now — not the
+  route's primary, and not a fresh quota decision. If the dispatcher held the agent on an alternate, or you
+  edited the file by hand, that is what you get. The dispatcher reads no quota and writes no file here, so a
+  binding adds no network delay of its own; pi's model selection still does its usual provider-authentication
+  check.
+- **A file with no `thinking:` keeps your session's level.** pi's own model switch would otherwise impose its
+  default, so the level you had is re-applied after the switch. A file that states a level applies it. pi clamps
+  whatever the model cannot do, and the notice names the level actually running, so a clamp is visible:
+  `…, thinking xhigh, clamped to medium by pi`.
+- **It persists.** The selection stays until you change it or invoke another bound skill; nothing restores the
+  previous model when the skill's work ends, and later dispatcher writes do not retarget your session.
+- **One notice per selection**, e.g. `Skill implementation-plan → planner: claude-bridge/claude-opus-5-5, thinking high`,
+  or `…, thinking retained (medium)` when the file states no level.
+- **Failures warn and change nothing**: a route `agents` does not configure, an agent no single readable file
+  defines, a file with no `model:` or with a `thinking:` that is not one of the seven levels, a model this pi
+  does not know, or a model whose provider is not authenticated. The skill still runs, on your current
+  selection. The model switch is not transactional — pi assigns the model before it can fail — so if pi itself
+  faults *while* applying the switch, the previous model and level are put back as far as the API allows and the
+  warning says so when they cannot be. The warning never claims a rollback that did not happen.
+
+Bindings layer like everything else: a project binding replaces the global one for the same skill, and the rest
+are inherited. `/quota-dispatch config` lists them as `skills.<name> = <route>  [<source>]`. Edits take effect
+on `/reload`; the agent file itself is read fresh on every invocation. See
+[0014](docs/adr/0014-skill-bindings-read-the-agent-file.md).
+
 ### Adding, removing and parking an agent
 
 An agent entry carries two entry-level **skip instructions**, read while the
@@ -496,6 +541,12 @@ Bad configuration never stops the dispatcher from starting:
   layer's value stands for that key alone. A typo in a project file cannot undo a
   correct global one. An invalid value never removes a valid one; removing an
   agent stays explicit (`disable: true`).
+- **A `skills` entry that could never fire or names no possible route** — a
+  `skills` value that is not an object, a skill name that is empty or holds a
+  space (pi names a skill up to the first space), or a binding whose value is
+  not an agent name — logged, and the previous layer's binding stands. A binding
+  to a route `agents` does not configure is not a load warning; it warns when
+  the skill is invoked.
 - **A skip flag that is not `true` or `false`, or a `null` anywhere** — logged
   and treated as absent, so the previous layer's value stands.
 - **A final `sessionAlwaysSwitchAt` below the effective `sessionSwitchAt`** —

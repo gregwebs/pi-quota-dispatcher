@@ -29,6 +29,13 @@ A route is never described as disabled — an entry in a config file either name
 route or is skipped, and a skipped entry names no route at all.
 _Avoid_: route, routing rule, mapping, agent route entry, disabled route
 
+**Skill binding**:
+The association a `skills` entry states between a skill name and an existing agent route. An explicit
+`/skill:<name>` invocation applies that route's agent **file** to the current session — its `model:` and, when it
+states one, its `thinking:` — and the selection persists until it is changed by hand or by another bound
+invocation.
+_Avoid_: skill role, skill model, role mapping
+
 **Candidate**:
 One model on one rail, considered as a possible destination for an agent. The
 rail comes from the candidate's own `rail` when it states one, otherwise from the

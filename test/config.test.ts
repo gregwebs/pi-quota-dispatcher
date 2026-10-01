@@ -27,6 +27,7 @@ import {
   mergeConfig,
   notJsonFault,
   projectConfigPath,
+  skillKey,
   thinkingFor,
   unusableConfigFileLines,
 } from "../src/config.ts";
@@ -86,6 +87,7 @@ function base(): DispatcherConfig {
     weeklySwitchAt: 90,
     margin: 10,
     models: {},
+    skills: {},
     agents: {
       planner: {
         primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
@@ -2580,4 +2582,251 @@ test("loadConfig applies project override with exact active provenance", async (
   assert.equal(loaded.sources.sessionSwitchAt, "global");
   assert.deepEqual(loaded.warnings, []);
   assert.ok(describeConfig(loaded).includes("  sessionAlwaysSwitchAt = 95  [project]"));
+});
+
+// ---------------------------------------------------------------- skill bindings (issue #52)
+
+/** Load the two layers named, each as JSON, from the fake filesystem. */
+async function loadedSkillLayers(global?: unknown, project?: unknown): Promise<LoadedConfig> {
+  const files: Record<string, string> = {};
+  if (global !== undefined) files[GLOBAL_PATH] = JSON.stringify(global);
+  if (project !== undefined) files[PROJECT_PATH] = JSON.stringify(project);
+  const fs = fakeFs(files);
+  return loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fs.readFile, warn: () => {} });
+}
+
+/** Every `sources` key a skill binding owns, with the layer that supplied it. */
+function skillSources(loaded: { sources: Record<string, string> }): Record<string, string> {
+  return Object.fromEntries(Object.entries(loaded.sources).filter(([key]) => key.startsWith("skills")));
+}
+
+test("defaultConfig ships no skill bindings", () => {
+  assert.deepEqual(defaultConfig("/opt/pi/agent").skills, {});
+});
+
+test("a global skill binding loads with its source", async () => {
+  const loaded = await loadedSkillLayers({ skills: { "implementation-plan": "planner" } });
+  assert.deepEqual(loaded.config.skills, { "implementation-plan": "planner" });
+  assert.equal(loaded.sources["skills.implementation-plan"], "global");
+  assert.deepEqual(loaded.warnings, []);
+});
+
+test("a project binding replaces the global one for that skill and inherits the rest", async () => {
+  const loaded = await loadedSkillLayers(
+    { skills: { a: "planner", b: "reviewer" } },
+    { skills: { a: "implementer" } },
+  );
+  assert.deepEqual(loaded.config.skills, { a: "implementer", b: "reviewer" });
+  assert.deepEqual(skillSources(loaded), { "skills.a": "project", "skills.b": "global" });
+  assert.deepEqual(loaded.warnings, []);
+});
+
+const NO_SKILL = "names no skill (an explicit invocation names a skill up to the first space)";
+const NOT_A_ROUTE_STRING = "must be a string naming an agent route";
+
+/**
+ * Every rejection §3.1(g) of the plan names, each over a valid lower binding.
+ *
+ * A value row overrides a binding the global layer already holds, so "the lower
+ * binding stands" is checked against that very binding. A key row names a skill
+ * no layer can bind, so it is checked against an unrelated binding and a quoted
+ * one: neither may move, and no `sources` key may appear for the bad name.
+ */
+const INVALID_SKILL_ROWS: Array<{ name: string; global: Record<string, string>; bad: Record<string, unknown>; text: string }> = [
+  ...([3, null, {}, true, ""] as const).map((value) => ({
+    name: `a ${JSON.stringify(value)} route`,
+    global: { "code-review": "reviewer" },
+    bad: { "code-review": value },
+    text: `"skills.code-review" ${NOT_A_ROUTE_STRING}`,
+  })),
+  {
+    name: "a model id where a route belongs",
+    global: { "code-review": "reviewer" },
+    bad: { "code-review": "claude-bridge/claude-opus-5-5" },
+    text:
+      `"skills.code-review" must name an agent route: agent "claude-bridge/claude-opus-5-5" is not a valid agent name ` +
+      `(a name is also a filename, so it must be a single path segment: not empty, not "." or "..", and with no "/", "\\" or NUL character)`,
+  },
+  {
+    name: "a route named after Object.prototype",
+    global: { "code-review": "reviewer" },
+    bad: { "code-review": "constructor" },
+    text: `"skills.code-review" must name an agent route: agent "constructor" shadows Object.prototype and is not manageable`,
+  },
+  {
+    name: "a quoted skill's non-string route",
+    global: { "v1.2": "reviewer" },
+    bad: { "v1.2": 3 },
+    text: `"skills["v1.2"]" ${NOT_A_ROUTE_STRING}`,
+  },
+  {
+    name: "an empty skill name",
+    global: { "implementation-plan": "planner", "v1.2": "reviewer" },
+    bad: { "": "planner" },
+    text: `"skills" entry "" ${NO_SKILL}`,
+  },
+  {
+    name: "a skill name holding a space",
+    global: { "implementation-plan": "planner", "v1.2": "reviewer" },
+    bad: { "pdf tools": "planner" },
+    text: `"skills" entry "pdf tools" ${NO_SKILL}`,
+  },
+];
+
+for (const row of INVALID_SKILL_ROWS) {
+  test(`each invalid skills entry warns and leaves the lower binding standing: ${row.name}`, async () => {
+    const lower = await loadedSkillLayers({ skills: row.global });
+    assert.deepEqual(lower.warnings, [], "the baseline must be valid");
+
+    const loaded = await loadedSkillLayers({ skills: row.global }, { skills: row.bad });
+    assert.deepEqual(loaded.warnings, [`${PROJECT_PATH}: ${row.text}`]);
+    assert.deepEqual(loaded.config.skills, row.global);
+    // Provenance membership is exactly the lower layer's: nothing for the bad
+    // entry, and every surviving binding still owned by the global file.
+    assert.deepEqual(skillSources(loaded), skillSources(lower));
+    for (const source of Object.values(skillSources(loaded))) assert.equal(source, "global");
+  });
+}
+
+test('"skills" that is not an object warns and leaves every binding standing', async () => {
+  const global = { skills: { "implementation-plan": "planner", "code-review": "reviewer" } };
+  for (const bad of [[], "x", null]) {
+    const loaded = await loadedSkillLayers(global, { skills: bad });
+    assert.deepEqual(loaded.warnings, [`${PROJECT_PATH}: "skills" must be an object`], JSON.stringify(bad));
+    assert.deepEqual(loaded.config.skills, global.skills);
+    assert.deepEqual(skillSources(loaded), {
+      "skills.implementation-plan": "global",
+      "skills.code-review": "global",
+    });
+  }
+});
+
+test("a binding to a route agents does not configure loads without a warning", async () => {
+  const loaded = await loadedSkillLayers({ skills: { "code-review": "ghost" } });
+  assert.deepEqual(loaded.config.agents, {});
+  assert.deepEqual(loaded.config.skills, { "code-review": "ghost" });
+  assert.equal(loaded.sources["skills.code-review"], "global");
+  assert.deepEqual(loaded.warnings, []);
+});
+
+test('"skills" is a known top-level key', async () => {
+  const loaded = await loadedSkillLayers({ skills: {} }, { skills: { a: "planner" } });
+  assert.ok(!loaded.warnings.some((w) => w.includes('unknown key "skills"')), loaded.warnings.join("\n"));
+  assert.deepEqual(loaded.warnings, []);
+});
+
+test("a skill outside the plain name class is quoted in sources and in the report", async () => {
+  assert.equal(skillKey("v1.2"), 'skills["v1.2"]');
+  assert.equal(skillKey("code-review"), "skills.code-review");
+
+  const loaded = await loadedSkillLayers({ skills: { "v1.2": "reviewer" } }, { skills: { "code-review": "planner" } });
+  assert.deepEqual(loaded.warnings, []);
+  assert.deepEqual(skillSources(loaded), { 'skills["v1.2"]': "global", "skills.code-review": "project" });
+  // The dotted spelling would name a different, nonexistent key.
+  assert.equal("skills.v1.2" in loaded.sources, false);
+
+  const lines = describeConfig(loaded);
+  assert.ok(lines.includes('  skills["v1.2"] = reviewer  [global]'), lines.join("\n"));
+  assert.ok(lines.includes("  skills.code-review = planner  [project]"), lines.join("\n"));
+  assert.deepEqual(configFilesFor(loaded, ['skills["v1.2"]']), [GLOBAL_PATH]);
+  assert.deepEqual(configFilesFor(loaded, ["skills.code-review"]), [PROJECT_PATH]);
+});
+
+test("a skill named __proto__ is kept as its own binding", () => {
+  const data: unknown = JSON.parse('{"skills":{"__proto__":"planner"}}');
+  assert.ok(isRecord(data));
+  const r = mergeConfig(base(), [{ source: "global", data }]);
+  assert.deepEqual(r.warnings, []);
+  assert.ok(Object.hasOwn(r.config.skills, "__proto__"));
+  assert.equal(Object.getOwnPropertyDescriptor(r.config.skills, "__proto__")?.value, "planner");
+  assert.equal(r.sources["skills.__proto__"], "global");
+  assert.equal(Object.getPrototypeOf(r.config.skills), Object.prototype);
+});
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+test("a base skill binding is cloned, validated and marked built-in", () => {
+  const b: DispatcherConfig = { ...base(), skills: { ok: "planner", "x y": "planner" } };
+  const r = mergeConfig(b, []);
+  assert.deepEqual(r.config.skills, { ok: "planner" });
+  assert.deepEqual(r.warnings, [`built-in: "skills" entry "x y" ${NO_SKILL}`]);
+  assert.equal(r.sources["skills.ok"], "built-in");
+  assert.deepEqual(skillSources(r), { "skills.ok": "built-in" });
+
+  // `deepEqual` narrows `r.config.skills`; mutate it through its declared type.
+  const merged: Record<string, string> = r.config.skills;
+  merged.ok = "reviewer";
+  merged.added = "reviewer";
+  assert.deepEqual(b.skills, { ok: "planner", "x y": "planner" }, "the base table must not be shared");
+});
+
+/** Models, both skill layers and two routes, so the block has every section. */
+async function loadedWithSkills(): Promise<LoadedConfig> {
+  const loaded = await loadedSkillLayers(
+    {
+      models: { "claude-bridge/claude-opus-5-5": { rail: "claude" } },
+      skills: { "implementation-plan": "planner" },
+    },
+    {
+      skills: { "code-review": "reviewer" },
+      agents: {
+        planner: {
+          primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+          alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
+        },
+        reviewer: { primary: { model: "openai-codex/gpt-6-astra", rail: "codex" }, alternates: [] },
+      },
+    },
+  );
+  assert.deepEqual(loaded.warnings, []);
+  return loaded;
+}
+
+test("describeConfig lists skill bindings sorted, between the models and the agents", async () => {
+  const lines = describeConfig(await loadedWithSkills());
+  const skillLines = lines.filter((l) => l.startsWith("  skills"));
+  assert.deepEqual(skillLines, [
+    "  skills.code-review = reviewer  [project]",
+    "  skills.implementation-plan = planner  [global]",
+  ]);
+
+  const lastModel = lines.findLastIndex((l) => l.startsWith("  models."));
+  const firstSkill = lines.findIndex((l) => l.startsWith("  skills"));
+  const lastSkill = lines.findLastIndex((l) => l.startsWith("  skills"));
+  const firstAgent = lines.findIndex((l) => l.startsWith("  agents."));
+  assert.ok(lastModel >= 0 && firstAgent >= 0, lines.join("\n"));
+  assert.ok(lastModel < firstSkill, lines.join("\n"));
+  assert.ok(lastSkill < firstAgent, lines.join("\n"));
+});
+
+test("describeConfig keeps scalars first, agents sorted and every value sourced with skill bindings present", async () => {
+  const lines = describeConfig(await loadedWithSkills());
+
+  const firstAgent = lines.findIndex((l) => l.includes("agents."));
+  assert.ok(firstAgent > 0, lines.join("\n"));
+  for (const scalar of ["agentDir", "claudeCredsPath", "piAuthPath", "ttlMs", "pollMs", "sessionSwitchAt", "weeklySwitchAt", "margin"]) {
+    const i = lines.findIndex((l) => l.includes(scalar));
+    assert.ok(i >= 0, `missing ${scalar}`);
+    assert.ok(i < firstAgent, `${scalar} should come before the agent lines`);
+  }
+  const planner = lines.findIndex((l) => l.includes("agents.planner."));
+  const reviewer = lines.findIndex((l) => l.includes("agents.reviewer."));
+  assert.ok(planner >= 0 && reviewer > planner, lines.join("\n"));
+
+  for (const l of lines.slice(1).filter((l) => l.includes(" = "))) {
+    assert.match(l, /\[(?:built-in|global|project)\]\s*$/);
+  }
+});
+
+test("an install with no skill bindings merges to the base unchanged", async () => {
+  const r = mergeConfig(base(), []);
+  assert.deepEqual(r.config, base());
+  assert.deepEqual(r.config.skills, {});
+  assert.deepEqual(skillSources(r), {});
+
+  const loaded = await loadedSkillLayers({ sessionSwitchAt: 60 });
+  assert.deepEqual(loaded.config.skills, {});
+  assert.ok(!describeConfig(loaded).some((l) => l.startsWith("  skills")));
 });
