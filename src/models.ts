@@ -22,7 +22,7 @@
  * and the registry is a structural type, so the check is exercised without a
  * registry, a session or a terminal.
  */
-import type { AgentRoute, Candidate, DispatcherConfig } from "./config.ts";
+import { agentKey, type AgentRoute, type Candidate, type DispatcherConfig } from "./config.ts";
 
 /**
  * The one thing this extension needs from the running pi's model registry:
@@ -235,7 +235,11 @@ export function checkModels(
   const agents: Record<string, AgentRoute> = {};
   for (const agent of Object.keys(config.agents).sort()) {
     const route = config.agents[agent];
-    if (!resolves(`agents.${agent}.primary.model`, route.primary.model)) {
+    // The key spells the name the way every other surface does, so a name
+    // outside `[A-Za-z0-9_-]` is quoted here too and `configFilesFor` can still
+    // find the file the miss came from.
+    const prefix = agentKey(agent);
+    if (!resolves(`${prefix}.primary.model`, route.primary.model)) {
       held[agent] = route.primary.model;
     }
     // The alternates after a dropped one keep their order; the index in the
@@ -244,7 +248,7 @@ export function checkModels(
     const alternates: Candidate[] = [];
     const dropped: DroppedAlternate[] = [];
     for (const [index, candidate] of route.alternates.entries()) {
-      const key = `agents.${agent}.alternates[${index}].model`;
+      const key = `${prefix}.alternates[${index}].model`;
       if (resolves(key, candidate.model)) alternates.push({ ...candidate });
       else dropped.push({ key, model: candidate.model });
     }

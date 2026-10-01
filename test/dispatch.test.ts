@@ -6,6 +6,7 @@ import { test } from "node:test";
 
 import {
   type AgentRoute,
+  type AgentDefinition,
   type Decision,
   type DispatcherConfig,
   type DroppedAlternate,
@@ -26,6 +27,8 @@ import {
   upsertModel,
   upsertThinking,
 } from "../src/index.ts";
+
+const definitionOf = (agent: string, cfg: DispatcherConfig): AgentDefinition => ({ agent, file: join(cfg.agentDir, `${agent}.md`) });
 
 // ---------------------------------------------------------------- parsing
 
@@ -395,14 +398,13 @@ test("describeDecision names the level it will write", () => {
   // No level is not rendered as one: the line stays what it always was.
   assert.equal(describeDecision(assign()), "planner -> claude-bridge/claude-opus-5-5");
 
-  const hold: Decision = { agent: "planner", file: "/a/planner.md", kind: "hold", why: "claude unreadable — holding" };
+  const hold: Decision = { agent: "planner", kind: "hold", why: "claude unreadable — holding" };
   assert.equal(describeDecision(hold), "planner -> (left as is)");
 });
 
 test("describeDecisionLines renders a hold as a headline plus its reasoning", () => {
   const decision: Decision = {
     agent: "planner",
-    file: "/a/planner.md",
     kind: "hold",
     why: "claude unreadable (HTTP 401) — holding",
   };
@@ -429,7 +431,7 @@ test("a real multi-alternate decision puts each passed-over candidate on its own
     ],
   };
   const decided = decide(
-    "planner",
+    definitionOf("planner", cfg),
     route,
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
@@ -516,7 +518,7 @@ function assignedModel(d: Decision): string {
 }
 
 function plannerDecision(claude: Readings, codex: Readings): Decision {
-  return decide("planner", AGENT_ROUTES.planner, rails(claude, codex), cfg);
+  return decide(definitionOf("planner", cfg), AGENT_ROUTES.planner, rails(claude, codex), cfg);
 }
 
 test("budgetUsed takes the worst window within a budget, not across budgets", () => {
@@ -570,21 +572,22 @@ test("decide resolves the candidate over the route over the model", () => {
   const headroom = rails({ session: 0, weekly: 0 }, { session: 0, weekly: 0 });
   const tight = rails({ session: 95, weekly: 0 }, { session: 0, weekly: 0 });
 
-  assert.equal(assignedThinking(decide("planner", route, headroom, withModelDefault)), "medium");
-  assert.equal(assignedThinking(decide("planner", route, tight, withModelDefault)), "off");
+  assert.equal(assignedThinking(decide(definitionOf("planner", withModelDefault), route, headroom, withModelDefault)), "medium");
+  assert.equal(assignedThinking(decide(definitionOf("planner", withModelDefault), route, tight, withModelDefault)), "off");
 
   // With no route default, the model's own entry is what is left.
   const modelOnly: AgentRoute = { ...route, thinking: undefined };
-  assert.equal(assignedThinking(decide("planner", modelOnly, headroom, withModelDefault)), "low");
+  assert.equal(assignedThinking(decide(definitionOf("planner", withModelDefault), modelOnly, headroom, withModelDefault)), "low");
 
   // And the pinned-to-primary case resolves it the same way, with no reading.
   const pinned: AgentRoute = { thinking: "max", primary: route.primary, alternates: [] };
-  assert.equal(assignedThinking(decide("planner", pinned, headroom, cfg)), "max");
+  assert.equal(assignedThinking(decide(definitionOf("planner", cfg), pinned, headroom, cfg)), "max");
 });
 
 test("a hold carries no level to write", () => {
-  const d = decide("planner", AGENT_ROUTES.planner, rails({ ok: false, note: "HTTP 500" }, { session: 0, weekly: 0 }), cfg);
+  const d = decide(definitionOf("planner", cfg), AGENT_ROUTES.planner, rails({ ok: false, note: "HTTP 500" }, { session: 0, weekly: 0 }), cfg);
   assert.equal(d.kind, "hold");
+  assert.equal("file" in d, false, "a hold has no file to write");
   assert.equal(Object.hasOwn(d, "thinking"), false);
 });
 
@@ -596,7 +599,7 @@ test("decide moves planner off claude when the session budget is tight", () => {
 
 test("decide moves reviewer off codex when the session budget is tight", () => {
   const d = decide(
-    "reviewer",
+    definitionOf("reviewer", cfg),
     AGENT_ROUTES.reviewer,
     rails({ session: 10, weekly: 0 }, { session: 90, weekly: 0 }),
     cfg,
@@ -630,7 +633,7 @@ test("a tight weekly is compared against the alternate's weekly, not its session
 test("decide does not switch when the margin is not met", () => {
   // codex 85 is >= sessionSwitchAt but only 5 points below claude's 90.
   const reviewer = decide(
-    "reviewer",
+    definitionOf("reviewer", cfg),
     AGENT_ROUTES.reviewer,
     rails({ session: 90, weekly: 0 }, { session: 85, weekly: 0 }),
     cfg,
@@ -645,7 +648,7 @@ test("decide does not switch when the margin is not met", () => {
 // comparator is strict, so exactly `margin` is not enough.
 test("exactly margin points healthier is not enough to switch", () => {
   const exactly = decide(
-    "reviewer",
+    definitionOf("reviewer", cfg),
     AGENT_ROUTES.reviewer,
     rails({ session: 85, weekly: 0 }, { session: 95, weekly: 0 }),
     cfg,
@@ -653,7 +656,7 @@ test("exactly margin points healthier is not enough to switch", () => {
   assert.equal(assignedModel(exactly), "openai-codex/gpt-6-astra");
 
   const beyond = decide(
-    "reviewer",
+    definitionOf("reviewer", cfg),
     AGENT_ROUTES.reviewer,
     rails({ session: 84, weekly: 0 }, { session: 95, weekly: 0 }),
     cfg,
@@ -663,7 +666,7 @@ test("exactly margin points healthier is not enough to switch", () => {
 
 test("decide switches on a session budget of 100", () => {
   const d = decide(
-    "reviewer",
+    definitionOf("reviewer", cfg),
     AGENT_ROUTES.reviewer,
     rails({ session: 10, weekly: 0 }, { session: 100, weekly: 0 }),
     cfg,
@@ -678,7 +681,7 @@ test("the session budget is the one reported when both are tight", () => {
 
 test("a metered primary is never tight, so it is left where it is", () => {
   const d = decide(
-    "implementer",
+    definitionOf("implementer", cfg),
     AGENT_ROUTES.implementer,
     rails({ session: 99, weekly: 99 }, { session: 99, weekly: 99 }),
     cfg,
@@ -699,7 +702,7 @@ const MULTI: AgentRoute = {
 test("decide walks alternates in priority order and takes the first usable one", () => {
   // Both alternates are usable; the first in order wins, not the roomiest.
   const d = decide(
-    "planner",
+    definitionOf("planner", cfg),
     MULTI,
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
@@ -726,7 +729,7 @@ test("two alternates on one rail are told apart by model, not just rail", () => 
     ],
   };
   const d = decide(
-    "planner",
+    definitionOf("planner", cfg),
     sameRail,
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
@@ -740,7 +743,7 @@ test("two alternates on one rail are told apart by model, not just rail", () => 
 
 test("an alternate within margin is passed over for a later usable one", () => {
   const d = decide(
-    "planner",
+    definitionOf("planner", cfg),
     MULTI,
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
@@ -755,7 +758,7 @@ test("an alternate within margin is passed over for a later usable one", () => {
 
 test("an alternate tight on its other budget is passed over for a later usable one", () => {
   const d = decide(
-    "planner",
+    definitionOf("planner", cfg),
     MULTI,
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
@@ -770,7 +773,7 @@ test("an alternate tight on its other budget is passed over for a later usable o
 
 test("when every readable alternate is rejected and none is unreadable, the primary is assigned", () => {
   const d = decide(
-    "planner",
+    definitionOf("planner", cfg),
     MULTI,
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
@@ -793,7 +796,7 @@ test("an empty alternates list pins the agent to its primary with no readability
   };
   // The primary rail is unreadable; an agent with nothing else to move to is
   // still assigned, because there is nothing else the answer could be.
-  const d = decide("planner", pinned, railMap(railState("claude", { ok: false, note: "HTTP 500" })), cfg);
+  const d = decide(definitionOf("planner", cfg), pinned, railMap(railState("claude", { ok: false, note: "HTTP 500" })), cfg);
   assert.equal(d.kind, "assign");
   assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
   assert.equal(d.why, "no alternate configured", "a route the user pinned still says so, in so many words");
@@ -818,7 +821,7 @@ test("a route whose alternates were all dropped explains the drop, not a missing
   // time: a dropped alternate is known bad, not an unknown reading, and the
   // route is still assigned rather than held.
   const decision = decide(
-    "planner",
+    definitionOf("planner", cfg),
     pinned,
     railMap(railState("claude", { ok: false, note: "HTTP 500" })),
     cfg,
@@ -857,7 +860,7 @@ test("dropped models are named for a route left with none, and on no other path"
 
   // The primary is healthy, so no alternate is consulted at all.
   const healthy = decide(
-    "planner",
+    definitionOf("planner", cfg),
     route,
     rails({ session: 10, weekly: 0 }, { session: 10, weekly: 0 }),
     cfg,
@@ -868,7 +871,7 @@ test("dropped models are named for a route left with none, and on no other path"
 
   // The primary is tight and the surviving alternate wins.
   const switched = decide(
-    "planner",
+    definitionOf("planner", cfg),
     route,
     rails({ session: 90, weekly: 0 }, { session: 10, weekly: 0 }),
     cfg,
@@ -880,7 +883,7 @@ test("dropped models are named for a route left with none, and on no other path"
   // The primary is tight and the surviving alternate is too close to it on the
   // same budget, so the route stays put and says why.
   const stayed = decide(
-    "planner",
+    definitionOf("planner", cfg),
     route,
     rails({ session: 90, weekly: 0 }, { session: 85, weekly: 0 }),
     cfg,
@@ -892,13 +895,14 @@ test("dropped models are named for a route left with none, and on no other path"
 
   // The primary cannot be read, which holds whatever the alternates say.
   const held = decide(
-    "planner",
+    definitionOf("planner", cfg),
     route,
     railMap(railState("claude", { ok: false, note: "HTTP 500" })),
     cfg,
     dropped,
   );
   assert.equal(held.kind, "hold");
+  assert.equal("file" in held, false, "a hold has no file to write");
   assert.ok(!held.why.includes("gpt-sol-6"), held.why);
 });
 
@@ -907,7 +911,7 @@ test("an empty alternates list assigns the primary even when no rail was read at
     primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
     alternates: [],
   };
-  const d = decide("planner", pinned, new Map(), cfg);
+  const d = decide(definitionOf("planner", cfg), pinned, new Map(), cfg);
   assert.equal(d.kind, "assign");
   assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
 });
@@ -919,7 +923,7 @@ test("an empty alternates list assigns the primary even when no rail was read at
 
 test("a readable primary below every threshold is assigned even when every alternate is unreadable", () => {
   const d = decide(
-    "planner",
+    definitionOf("planner", cfg),
     MULTI,
     railMap(
       railState("claude", { session: 10, weekly: 10 }),
@@ -934,7 +938,7 @@ test("a readable primary below every threshold is assigned even when every alter
 
 test("an unreadable alternate earlier in order than a usable one holds instead", () => {
   const d = decide(
-    "planner",
+    definitionOf("planner", cfg),
     MULTI,
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
@@ -944,6 +948,7 @@ test("an unreadable alternate earlier in order than a usable one holds instead",
     cfg,
   );
   assert.equal(d.kind, "hold");
+  assert.equal("file" in d, false, "a hold has no file to write");
   assert.ok(d.why.includes("codex"), d.why);
 });
 
@@ -958,7 +963,7 @@ test("a hold names both models when two alternates share a rail", () => {
     ],
   };
   const d = decide(
-    "planner",
+    definitionOf("planner", cfg),
     route,
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
@@ -967,6 +972,7 @@ test("a hold names both models when two alternates share a rail", () => {
     cfg,
   );
   assert.equal(d.kind, "hold");
+  assert.equal("file" in d, false, "a hold has no file to write");
   assert.ok(d.why.includes("openai-codex/gpt-6-sol"), d.why);
   assert.ok(d.why.includes("openai-codex/gpt-5.6-luna"), d.why);
 });
@@ -984,7 +990,7 @@ test("a hold still names the candidates after the provisional winner", () => {
     ],
   };
   const d = decide(
-    "planner",
+    definitionOf("planner", cfg),
     route,
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
@@ -994,6 +1000,7 @@ test("a hold still names the candidates after the provisional winner", () => {
     cfg,
   );
   assert.equal(d.kind, "hold");
+  assert.equal("file" in d, false, "a hold has no file to write");
   assert.ok(d.why.includes("openai-codex/gpt-6-sol"), d.why);
   assert.ok(d.why.includes("deepseek/deepseek-r1"), d.why);
   assert.match(d.why, /not consulted/, d.why);
@@ -1006,7 +1013,7 @@ test("a hold still names the candidates after the provisional winner", () => {
 // primary on the strength of a reading that was never consulted.
 test("an unreadable alternate later in order than a usable winner does not hold", () => {
   const d = decide(
-    "planner",
+    definitionOf("planner", cfg),
     MULTI,
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
@@ -1021,7 +1028,7 @@ test("an unreadable alternate later in order than a usable winner does not hold"
 
 test("when no readable alternate qualifies, an unreadable one holds rather than falling back to the primary", () => {
   const d = decide(
-    "planner",
+    definitionOf("planner", cfg),
     MULTI,
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
@@ -1031,6 +1038,7 @@ test("when no readable alternate qualifies, an unreadable one holds rather than 
     cfg,
   );
   assert.equal(d.kind, "hold");
+  assert.equal("file" in d, false, "a hold has no file to write");
 });
 
 // ---------------------------------------------------------------- containment
@@ -1044,10 +1052,10 @@ test("decide holds rather than assigning when the agent resolves outside agentDi
   const confined: DispatcherConfig = { ...DEFAULT_CONFIG, agentDir: "/tmp/agents", agents: AGENT_ROUTES };
   const healthy = rails({ session: 0, weekly: 0 }, { session: 0, weekly: 0 });
 
-  const escaped = decide("../outside", AGENT_ROUTES.planner, healthy, confined);
+  const escaped = decide(definitionOf("../outside", confined), AGENT_ROUTES.planner, healthy, confined);
   assert.equal(escaped.kind, "hold");
+  assert.equal("file" in escaped, false, "a hold has no file to write");
   assert.equal("model" in escaped, false, "a hold must carry no model to write");
-  assert.equal(escaped.file, "/tmp/outside.md");
   assert.ok(escaped.why.includes("/tmp/outside.md"), escaped.why);
 });
 
@@ -1058,10 +1066,10 @@ test("decide holds for a sibling directory that merely shares agentDir's prefix"
   const confined: DispatcherConfig = { ...DEFAULT_CONFIG, agentDir: "/tmp/agents", agents: AGENT_ROUTES };
   const healthy = rails({ session: 0, weekly: 0 }, { session: 0, weekly: 0 });
 
-  const d = decide("../agents-evil/agent", AGENT_ROUTES.planner, healthy, confined);
+  const d = decide(definitionOf("../agents-evil/agent", confined), AGENT_ROUTES.planner, healthy, confined);
   assert.equal(d.kind, "hold");
+  assert.equal("file" in d, false, "a hold has no file to write");
   assert.equal("model" in d, false, "a hold must carry no model to write");
-  assert.equal(d.file, "/tmp/agents-evil/agent.md");
   assert.ok(d.why.includes("/tmp/agents-evil/agent.md"), d.why);
 });
 
@@ -1069,9 +1077,9 @@ test("decide assigns normally for a well-behaved name", () => {
   const confined: DispatcherConfig = { ...DEFAULT_CONFIG, agentDir: "/tmp/agents", agents: AGENT_ROUTES };
   const healthy = rails({ session: 0, weekly: 0 }, { session: 0, weekly: 0 });
 
-  const d = decide("planner", AGENT_ROUTES.planner, healthy, confined);
+  const d = decide(definitionOf("planner", confined), AGENT_ROUTES.planner, healthy, confined);
   assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
-  assert.equal(d.file, "/tmp/agents/planner.md");
+  assert.equal(d.kind === "assign" ? d.file : undefined, "/tmp/agents/planner.md");
 });
 
 test("decide treats a name that normalizes back inside agentDir as contained", () => {
@@ -1080,9 +1088,9 @@ test("decide treats a name that normalizes back inside agentDir as contained", (
   const confined: DispatcherConfig = { ...DEFAULT_CONFIG, agentDir: "/tmp/agents", agents: AGENT_ROUTES };
   const healthy = rails({ session: 0, weekly: 0 }, { session: 0, weekly: 0 });
 
-  const d = decide("sub/../planner", AGENT_ROUTES.planner, healthy, confined);
+  const d = decide(definitionOf("sub/../planner", confined), AGENT_ROUTES.planner, healthy, confined);
   assert.equal(d.kind, "assign");
-  assert.equal(d.file, "/tmp/agents/planner.md");
+  assert.equal(d.kind === "assign" ? d.file : undefined, "/tmp/agents/planner.md");
 });
 
 // ------------------------------------------------- destination eligibility
@@ -1104,7 +1112,7 @@ test("one pass never moves an agent onto a rail it moves another agent off", () 
   const planner = plannerDecision(claude, codex);
   assert.equal(assignedModel(planner), "claude-bridge/claude-opus-5-5");
 
-  const reviewer = decide("reviewer", AGENT_ROUTES.reviewer, rails(claude, codex), cfg);
+  const reviewer = decide(definitionOf("reviewer", cfg), AGENT_ROUTES.reviewer, rails(claude, codex), cfg);
   assert.equal(assignedModel(reviewer), "openai-codex/gpt-6-astra");
 });
 
@@ -1131,6 +1139,7 @@ test("an unreported budget is held, not read as idle", () => {
   // is missing is the one that would decide, so the dispatcher holds.
   const d = plannerDecision({ session: 80, weekly: 0 }, { weekly: 100 });
   assert.equal(d.kind, "hold");
+  assert.equal("file" in d, false, "a hold has no file to write");
   assert.ok(d.why.includes("codex"), d.why);
   assert.match(d.why, /session/, d.why);
 });
@@ -1151,12 +1160,14 @@ test("a metered rail reports no budgets rather than unreported ones", () => {
 test("decide makes no assignment when the primary rail is unreadable", () => {
   const d = plannerDecision({ ok: false, note: "HTTP 401" }, { session: 1, weekly: 0 });
   assert.equal(d.kind, "hold");
+  assert.equal("file" in d, false, "a hold has no file to write");
   assert.match(d.why, /unreadable/);
 });
 
 test("decide makes no assignment when the alternate rail is unreadable", () => {
   const d = plannerDecision({ session: 99, weekly: 0 }, { ok: false, note: "HTTP 500" });
   assert.equal(d.kind, "hold");
+  assert.equal("file" in d, false, "a hold has no file to write");
 });
 
 // ---------------------------------------------------------------- dispatcher
@@ -1363,6 +1374,7 @@ test("a partial reading is held rather than read as headroom", async () => {
   const planner = results.find((r) => r.decision.agent === "planner")!;
 
   assert.equal(planner.decision.kind, "hold");
+  assert.equal("file" in planner.decision, false, "a hold has no file to write");
   assert.ok(planner.decision.why.includes("codex"), planner.decision.why);
   assert.equal(planner.outcome, "held");
 });
@@ -1383,6 +1395,7 @@ test("a missing credential file holds every agent, even when a switch looks due"
   const planner = results.find((r) => r.decision.agent === "planner")!;
 
   assert.equal(planner.decision.kind, "hold");
+  assert.equal("file" in planner.decision, false, "a hold has no file to write");
   assert.equal(planner.outcome, "held");
   assert.match(planner.decision.why, /unreadable/);
 });
@@ -1459,6 +1472,7 @@ test("an expired claude token counts as unreadable rather than switching", async
   const planner = results.find((r) => r.decision.agent === "planner")!;
 
   assert.equal(planner.decision.kind, "hold");
+  assert.equal("file" in planner.decision, false, "a hold has no file to write");
   assert.match(planner.decision.why, /unreadable/);
 });
 
@@ -1534,6 +1548,7 @@ async function assertNotRetried(status: number) {
 
   assert.equal(calls.filter((u) => u.includes("chatgpt.com")).length, 1, `HTTP ${status} is an answer`);
   assert.equal(planner.decision.kind, "hold");
+  assert.equal("file" in planner.decision, false, "a hold has no file to write");
   assert.match(planner.decision.why, new RegExp(`unreadable \\(HTTP ${status}\\)`));
 }
 

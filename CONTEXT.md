@@ -11,8 +11,17 @@ each agent belongs.
 _Avoid_: router, scheduler, balancer
 
 **Agent**:
-A named identity that pi can spawn, defined by its own file in the agent dir.
+A named identity that pi can spawn, defined by a file in the agent dir. Its name
+is the name pi spawns it under — the file's declared `name:`, else the filename
+stem — so the name and the filename are independent, and a route key is a name,
+not a filename.
 _Avoid_: subagent, agent config, agent entry
+
+**Agent Definition**:
+What a route resolves to before any model is chosen: the name pi spawns the
+agent under, and the file a write for it lands in. Where no file claims the
+name, it is the path `/agents` would create, and nothing is written there.
+_Avoid_: agent target, file reference
 
 **Agent Route**:
 The destination policy for one agent: its primary and its list of alternates.
@@ -50,8 +59,8 @@ the file used to hold.
 _Avoid_: effective level, final level, thinking default
 
 **Unmanaged**:
-Describes an agent file that no agent route names. The dispatcher never touches
-it, and that is a normal state rather than a fault.
+Describes an agent file whose agent no agent route names. The dispatcher never
+touches it, and that is a normal state rather than a fault.
 _Avoid_: disabled, ignored, unconfigured, unrouted
 
 **Primary**:
@@ -95,13 +104,20 @@ tight. Applies to the next spawn; work already in flight keeps the model it
 started on.
 _Avoid_: failover, migration, rotation
 
+**Contested**:
+Describes an agent name that two or more agent files claim, so pi spawns
+whichever it loads last. A contested route is **held**.
+_Avoid_: ambiguous, duplicate, shadowed
+
 **Hold**:
-A decision to assign nothing, leaving an agent's file exactly as the user left
-it. What the dispatcher does when a reading it does not have could have changed
-the answer — an unreadable rail, or a budget that was not reported. It is also
-the decision for an agent whose **primary** this pi cannot spawn: there the
-model is *known bad* rather than *unknown*, no reading could change the answer,
-and it is dropped from consideration instead of waited on.
+A decision to assign nothing, leaving the files of the agents involved exactly as
+the user left them. What the dispatcher does when a reading it does not have
+could have changed the answer — an unreadable rail, or a budget that was not
+reported — and when no single file could carry a write: a **contested** name,
+where two or more files claim it. It is also the decision for an agent whose
+**primary** this pi cannot spawn: there the model is *known bad* rather than
+*unknown*, no reading could change the answer, and it is dropped from
+consideration instead of waited on.
 _Avoid_: skip, no-op, hold-off, fall back
 
 **Unusable file**:

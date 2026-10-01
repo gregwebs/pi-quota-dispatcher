@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import extension, { parseInvocation, unknownFormNotice } from "../src/index.ts";
+import extension, { checkAgentFiles, DEFAULT_CONFIG, parseInvocation, readAgentDirectory, unknownFormNotice } from "../src/index.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
 // documented literal directly.
@@ -1140,3 +1140,150 @@ test("a miss in each layer names both config files, each occurrence once", async
     { modelRegistry: registry({ "claude-bridge": ["claude-opus-5-5"], "openai-codex": ["gpt-6-sol"] }) },
   );
 });
+
+// The warning moved to boot: both post-boot reader surfaces must retain it.
+test("boot agent-file warnings remain in the report tail and the config command", async () => {
+  const fx = await fixture();
+  const missing = join(fx.agentDir, "agents", "reviewer.md");
+  const warning = `  warning: ${missing}: configured agent "reviewer" has no file — run the /agents command to create a new agent`;
+  await withExtension(fx, async ({ runAll }) => {
+    const report = (await runAll("")).join("\n");
+    assert.ok(report.split("\n").includes(warning), report);
+    assert.ok(report.indexOf(warning) > report.indexOf("reviewer ->"), report);
+    const configText = (await runAll("config")).join("\n");
+    assert.ok(configText.split("\n").includes(warning), configText);
+    assert.ok(configText.indexOf(warning) > configText.indexOf("agents.reviewer.primary.model"), configText);
+  });
+});
+
+test("unmanaged listings use declared identities, not stems, including contested routed files", async () => {
+  const fx = await fixture(2_147_483_647, {
+    Architect: { primary: { model: "deepseek/deepseek-flash", rail: "deepseek" } },
+    "plan-work": { primary: { model: "deepseek/deepseek-flash", rail: "deepseek" } },
+    reviewer: { primary: { model: "deepseek/deepseek-flash", rail: "deepseek" } },
+  });
+  const dir = join(fx.agentDir, "agents");
+  await writeFile(join(dir, "architect-work.md"), TEMPLATE("Architect", "deepseek/deepseek-flash"));
+  await writeFile(join(dir, "plan-work.md"), TEMPLATE("Unrouted", "deepseek/deepseek-flash"));
+  await writeFile(join(dir, "one.md"), TEMPLATE("reviewer", "deepseek/deepseek-flash"));
+  await writeFile(join(dir, "two.md"), TEMPLATE("reviewer", "deepseek/deepseek-flash"));
+  await withExtension(fx, async ({ run }) => {
+    const report = await run("");
+    const at = report.indexOf("unmanaged agent files");
+    assert.notEqual(at, -1, report);
+    const listed: string[] = [];
+    for (const line of report.slice(at).split("\n").slice(1)) {
+      if (!line.startsWith("  ") || !line.includes(".md")) break;
+      listed.push(line);
+    }
+    assert.ok(listed.includes("  plan-work.md (name: Unrouted) — model: deepseek/deepseek-flash"), report);
+    assert.ok(!listed.some((l) => l.includes("architect-work.md") || l.includes("one.md") || l.includes("two.md")), report);
+    assert.ok(report.includes("[held]"), report);
+    assert.equal(report.includes("ambiguous"), false);
+    const warning = report.split("\n").find((line) => line.startsWith("  warning:") && line.includes('configured agent "reviewer"'));
+    assert.ok(warning, report);
+    assert.ok(warning.includes("is contested:"), report);
+    assert.ok(warning.endsWith("give each file its own name"), report);
+    const configText = await run("config");
+    assert.equal(configText.includes("ambiguous"), false);
+    assert.ok(configText.includes("is contested:"), configText);
+  });
+});
+
+test("boot joins load, agent-file, and model warnings in that order", async () => {
+  const fx = await fixture(2_147_483_647, {
+    missing: { primary: { model: "deepseek/not-known", rail: "deepseek" } },
+  });
+  const path = join(fx.agentDir, CONFIG_FILE_NAME);
+  const data = JSON.parse(await readFile(path, "utf8"));
+  await writeFile(path, JSON.stringify({ ...data, ttlMs: "bad" }));
+  await withExtension(fx, async ({ runAll }) => {
+    for (const form of ["", "config"]) {
+      const lines = (await runAll(form)).join("\n").split("\n");
+      const warnings = lines.filter((line) => line.startsWith("  warning:"));
+      assert.equal(warnings.length, 3, lines.join("\n"));
+      assert.ok(warnings[0].includes("ttlMs"), warnings.join("\n"));
+      assert.ok(warnings[1].includes('configured agent "missing" has no file'), warnings.join("\n"));
+      assert.ok(warnings[2].includes("agents.missing.primary.model: this pi does not know model"), warnings.join("\n"));
+    }
+  }, stubFetch, { modelRegistry: { find: () => undefined } });
+});
+
+test("a scoped occupant is listed unmanaged and its qualified warning reaches both reader surfaces", async () => {
+  const fx = await fixture(2_147_483_647, {
+    scoped: { primary: { model: "deepseek/deepseek-flash", rail: "deepseek" } },
+  });
+  const file = join(fx.agentDir, "agents", "scoped.md");
+  const before = TEMPLATE("acme:scout", "deepseek/deepseek-flash");
+  await writeFile(file, before);
+  const listing = '  scoped.md — not an agent: its declared name "acme:scout" is scoped';
+  await withExtension(fx, async ({ runAll }) => {
+    for (const form of ["", "config"]) {
+      const output = (await runAll(form)).join("\n");
+      const warnings = output.split("\n").filter((line) => line.startsWith("  warning:") && line.includes(file));
+      assert.equal(warnings.length, 1, output);
+      assert.ok(warnings[0].includes('the file there is not an agent: its declared name "acme:scout" is scoped'), output);
+      assert.equal(warnings[0].replace(file, "").includes("/agents"), false, warnings[0]);
+      assert.ok(warnings[0].includes("give that file a name pi registers, or drop this route"), warnings[0]);
+      if (form === "") {
+        assert.ok(output.includes("unmanaged agent files"), output);
+        assert.ok(output.split("\n").includes(listing), output);
+        assert.ok(output.includes("[skipped (no file)]"), output);
+      }
+    }
+    const applied = (await runAll("apply")).join("\n");
+    assert.ok(applied.includes("[skipped (no file)]"), applied);
+  });
+  assert.equal(await readFile(file, "utf8"), before);
+});
+
+// Advice must be safe for the actual path: a parenthetical alone does not prevent
+// a later create command from recommending an overwrite.
+for (const occupant of ["none", "agent", "scoped", "unreadable"] as const) {
+  test(`the ${occupant} occupant remedy reaches the report warning tail without destructive create advice`, async (t) => {
+    if (occupant === "unreadable" && process.getuid?.() === 0) {
+      t.skip("root can read a mode-000 file");
+      return;
+    }
+    const primary = { model: "deepseek/deepseek-flash", rail: "deepseek" as const };
+    const fx = await fixture(2_147_483_647, { New: { primary } });
+    const dir = join(fx.agentDir, "agents");
+    const file = join(dir, "New.md");
+    if (occupant !== "none") {
+      await writeFile(file, TEMPLATE(occupant === "scoped" ? "acme:scout" : "Architect", primary.model));
+      if (occupant === "unreadable") {
+        await chmod(file, 0);
+        t.after(() => chmod(file, 0o600));
+      }
+    }
+    const remedies = {
+      none: "run the /agents command to create a new agent",
+      agent: "name the route after that agent, or rename that file",
+      scoped: "give that file a name pi registers, or drop this route",
+      unreadable: "make that file readable, or remove it",
+    };
+    const notes = {
+      none: "",
+      agent: ' (the file there is agent "Architect")',
+      scoped: ' (the file there is not an agent: its declared name "acme:scout" is scoped)',
+      unreadable: " (the file there could not be read)",
+    };
+    const warnings = checkAgentFiles(
+      { ...DEFAULT_CONFIG, agentDir: dir, agents: { New: { primary, alternates: [] } } },
+      await readAgentDirectory(dir),
+      () => {},
+    );
+    const expected = `${file}: configured agent "New" has no file${notes[occupant]} — ${remedies[occupant]}`;
+    assert.deepEqual(warnings, [expected]);
+    assert.equal(warnings[0].replace(file, "").includes("/agents"), occupant === "none", warnings[0]);
+    assert.ok(warnings[0].includes(remedies[occupant]), warnings[0]);
+    await withExtension(fx, async ({ runAll }) => {
+      const report = (await runAll("")).join("\n");
+      const replay = report.split("\n").filter((line) => line.startsWith("  warning:") && line.includes(file));
+      assert.deepEqual(replay, [`  warning: ${expected}`], report);
+      assert.equal(replay[0].replace(file, "").includes("/agents"), occupant === "none", replay[0]);
+      assert.ok(replay[0].includes(remedies[occupant]), replay[0]);
+      assert.ok(report.indexOf(replay[0]) > report.indexOf("New ->"), report);
+    });
+  });
+}
