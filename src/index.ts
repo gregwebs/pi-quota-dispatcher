@@ -92,6 +92,7 @@ export {
   modelIdRejection,
   projectConfigPath,
   railFromModel,
+  skillKey,
   thinkingFor,
 } from "./config.ts";
 export type {
@@ -111,6 +112,7 @@ export type {
   ModelDefault,
   Rail,
   SkipFlag,
+  SkillBinding,
   ThinkingLevel,
 } from "./config.ts";
 
@@ -137,7 +139,12 @@ export type { Coordination, FileWritePacing, LockAttempt, LockHolder } from "./a
 
 // The models module is where a config's model ids are resolved against the pi
 // that is running; re-exported here for the same reason as the config module.
-export { checkModels, modelLookup } from "./models.ts";
+export {
+  checkModels,
+  modelLookup,
+  splitModelId,
+  unknownModelClause,
+} from "./models.ts";
 export type {
   DroppedAlternate,
   ModelCheckResult,
@@ -145,6 +152,13 @@ export type {
   ModelMiss,
   ModelRegistryLike,
 } from "./models.ts";
+
+import { type AgentFileSelection, applySkillBinding, explicitSkill } from "./skill-binding.ts";
+
+// The skill-binding module is where an explicit `/skill:` invocation selects the
+// session's model; re-exported here for the same reason as the config module.
+export { applySkillBinding, explicitSkill } from "./skill-binding.ts";
+export type { AgentFileSelection, SessionSelection, SkillBindingDeps } from "./skill-binding.ts";
 
 // ---------------------------------------------------------------- types
 
@@ -961,6 +975,12 @@ export interface NamedAgentFile {
   /** Absolute path, `<agentDir>/<filename>`. */
   file: string;
   model?: string;
+  /**
+   * The uncommented `thinking:` value, decoded but deliberately not validated: a
+   * skill binding has to tell a malformed level from an absent one and warn,
+   * which it cannot do if a bad value is dropped here.
+   */
+  thinking?: string;
   /** The file is there but its frontmatter could not be read; it names no agent either. */
   unreadable?: boolean;
 }
@@ -1018,7 +1038,8 @@ function declaredName(head: string): string | undefined {
 }
 
 /**
- * Every agent file in `agentDir`, sorted by filename.
+ * Every agent file in `agentDir`, sorted by filename. Each named file carries
+ * the `model:` and `thinking:` values it states, decoded.
  *
  * The name is the pi-visible one (see `AgentFile`), so a route keyed by a
  * declared name reaches the file that declares it. A declared name containing
@@ -1064,6 +1085,7 @@ export async function readAgentFiles(agentDir: string): Promise<AgentFile[]> {
 
     let name = entry.slice(0, -".md".length);
     let model: string | undefined;
+    let thinking: string | undefined;
     let unreadable = false;
     try {
       const head = frontmatter(await readPrefix(file));
@@ -1079,6 +1101,7 @@ export async function readAgentFiles(agentDir: string): Promise<AgentFile[]> {
         }
         if (declared) name = declared;
         model = activeModel(head);
+        thinking = activeThinking(head);
       }
     } catch {
       unreadable = true;
@@ -1088,6 +1111,7 @@ export async function readAgentFiles(agentDir: string): Promise<AgentFile[]> {
       name,
       file,
       ...(model !== undefined ? { model } : {}),
+      ...(thinking !== undefined ? { thinking } : {}),
       ...(unreadable ? { unreadable } : {}),
     });
   }
@@ -1188,6 +1212,9 @@ function contestedNote(contest: ContestedAgent): string {
   return `${contest.files.length} agent files claim the name "${contest.agent}" (${claimants}) and pi spawns whichever it loads last`;
 }
 
+/** What to do about a contested name, wherever one is reported. */
+const CONTESTED_REMEDY = "give each file its own name";
+
 /**
  * What to say about the file already sitting at the path `/agents` would
  * create, and what to do about it.
@@ -1241,7 +1268,7 @@ export function checkAgentFiles(
     const resolution = resolveAgent(directory, agent);
     let line: string;
     if (resolution.kind === "contested") {
-      line = `${directory.dir}: configured agent "${agent}" is contested: ${contestedNote(resolution)} — give each file its own name`;
+      line = `${directory.dir}: configured agent "${agent}" is contested: ${contestedNote(resolution)} — ${CONTESTED_REMEDY}`;
     } else if (resolution.kind === "missing") {
       const { why, remedy } = occupantNote(resolution.occupant);
       line = `${resolution.definition.file}: configured agent "${agent}" has no file${why} — ${remedy}`;
@@ -1256,6 +1283,47 @@ export function checkAgentFiles(
     }
   }
   return warnings;
+}
+
+/**
+ * A reader for the file that names `agent` right now, or why there is nothing to
+ * read — for a skill binding, which selects whatever that file says.
+ *
+ * A factory rather than a two-string function: the agent dir is fixed for the
+ * reader's life and the bound route varies per call, so each call names one thing
+ * and no signature carries two adjacent strings.
+ *
+ * The read is fresh on every call and resolved by pi-visible name exactly as a
+ * spawn is (`resolveAgent`), so a dispatcher write or a hand edit since the last
+ * invocation is what the session gets. Nothing is cached and nothing is written.
+ *
+ * `why` is a finished clause built from the boot check's own accounts of the same
+ * states (`contestedNote`, `occupantNote`), so one state reads the same wherever
+ * the reader meets it. An empty `model:` or `thinking:` states nothing, the way
+ * an empty `name:` declares nothing, so it comes back absent.
+ */
+export function agentSelectionReader(agentDir: string): (agent: string) => Promise<AgentFileSelection> {
+  return async (agent) => {
+    const directory = await readAgentDirectory(agentDir);
+    const resolution = resolveAgent(directory, agent);
+    switch (resolution.kind) {
+      case "contested":
+        return { kind: "unavailable", why: `${contestedNote(resolution)} — ${CONTESTED_REMEDY}` };
+      case "missing": {
+        const { why, remedy } = occupantNote(resolution.occupant);
+        return { kind: "unavailable", why: `it has no file at ${resolution.definition.file}${why} — ${remedy}` };
+      }
+      case "defined": {
+        const file = directory.files.find(
+          (candidate): candidate is NamedAgentFile =>
+            candidate.kind === "agent" && candidate.file === resolution.definition.file,
+        );
+        const model = file?.model;
+        const thinking = file?.thinking;
+        return { kind: "file", ...(model ? { model } : {}), ...(thinking ? { thinking } : {}) };
+      }
+    }
+  };
 }
 
 /**
@@ -3080,8 +3148,10 @@ export default function (pi: ExtensionAPI) {
    *
    * Loading is separate from booting because the model check needs the
    * `ExtensionContext`, and the module-load timer below is the one caller with
-   * none. It only needs the cadence, so it reads the config directly; every
-   * caller that can supply a context goes through `bootOnce`.
+   * none. It only needs the cadence, so it reads the config directly. Every
+   * caller that needs the checks and the dispatcher goes through `bootOnce`; the
+   * input handler is the deliberate exception, because a skill binding needs
+   * neither.
    */
   let loadedPromise: Promise<LoadedConfig> | undefined;
   const loadedOnce = () => (loadedPromise ??= loadConfig());
@@ -3238,5 +3308,49 @@ export default function (pi: ExtensionAPI) {
     stopped = true;
     if (timer) clearInterval(timer);
     setFooterStatus(ctx, undefined);
+  });
+
+  // An explicit `/skill:<name>` applies its binding before pi expands the skill:
+  // input handlers run first and are awaited. The path touches only the cached
+  // config and the agent dir — no boot, no quota request, no credential, no write
+  // — and returns nothing, so the text reaches pi exactly as typed and the skill
+  // runs whatever happened here. See
+  // docs/adr/0014-skill-bindings-read-the-agent-file.md.
+  //
+  // `loadedOnce` rather than `bootOnce`: a boot runs the model and agent-file
+  // checks and builds the dispatcher, none of which a binding needs, and a
+  // binding must not be what triggers them.
+  pi.on("input", async (event, ctx) => {
+    // Answered before the config is read, so ordinary input costs nothing.
+    if (explicitSkill(event.text) === undefined) return;
+    const { config } = await loadedOnce();
+    await applySkillBinding(
+      {
+        config,
+        readSelection: agentSelectionReader(config.agentDir),
+        selection: {
+          // `ctx.model` is a live getter over the session's current model, so
+          // reading it before the switch gives the pre-switch model, and reading
+          // it after a fault says whether the session moved.
+          getModel: () => ctx.model,
+          // Feature-detected like `modelLookup`: a context whose registry lacks
+          // `find` is no registry, so the binding warns "does not know model"
+          // rather than throwing into the catch-all.
+          findModel: (provider, modelId) =>
+            typeof ctx.modelRegistry?.find === "function"
+              ? ctx.modelRegistry.find(provider, modelId)
+              : undefined,
+          setModel: (model) => pi.setModel(model),
+          getThinkingLevel: () => pi.getThinkingLevel(),
+          setThinkingLevel: (level) => pi.setThinkingLevel(level),
+        },
+        // A binding's notice is a UI affordance like every other one here; a
+        // headless context has nowhere to show it and no one watching.
+        notify: (message, type) => {
+          if (ctx.hasUI) ctx.ui.notify(message, type);
+        },
+      },
+      event.text,
+    );
   });
 }

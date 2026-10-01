@@ -47,7 +47,7 @@ export const THINKING_LEVELS: readonly ThinkingLevel[] = [
 ];
 
 /** The levels as a rejection words them, e.g. `"off", "minimal", ...`. */
-const THINKING_LEVEL_LIST = THINKING_LEVELS.map((level) => `"${level}"`).join(", ");
+export const THINKING_LEVEL_LIST = THINKING_LEVELS.map((level) => `"${level}"`).join(", ");
 
 /**
  * Whether `value` is a level this seam accepts.
@@ -264,6 +264,14 @@ export interface DispatcherConfig {
    */
   models: Record<string, ModelDefault>;
   /**
+   * Skill bindings, keyed by skill name: the agent route whose file supplies the
+   * model and thinking level an explicit `/skill:<name>` invocation selects for
+   * the session. The table ships empty; a binding is opt-in like a route. What a
+   * binding means and why the route's file answers is in
+   * docs/adr/0014-skill-bindings-read-the-agent-file.md.
+   */
+  skills: Record<string, string>;
+  /**
    * The agents this extension manages, keyed by agent name — the name pi spawns
    * the agent under (the file's `name:`, else its filename stem), which a route
    * also uses as its key; see `resolveAgent` in `index.ts`. A name is not a
@@ -385,15 +393,16 @@ export function agentNameRejection(name: string): string | undefined {
   return undefined;
 }
 
-/** The characters a name may be spelled with inside a `sources` key unquoted. */
-const PLAIN_AGENT_CHARS = "[A-Za-z0-9_-]+";
+/** The characters a name — an agent's or a skill's — may be spelled with
+ * inside a `sources` key unquoted. */
+const PLAIN_NAME_CHARS = "[A-Za-z0-9_-]+";
 
 /** Names that need no quoting in a `sources` key; the rest are quoted. */
-const PLAIN_AGENT_KEY = new RegExp(`^${PLAIN_AGENT_CHARS}$`);
+const PLAIN_NAME = new RegExp(`^${PLAIN_NAME_CHARS}$`);
 
 /** The bare removal marker for a plain name, built from the same character
- * class as `PLAIN_AGENT_KEY` so the two spellings of a plain name cannot drift. */
-const PLAIN_DISABLED_MARKER = new RegExp(`^agents\\.(${PLAIN_AGENT_CHARS})$`);
+ * class as `PLAIN_NAME` so the two spellings of a plain name cannot drift. */
+const PLAIN_DISABLED_MARKER = new RegExp(`^agents\\.(${PLAIN_NAME_CHARS})$`);
 
 /**
  * The key an agent is named by in `sources` and in every warning that names a
@@ -417,7 +426,19 @@ const PLAIN_DISABLED_MARKER = new RegExp(`^agents\\.(${PLAIN_AGENT_CHARS})$`);
  * is the disabled marker.
  */
 export function agentKey(agent: string): string {
-  return PLAIN_AGENT_KEY.test(agent) ? `agents.${agent}` : `agents[${JSON.stringify(agent)}]`;
+  return PLAIN_NAME.test(agent) ? `agents.${agent}` : `agents[${JSON.stringify(agent)}]`;
+}
+
+/**
+ * The key a skill binding is named by in `sources`, in `describeConfig` and in
+ * every warning about it — `agentKey`'s rule, for the same reason: a skill name
+ * may hold a `.`, and a flat dotted key must name exactly one binding.
+ *
+ *   skillKey("code-review") === "skills.code-review"
+ *   skillKey("v1.2")        === 'skills["v1.2"]'
+ */
+export function skillKey(skill: string): string {
+  return PLAIN_NAME.test(skill) ? `skills.${skill}` : `skills[${JSON.stringify(skill)}]`;
 }
 
 /**
@@ -451,6 +472,87 @@ function disabledAgentOf(key: string): string | undefined {
 /** JSON objects only; arrays, `null` and primitives are not layers or routes. */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** A skill name and the agent route its explicit `/skill:<name>` invocation selects from. */
+export interface SkillBinding {
+  skill: string;
+  route: string;
+}
+
+/**
+ * A `skills` entry as a binding, or the sentence that rejects it.
+ *
+ * The skill is named the way pi splits an explicit invocation — everything after
+ * `/skill:` up to the first space — so a name that is empty or holds a space can
+ * never be invoked, and a binding for it could never fire. That is the only rule
+ * on the skill: pi loads a skill whose name breaks the Agent Skills grammar (it
+ * warns and keeps it), so a stricter rule here would refuse a skill the user can
+ * run.
+ *
+ * The route is checked as a *name* only. Whether `agents` configures it is
+ * deliberately not asked here: another layer may complete the table, and an
+ * unconfigured route warns at invocation (`applySkillBinding`), naming the skill
+ * it cost.
+ */
+function parseSkillBinding(skill: string, route: unknown): { binding: SkillBinding } | { rejection: string } {
+  if (skill === "" || skill.includes(" ")) {
+    return {
+      rejection: `"skills" entry ${JSON.stringify(skill)} names no skill (an explicit invocation names a skill up to the first space)`,
+    };
+  }
+  if (typeof route !== "string" || route === "") {
+    return { rejection: `"${skillKey(skill)}" must be a string naming an agent route` };
+  }
+  const rejection = agentNameRejection(route);
+  if (rejection !== undefined) {
+    return { rejection: `"${skillKey(skill)}" must name an agent route: ${rejection}` };
+  }
+  return { binding: { skill, route } };
+}
+
+/**
+ * `skills[binding.skill] = binding.route`, as an own data property whatever the
+ * name.
+ *
+ * Plain assignment to `__proto__` runs the inherited setter, which ignores a
+ * string: the binding would vanish while `sources` still named it. Agent names
+ * refuse `Object.prototype`'s names instead, because a name is also a filename
+ * and the refusal costs nothing; a skill name is pi's, and this seam refuses no
+ * name pi can invoke (see `parseSkillBinding`).
+ */
+function bindSkill(skills: Record<string, string>, binding: SkillBinding): void {
+  Object.defineProperty(skills, binding.skill, {
+    value: binding.route,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
+/**
+ * Walk a `skills` table once, validating every entry and handing each accepted
+ * binding to `accept`, each rejected one's reason to `reject`.
+ *
+ * The built-in clone and each config layer fold the same table by the same rule
+ * — a valid entry lands, a rejected one is dropped with its sentence — and only
+ * differ in where the reason goes and where the binding lands, so the walk lives
+ * here once. `entries` is `Object.entries` order, which is the order the caller
+ * wants to warn in.
+ */
+function foldSkillEntries(
+  entries: Iterable<[string, unknown]>,
+  reject: (reason: string) => void,
+  accept: (binding: SkillBinding) => void,
+): void {
+  for (const [skill, route] of entries) {
+    const parsed = parseSkillBinding(skill, route);
+    if ("rejection" in parsed) {
+      reject(parsed.rejection);
+      continue;
+    }
+    accept(parsed.binding);
+  }
 }
 
 function isRail(value: unknown): value is Rail {
@@ -506,15 +608,17 @@ function mismatchedRail(model: string, rail: Rail): Rail | undefined {
  *   weeklySwitchAt   90
  *   margin           10
  *   models           {}
+ *   skills           {}
  *
  * `sessionAlwaysSwitchAt` is deliberately absent rather than defaulted: it is
  * opt-in, and its absence is what keeps the legacy margin policy.
  *
- * `models` and `agents` are both empty, and that is the point. There is no
- * opinion here about which agents exist, where their work should go, or which
- * model thinks how hard: a shipped table names files the user never named and
- * routes work to rails they never chose. The README shows the snippet to paste
- * instead.
+ * `models`, `skills` and `agents` are all empty, and that is the point. There
+ * is no opinion here about which agents exist, where their work should go, or
+ * which model thinks how hard: a shipped table names files the user never named
+ * and routes work to rails they never chose. A shipped binding would switch the
+ * session's model on a skill the user never bound. The README shows the snippet
+ * to paste instead.
  */
 export function defaultConfig(agentDir: string = getAgentDir()): DispatcherConfig {
   return {
@@ -528,6 +632,7 @@ export function defaultConfig(agentDir: string = getAgentDir()): DispatcherConfi
     weeklySwitchAt: 90,
     margin: 10,
     models: {},
+    skills: {},
     agents: {},
   };
 }
@@ -623,9 +728,11 @@ export interface LoadedConfig {
   files: ConfigFile[];
   /**
    * Dotted key -> the layer that supplied the effective value. Covers the
-   * scalar keys and each candidate field of each agent, e.g. `sessionSwitchAt`,
+   * scalar keys, each skill binding and each candidate field of each agent,
+   * e.g. `sessionSwitchAt`, `skills.code-review`,
    * `agents.planner.primary.model` and `agents.planner.alternates[0].model`. A
-   * key no layer set is `"built-in"`.
+   * key no layer set is `"built-in"`. A skill name outside `[A-Za-z0-9_-]` is
+   * quoted the same way an agent is (`skills["v1.2"]`, see `skillKey`).
    *
    * It describes the config that actually resulted, so an agent or candidate a
    * layer proposes but validation rejects leaves no entry: `sources` never
@@ -704,7 +811,7 @@ const JSON_BARE_QUOTED_FILE = /^"[\s\S]*$/u;
 
 /** The text of a thrown value, whatever was thrown: a parser error is not
  * always an `Error`, and a fault must not come out as `undefined`. */
-function errorText(err: unknown): string {
+export function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
@@ -966,6 +1073,11 @@ export interface MergeResult {
  *     an object, or an unrecognised key inside one, or a `rail` that is not one
  *     of the three known rails, or a registered rail that reads like a
  *     different account's model than its key
+ *   - a `skills` value that is not an object, a skill name an explicit
+ *     invocation could never name (empty, or holding a space), or a binding
+ *     whose route is not a string that could name an agent. A binding to a
+ *     route `agents` does not configure is deliberately *not* a load warning:
+ *     another layer may complete the table, and the invocation warns instead.
  *   - a candidate left with no rail: one that states none and whose model has
  *     no registered rail cannot name an account to route to
  *   - a `model` whose prefix reads like a different rail's model than the one
@@ -1207,7 +1319,15 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
     }
     models[id] = { ...entry };
   }
-  const config: DispatcherConfig = { ...base, models, agents };
+  // Cloned for the same reason `models` is, and validated with the same rule a
+  // layer gets: a bad base entry is dropped with the warning a layer would get.
+  const skills: Record<string, string> = {};
+  foldSkillEntries(
+    Object.entries(base.skills),
+    (reason) => warnings.push(`built-in: ${reason}`),
+    (binding) => bindSkill(skills, binding),
+  );
+  const config: DispatcherConfig = { ...base, models, skills, agents };
   const scalarTarget = config as unknown as Record<ScalarKey, string | number>;
 
   const sources: Record<string, ConfigSource> = {};
@@ -1237,6 +1357,7 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
     if (entry.rail !== undefined) setSource(`models.${id}.rail`, "built-in");
     if (entry.thinking !== undefined) setSource(`models.${id}.thinking`, "built-in");
   }
+  for (const skill of Object.keys(config.skills)) setSource(skillKey(skill), "built-in");
   for (const [agent, route] of Object.entries(config.agents)) {
     const key = agentKey(agent);
     setSource(`${key}.primary.model`, "built-in");
@@ -1498,6 +1619,26 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
     }
   };
 
+  /**
+   * Fold one layer's `skills` table in, per skill. Flat like a scalar but keyed:
+   * a binding for a skill replaces the one beneath it and every other binding is
+   * inherited, and a rejected entry leaves the binding beneath it standing.
+   */
+  const applySkills = (value: unknown, source: ConfigSource, warn: (message: string) => void): void => {
+    if (!isPlainObject(value)) {
+      warn(`"skills" must be an object`);
+      return;
+    }
+    foldSkillEntries(
+      Object.entries(value),
+      warn,
+      (binding) => {
+        bindSkill(config.skills, binding);
+        setSource(skillKey(binding.skill), source);
+      },
+    );
+  };
+
   const labelWarn = (layer: MergeLayer): ((message: string) => void) => {
     const label = labelOf(layer);
     return (message: string) => {
@@ -1603,6 +1744,11 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       if (key === "models") {
         // Merged in the pass above, before any agent, so a candidate in any
         // layer can inherit a rail registered in any layer.
+        continue;
+      }
+
+      if (key === "skills") {
+        applySkills(value, source, warn);
         continue;
       }
 
@@ -1750,8 +1896,9 @@ export function describeConfigWarnings(loaded: LoadedConfig): string[] {
  *
  * `describeConfigLayers`'s line first, then one line per effective value: the
  * scalars in a fixed order, then the `models` table sorted by model id — each
- * entry's `rail` before its `thinking` — then the agents sorted by name, each
- * rendered `<dotted-key> = <value>  [<source>]`:
+ * entry's `rail` before its `thinking` — then the skill bindings sorted by skill
+ * name, `skills.<name> = <route>`, then the agents sorted by name, each rendered
+ * `<dotted-key> = <value>  [<source>]`:
  *
  *   `  sessionSwitchAt = 75  [built-in]`
  *
@@ -1797,6 +1944,15 @@ export function describeConfig(loaded: LoadedConfig): string[] {
     if (entry.thinking !== undefined) {
       lines.push(`  models.${id}.thinking = ${entry.thinking}  [${sourceOf(`models.${id}.thinking`)}]`);
     }
+  }
+
+  // Between the models and the agents, so the block reads what is registered,
+  // then which route each skill takes its selection from, then the routes. A
+  // binding to a route the table does not configure is listed all the same: it
+  // is in the effective config, and the invocation is where it warns.
+  for (const skill of Object.keys(loaded.config.skills).sort()) {
+    const key = skillKey(skill);
+    lines.push(`  ${key} = ${loaded.config.skills[skill]}  [${sourceOf(key)}]`);
   }
 
   // A disabled agent is absent from `loaded.config.agents` by construction, so

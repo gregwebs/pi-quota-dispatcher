@@ -1,13 +1,21 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import extension, { checkAgentFiles, DEFAULT_CONFIG, parseInvocation, readAgentDirectory, unknownFormNotice } from "../src/index.ts";
+import type { ThinkingLevel } from "../src/config.ts";
+import extension, {
+  checkAgentFiles,
+  DEFAULT_CONFIG,
+  explicitSkill,
+  parseInvocation,
+  readAgentDirectory,
+  unknownFormNotice,
+} from "../src/index.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
 // documented literal directly.
@@ -50,6 +58,7 @@ const CONFIGURED_AGENTS = {
 async function fixture(
   pollMs = 2_147_483_647,
   agents: Record<string, unknown> = CONFIGURED_AGENTS,
+  extraGlobal: Record<string, unknown> = {},
 ): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "pqd-cmd-"));
   const agentDir = join(root, "agent");
@@ -78,6 +87,7 @@ async function fixture(
       claudeCredsPath,
       pollMs,
       agents,
+      ...extraGlobal,
     }),
     "utf8",
   );
@@ -159,10 +169,116 @@ interface Ctx {
   hasUI: boolean;
   ui: Ui;
   modelRegistry?: ModelRegistryLike;
+  /** The session's model; present only when a test supplies a `FakeSession`. */
+  readonly model?: FakeModel;
 }
 
+/** A model as the fake registry answers it and the fake session holds it. */
+interface FakeModel {
+  provider: string;
+  id: string;
+}
+
+/** What one `setModel` call does. */
+type SetModelResult = boolean | Error | { moved: true; error: Error };
+
+/**
+ * The session pi's model and thinking setters act on. The extension reaches it
+ * through `ctx.model` and the `pi.setModel`/`getThinkingLevel`/`setThinkingLevel`
+ * API; every access is recorded in `calls` so a test can pin the order.
+ */
+interface FakeSession {
+  /** In order: "getModel", "getThinkingLevel", "setModel:<provider>/<id>", "setThinkingLevel:<level>". */
+  calls: string[];
+  model?: string;
+  thinking: ThinkingLevel;
+  /** What pi's own setModel resets the level to (its per-model/default rule), so "retained" is proven. */
+  switchLevel: ThinkingLevel;
+  /** pi clamps to what the target supports; the fake stands in for that. */
+  clamp?: (asked: ThinkingLevel) => ThinkingLevel;
+  /** What the first setModel does: resolve true/false, reject before moving, or move and then reject. */
+  setModelResult: SetModelResult;
+  /** What every later setModel does — the restore's. Defaults to `true`. */
+  laterSetModelResult?: SetModelResult;
+  /** Thrown by the first setThinkingLevel after it has already applied the level. */
+  thinkingThrows?: Error;
+}
+
+function fakeSession(overrides: Partial<FakeSession> = {}): FakeSession {
+  return {
+    calls: [],
+    model: "deepseek/deepseek-flash",
+    thinking: "medium",
+    switchLevel: "minimal",
+    setModelResult: true,
+    ...overrides,
+  };
+}
+
+/**
+ * One object per `provider/id` for the whole file. pi returns the *same* model
+ * object while the session stays on the same model, and `pi.setModel` does not
+ * short-circuit re-selecting the model already in place — the same-object
+ * movement check depends on seeing that (issue #52 F1). A fresh `{ provider, id
+ * }` on every read would make even an unmoved model look like a move by
+ * identity, so the registry's `find` and the fake `ctx.model` both hand back the
+ * one object this map memoizes.
+ */
+const MODEL_OBJECTS = new Map<string, FakeModel>();
+
+function modelOf(spec: string | undefined): FakeModel | undefined {
+  if (spec === undefined) return undefined;
+  const existing = MODEL_OBJECTS.get(spec);
+  if (existing !== undefined) return existing;
+  const slash = spec.indexOf("/");
+  const model = { provider: spec.slice(0, slash), id: spec.slice(slash + 1) };
+  MODEL_OBJECTS.set(spec, model);
+  return model;
+}
+
+/**
+ * The extension API's session-selection methods over a `FakeSession`, with
+ * pi's order of effects: a rejection before the move changes nothing, `false`
+ * changes nothing, and a successful (or moved-then-failed) switch assigns the
+ * model first and resets the level by pi's own rule, as `AgentSession.setModel`
+ * does before its later steps can throw.
+ */
+function sessionApi(session: FakeSession) {
+  let setModels = 0;
+  let thinkingSets = 0;
+  return {
+    setModel: async (model: FakeModel): Promise<boolean> => {
+      session.calls.push(`setModel:${model.provider}/${model.id}`);
+      const result = setModels++ === 0 ? session.setModelResult : (session.laterSetModelResult ?? true);
+      if (result === false) return false;
+      if (result instanceof Error) throw result;
+      session.model = `${model.provider}/${model.id}`;
+      session.thinking = session.clamp?.(session.switchLevel) ?? session.switchLevel;
+      if (result !== true) throw result.error;
+      return true;
+    },
+    getThinkingLevel: (): ThinkingLevel => {
+      session.calls.push("getThinkingLevel");
+      return session.thinking;
+    },
+    setThinkingLevel: (level: ThinkingLevel): void => {
+      session.calls.push(`setThinkingLevel:${level}`);
+      session.thinking = session.clamp?.(level) ?? level;
+      if (thinkingSets++ === 0 && session.thinkingThrows) throw session.thinkingThrows;
+    },
+  };
+}
+
+/**
+ * The events this harness fires, discriminated by `type`, so an input event
+ * cannot be passed where a lifecycle handler expects a reason.
+ */
+type HarnessEvent =
+  | { type: "session_start" | "session_shutdown"; reason: string }
+  | { type: "input"; text: string; source: "interactive" };
+
 type CommandHandler = (args: string, ctx: Ctx) => Promise<void>;
-type EventHandler = (event: { reason: string }, ctx: Ctx) => Promise<void>;
+type EventHandler = (event: HarnessEvent, ctx: Ctx) => Promise<unknown>;
 
 /** What a test can drive once the extension is installed. */
 interface Harness {
@@ -172,6 +288,10 @@ interface Harness {
   runAll: (args: string) => Promise<string[]>;
   /** Fire the `session_start` handler the extension registered. */
   sessionStart: (reason?: string) => Promise<void>;
+  /** Fire the registered `input` handler with typed text and return what it returned. */
+  input: (text: string) => Promise<unknown>;
+  /** The events the extension registered a handler for, in registration order. */
+  events: string[];
   /** Everything the extension pushed to the UI, in order. */
   notifications: Array<{ text: string; level: string }>;
   statuses: Array<{ key: string; text: string | undefined }>;
@@ -188,7 +308,7 @@ async function withExtension(
   fx: Fixture,
   body: (h: Harness) => Promise<void>,
   fetchFactory: () => typeof fetch = stubFetch,
-  opts: { hasUI?: boolean; modelRegistry?: ModelRegistryLike } = {},
+  opts: { hasUI?: boolean; modelRegistry?: ModelRegistryLike; session?: FakeSession; notifyThrows?: boolean } = {},
 ): Promise<void> {
   const previousEnv = process.env[ENV_AGENT_DIR];
   const previousCwd = process.cwd();
@@ -205,14 +325,39 @@ async function withExtension(
   let command: CommandHandler | undefined;
   let description: string | undefined;
 
-  const makeCtx = (): Ctx => ({
-    hasUI,
-    ui: {
-      notify: (text: string, level?: string) => notifications.push({ text, level: level ?? "" }),
-      setStatus: (key: string, text?: string) => statuses.push({ key, text }),
-    },
-    ...(opts.modelRegistry ? { modelRegistry: opts.modelRegistry } : {}),
-  });
+  const events: string[] = [];
+  const session = opts.session;
+
+  const makeCtx = (): Ctx => {
+    const ctx: Ctx = {
+      hasUI,
+      ui: {
+        notify: (text: string, level?: string) => {
+          notifications.push({ text, level: level ?? "" });
+          if (opts.notifyThrows) throw new Error("notify failed");
+        },
+        setStatus: (key: string, text?: string) => statuses.push({ key, text }),
+      },
+      ...(opts.modelRegistry ? { modelRegistry: opts.modelRegistry } : {}),
+    };
+    if (session) {
+      Object.defineProperty(ctx, "model", {
+        enumerable: true,
+        get: () => {
+          session.calls.push("getModel");
+          // `MODEL_OBJECTS` is the one object per `provider/id`: the same object
+          // the registry's `find` returns, so a same-model re-selection compares
+          // equal by identity and a real move does not.
+          return modelOf(session.model);
+        },
+      });
+    }
+    return ctx;
+  };
+
+  const unexpected = (name: string) => () => {
+    throw new Error(`${name} called without a FakeSession`);
+  };
 
   const api = {
     registerCommand: (_name: string, spec: { description?: string; handler: CommandHandler }) => {
@@ -220,8 +365,16 @@ async function withExtension(
       description = spec.description;
     },
     on: (event: string, handler: EventHandler) => {
+      events.push(event);
       eventHandlers[event] = handler;
     },
+    ...(session
+      ? sessionApi(session)
+      : {
+          setModel: unexpected("setModel"),
+          getThinkingLevel: unexpected("getThinkingLevel"),
+          setThinkingLevel: unexpected("setThinkingLevel"),
+        }),
   } as unknown as ExtensionAPI;
 
   try {
@@ -245,13 +398,19 @@ async function withExtension(
         return notifications.map((n) => n.text);
       },
       sessionStart: async (reason = "startup") => {
-        await eventHandlers.session_start?.({ reason }, makeCtx());
+        await eventHandlers.session_start?.({ type: "session_start", reason }, makeCtx());
       },
+      input: async (text: string) => {
+        const handler = eventHandlers.input;
+        assert.ok(handler, "the extension must register an input handler");
+        return handler({ type: "input", text, source: "interactive" }, makeCtx());
+      },
+      events,
     };
 
     await body(harness);
   } finally {
-    await eventHandlers.session_shutdown?.({ reason: "shutdown" }, makeCtx());
+    await eventHandlers.session_shutdown?.({ type: "session_shutdown", reason: "shutdown" }, makeCtx());
     globalThis.fetch = previousFetch;
     if (previousEnv === undefined) delete process.env[ENV_AGENT_DIR];
     else process.env[ENV_AGENT_DIR] = previousEnv;
@@ -710,11 +869,13 @@ test("an empty table still reports one line per rail and writes nothing", async 
 
 /**
  * The running pi's model registry. `find` is the only method this extension
- * reads: it answers the model, or undefined when this pi cannot spawn it.
+ * reads: it answers the model, or undefined when this pi cannot spawn it. It
+ * answers with the shared `MODEL_OBJECTS` instance, so the object `setModel` is
+ * handed is the object `ctx.model` returns.
  */
 function registry(known: Record<string, string[]>): ModelRegistryLike {
   return {
-    find: (provider, modelId) => (known[provider]?.includes(modelId) ? { provider, id: modelId } : undefined),
+    find: (provider, modelId) => (known[provider]?.includes(modelId) ? modelOf(`${provider}/${modelId}`) : undefined),
   };
 }
 
@@ -1410,4 +1571,869 @@ test("disabled ordering warning reaches report refresh and config without leakin
       for (const word of ["sessionSwitchAt", "90", "95", globalPath, projectPath, "disabled"]) assert.ok(warnings[0].includes(word), warnings[0]);
     }
   }, () => stubFetch({ claudeSession: 95, codexSession: 85 }));
+});
+
+// ---------------------------------------------------------------- skill bindings (issue #52)
+
+/** Every model the input tests' pi knows; anything else is unknown to it. */
+const KNOWN_MODELS = registry({
+  "claude-bridge": ["claude-opus-5-5"],
+  "openai-codex": ["gpt-6-sol", "gpt-6-astra"],
+  deepseek: ["deepseek-flash"],
+});
+
+const BINDINGS = { "implementation-plan": "planner", "code-review": "reviewer" };
+
+const PLANNER_BOUND = 'Skill "implementation-plan" is bound to agent route "planner"';
+const REVIEWER_BOUND = 'Skill "code-review" is bound to agent route "reviewer"';
+
+/** The fixture with skill bindings in its global config. */
+function skillFixture(skills: Record<string, unknown> = BINDINGS): Promise<Fixture> {
+  return fixture(2_147_483_647, CONFIGURED_AGENTS, { skills });
+}
+
+/** An agent file with the frontmatter lines given, verbatim. */
+function agentFile(...lines: string[]): string {
+  return `---\n${lines.join("\n")}\n---\n\nBody.\n`;
+}
+
+/**
+ * The quota network, refused: any request fails the call and is counted, so a
+ * test can assert the input path made none. Its callers install the extension
+ * and drive `input` without a `session_start`, so no startup evaluation or poll
+ * ever reaches the network; `pollMs` is the timer max besides.
+ */
+function refusingFetch(): { factory: () => typeof fetch; count: () => number } {
+  let count = 0;
+  const refused = (async (url: string | URL) => {
+    count++;
+    throw new Error(`no quota request expected: ${String(url)}`);
+  }) as unknown as typeof fetch;
+  return { factory: () => refused, count: () => count };
+}
+
+/**
+ * The quota network, counted but answered normally, so a test can let startup's
+ * own evaluation succeed and then assert an invocation added no request.
+ */
+function countingStubFetch(overrides: Partial<RailReadings> = {}): { factory: () => typeof fetch; count: () => number } {
+  let count = 0;
+  const stub = stubFetch(overrides);
+  const counting = (async (url: string | URL) => {
+    count++;
+    return stub(url);
+  }) as unknown as typeof fetch;
+  return { factory: () => counting, count: () => count };
+}
+
+/**
+ * Install the extension over `session` with the known-model registry and a
+ * refusing fetch, and assert afterwards that nothing reached the network.
+ */
+async function withSkills(
+  fx: Fixture,
+  session: FakeSession,
+  body: (h: Harness) => Promise<void>,
+  opts: { modelRegistry?: ModelRegistryLike; notifyThrows?: boolean; noRegistry?: boolean } = {},
+): Promise<void> {
+  const quota = refusingFetch();
+  await withExtension(fx, body, quota.factory, {
+    session,
+    ...(opts.noRegistry ? {} : { modelRegistry: opts.modelRegistry ?? KNOWN_MODELS }),
+    ...(opts.notifyThrows ? { notifyThrows: true } : {}),
+  });
+  assert.equal(quota.count(), 0, "a skill invocation must make no quota request");
+}
+
+/** The calls a successful switch makes: read, switch, ask for the level, read it back. */
+function selectionCalls(model: string, level: ThinkingLevel): string[] {
+  return ["getModel", "getThinkingLevel", `setModel:${model}`, `setThinkingLevel:${level}`, "getThinkingLevel"];
+}
+
+test("a bound skill selects the file's model, then its stated level, and leaves the input to pi", async () => {
+  const fx = await skillFixture();
+  const before = await readFile(fx.plannerFile, "utf8");
+  const session = fakeSession();
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    assert.equal(await input("/skill:implementation-plan write the plan for #52"), undefined);
+    assert.deepEqual(session.calls, selectionCalls("claude-bridge/claude-opus-5-5", "high"));
+    assert.deepEqual(notifications, [
+      { text: "Skill implementation-plan → planner: claude-bridge/claude-opus-5-5, thinking high", level: "info" },
+    ]);
+  });
+
+  assert.equal(session.model, "claude-bridge/claude-opus-5-5");
+  assert.equal(session.thinking, "high");
+  assert.equal(await readFile(fx.plannerFile, "utf8"), before, "invocation must not write the agent file");
+});
+
+test("the bound agent is found by its declared name when the filename differs", async () => {
+  const fx = await skillFixture();
+  await rm(fx.plannerFile);
+  await writeFile(
+    join(dirname(fx.plannerFile), "plan-work.md"),
+    agentFile("name: planner", 'model: "openai-codex/gpt-6-sol"', "thinking: low"),
+  );
+  const session = fakeSession();
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    assert.equal(await input("/skill:implementation-plan"), undefined);
+    assert.deepEqual(session.calls, selectionCalls("openai-codex/gpt-6-sol", "low"));
+    assert.deepEqual(notifications, [
+      { text: "Skill implementation-plan → planner: openai-codex/gpt-6-sol, thinking low", level: "info" },
+    ]);
+  });
+});
+
+test("each invocation reads the file as it stands", async () => {
+  const fx = await skillFixture();
+  const session = fakeSession();
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    await input("/skill:implementation-plan first");
+    await writeFile(fx.plannerFile, agentFile("name: planner", 'model: "openai-codex/gpt-6-sol"', "thinking: medium"));
+    await input("/skill:implementation-plan second");
+
+    assert.deepEqual(session.calls, [
+      ...selectionCalls("claude-bridge/claude-opus-5-5", "high"),
+      ...selectionCalls("openai-codex/gpt-6-sol", "medium"),
+    ]);
+    assert.deepEqual(
+      notifications.map((n) => n.text),
+      [
+        "Skill implementation-plan → planner: claude-bridge/claude-opus-5-5, thinking high",
+        "Skill implementation-plan → planner: openai-codex/gpt-6-sol, thinking medium",
+      ],
+    );
+  });
+  assert.equal(session.model, "openai-codex/gpt-6-sol");
+  assert.equal(session.thinking, "medium");
+});
+
+test("a file left stale by a hold is used as it is, without a quota read", async () => {
+  const fx = await skillFixture();
+  // Not the planner's primary nor its alternate: only a hold or a hand edit
+  // leaves the file here, and the file is still the authority.
+  await writeFile(fx.plannerFile, agentFile("name: planner", 'model: "deepseek/deepseek-flash"', "thinking: high"));
+  const session = fakeSession({ model: "openai-codex/gpt-6-sol" });
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    assert.equal(await input("/skill:implementation-plan"), undefined);
+    assert.deepEqual(session.calls, selectionCalls("deepseek/deepseek-flash", "high"));
+    assert.deepEqual(notifications, [
+      { text: "Skill implementation-plan → planner: deepseek/deepseek-flash, thinking high", level: "info" },
+    ]);
+  });
+  assert.equal(session.model, "deepseek/deepseek-flash");
+});
+
+test("a file with no thinking line keeps the session's level across the switch", async () => {
+  const fx = await skillFixture();
+  await writeFile(fx.plannerFile, agentFile("name: planner", 'model: "claude-bridge/claude-opus-5-5"'));
+  // pi's own switch would leave the session on `low`; the file asked for nothing.
+  const session = fakeSession({ thinking: "medium", switchLevel: "low" });
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    assert.equal(await input("/skill:implementation-plan"), undefined);
+    assert.deepEqual(session.calls, selectionCalls("claude-bridge/claude-opus-5-5", "medium"));
+    assert.deepEqual(notifications, [
+      {
+        text: "Skill implementation-plan → planner: claude-bridge/claude-opus-5-5, thinking retained (medium)",
+        level: "info",
+      },
+    ]);
+  });
+  assert.equal(session.thinking, "medium");
+});
+
+test("an explicit thinking: off is applied, not taken for absent", async () => {
+  const fx = await skillFixture();
+  await writeFile(fx.plannerFile, agentFile("name: planner", 'model: "claude-bridge/claude-opus-5-5"', "thinking: off"));
+  const session = fakeSession({ thinking: "high", switchLevel: "high" });
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    await input("/skill:implementation-plan");
+    assert.deepEqual(session.calls, selectionCalls("claude-bridge/claude-opus-5-5", "off"));
+    assert.deepEqual(notifications, [
+      { text: "Skill implementation-plan → planner: claude-bridge/claude-opus-5-5, thinking off", level: "info" },
+    ]);
+  });
+  assert.equal(session.thinking, "off");
+});
+
+/**
+ * The file's scalars are read by the conventions a spawn's file is read by: a
+ * quoted value is unquoted, a trailing comment is not part of it, a commented
+ * line states nothing, and an empty `thinking:` states nothing either — so it
+ * keeps the session's level rather than being taken for a level.
+ */
+test("quoted, commented and empty frontmatter scalars are read the way the agent file is", async () => {
+  const fx = await skillFixture();
+  const reviewer = join(dirname(fx.plannerFile), "reviewer.md");
+  const cases: Array<{ lines: string[]; asked: ThinkingLevel; notice: string }> = [
+    {
+      lines: ["name: reviewer", 'model: "openai-codex/gpt-6-astra" # pinned by hand', "thinking: 'low'"],
+      asked: "low",
+      notice: "thinking low",
+    },
+    {
+      lines: ["name: reviewer", "model: openai-codex/gpt-6-astra", "# thinking: high"],
+      asked: "medium",
+      notice: "thinking retained (medium)",
+    },
+    {
+      lines: ["name: reviewer", "model: 'openai-codex/gpt-6-astra'", 'thinking: ""'],
+      asked: "medium",
+      notice: "thinking retained (medium)",
+    },
+  ];
+  for (const c of cases) {
+    await writeFile(reviewer, agentFile(...c.lines));
+    const session = fakeSession({ thinking: "medium", switchLevel: "minimal" });
+    await withSkills(fx, session, async ({ input, notifications }) => {
+      assert.equal(await input("/skill:code-review"), undefined);
+      assert.deepEqual(session.calls, selectionCalls("openai-codex/gpt-6-astra", c.asked), c.lines.join(" | "));
+      assert.deepEqual(notifications, [
+        { text: `Skill code-review → reviewer: openai-codex/gpt-6-astra, ${c.notice}`, level: "info" },
+      ]);
+    });
+  }
+});
+
+test("unbound skills and ordinary prompts change nothing and say nothing", async () => {
+  const fx = await skillFixture();
+  const session = fakeSession();
+  const texts = [
+    "/skill:pdf-tools extract a.pdf",
+    "please run /skill:implementation-plan",
+    "/skills:implementation-plan",
+    "/skill:",
+    "/skill: implementation-plan",
+    '<skill name="implementation-plan">…</skill>',
+    "",
+  ];
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    for (const text of texts) {
+      assert.equal(await input(text), undefined, text);
+      assert.deepEqual(session.calls, [], text);
+      assert.deepEqual(notifications, [], text);
+    }
+  });
+});
+
+test("an install with no bindings is untouched by a skill invocation", async () => {
+  const fx = await fixture();
+  const session = fakeSession();
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    for (const text of ["/skill:implementation-plan write it", "/skill:code-review", "/skill:planner"]) {
+      assert.equal(await input(text), undefined, text);
+    }
+    assert.deepEqual(session.calls, []);
+    assert.deepEqual(notifications, []);
+  });
+  assert.equal(session.model, "deepseek/deepseek-flash");
+  assert.equal(session.thinking, "medium");
+});
+
+interface UnusableBinding {
+  name: string;
+  /** Bindings in force; defaults to `BINDINGS`. */
+  skills?: Record<string, string>;
+  /** Files written into the agents dir, by basename. */
+  files?: Record<string, string>;
+  unreadable?: string;
+  noRegistry?: boolean;
+  session?: Partial<FakeSession>;
+  text?: string;
+  warning: (dir: string) => string;
+  calls: string[];
+}
+
+const READS = ["getModel", "getThinkingLevel"];
+const ASTRA_REVIEWER = agentFile("name: reviewer", 'model: "openai-codex/gpt-6-astra"', "thinking: low");
+const NOT_A_LEVEL = 'which is not one of "off", "minimal", "low", "medium", "high", "xhigh", "max"';
+
+/** Every warning row of the plan's message contract, with the variants within a row. */
+const UNUSABLE_BINDINGS: UnusableBinding[] = [
+  {
+    name: "a route the table does not configure",
+    skills: { "code-review": "ghost" },
+    warning: () => 'Skill "code-review" is bound to agent route "ghost", which is not configured',
+    calls: [],
+  },
+  {
+    name: "no file defines the route",
+    warning: (dir) =>
+      `${REVIEWER_BOUND}, but it has no file at ${dir}/reviewer.md — run the /agents command to create a new agent`,
+    calls: [],
+  },
+  {
+    name: "the route's file cannot be read",
+    files: { "reviewer.md": ASTRA_REVIEWER },
+    unreadable: "reviewer.md",
+    warning: (dir) =>
+      `${REVIEWER_BOUND}, but it has no file at ${dir}/reviewer.md (the file there could not be read) — make that file readable, or remove it`,
+    calls: [],
+  },
+  {
+    name: "the route's file is another agent",
+    files: { "reviewer.md": agentFile("name: other", 'model: "openai-codex/gpt-6-astra"') },
+    warning: (dir) =>
+      `${REVIEWER_BOUND}, but it has no file at ${dir}/reviewer.md (the file there is agent "other") — name the route after that agent, or rename that file`,
+    calls: [],
+  },
+  {
+    name: "the route's file declares a scoped name",
+    files: { "reviewer.md": agentFile("name: pkg:reviewer", 'model: "openai-codex/gpt-6-astra"') },
+    warning: (dir) =>
+      `${REVIEWER_BOUND}, but it has no file at ${dir}/reviewer.md (the file there is not an agent: its declared name "pkg:reviewer" is scoped) — give that file a name pi registers, or drop this route`,
+    calls: [],
+  },
+  {
+    name: "two files claim the route's name",
+    files: { "a.md": ASTRA_REVIEWER, "b.md": ASTRA_REVIEWER },
+    warning: () =>
+      `${REVIEWER_BOUND}, but 2 agent files claim the name "reviewer" (a.md, b.md) and pi spawns whichever it loads last — give each file its own name`,
+    calls: [],
+  },
+  ...[
+    { variant: "no model line", file: agentFile("name: reviewer", "thinking: low") },
+    { variant: "an empty quoted model", file: agentFile("name: reviewer", 'model: ""', "thinking: low") },
+    { variant: "a bare model key", file: agentFile("name: reviewer", "model:", "thinking: low") },
+    { variant: "a commented-out model", file: agentFile("name: reviewer", '# model: "openai-codex/gpt-6-astra"') },
+    { variant: "no frontmatter", file: "Just a body, named by its stem.\n" },
+  ].map(({ variant, file }) => ({
+    name: `the file states no model: ${variant}`,
+    files: { "reviewer.md": file },
+    warning: () => `${REVIEWER_BOUND}, but its file states no model`,
+    calls: [],
+  })),
+  ...[
+    { variant: "two words", line: "thinking: very high", value: "very high" },
+    { variant: "two words, quoted", line: 'thinking: "very high"', value: "very high" },
+    { variant: "a level in the wrong case", line: "thinking: High", value: "High" },
+  ].map(({ variant, line, value }) => ({
+    name: `the file states a malformed level: ${variant}`,
+    files: { "reviewer.md": agentFile("name: reviewer", 'model: "openai-codex/gpt-6-astra"', line) },
+    warning: () => `${REVIEWER_BOUND}, but its file states thinking "${value}", ${NOT_A_LEVEL}`,
+    calls: [],
+  })),
+  {
+    name: "the registry does not know the model",
+    files: { "reviewer.md": agentFile("name: reviewer", 'model: "openai-codex/gpt-9"', "thinking: low") },
+    warning: () => `${REVIEWER_BOUND}, but this pi does not know model openai-codex/gpt-9 — a newer pi may`,
+    calls: [],
+  },
+  {
+    name: "the model has no provider",
+    files: { "reviewer.md": agentFile("name: reviewer", "model: gpt-6-astra", "thinking: low") },
+    warning: () => `${REVIEWER_BOUND}, but this pi does not know model gpt-6-astra — a newer pi may`,
+    calls: [],
+  },
+  {
+    name: "there is no registry at all",
+    files: { "reviewer.md": ASTRA_REVIEWER },
+    noRegistry: true,
+    warning: () => `${REVIEWER_BOUND}, but this pi does not know model openai-codex/gpt-6-astra — a newer pi may`,
+    calls: [],
+  },
+  {
+    name: "setModel resolves false",
+    files: { "reviewer.md": ASTRA_REVIEWER },
+    session: { setModelResult: false },
+    warning: () =>
+      `${REVIEWER_BOUND}, but its model openai-codex/gpt-6-astra could not be selected (no authentication is configured for the provider)`,
+    calls: [...READS, "setModel:openai-codex/gpt-6-astra"],
+  },
+  {
+    name: "setModel rejects before moving, so there is nothing to restore",
+    files: { "reviewer.md": ASTRA_REVIEWER },
+    session: { setModelResult: new Error("No API key for openai-codex/gpt-6-astra") },
+    warning: () =>
+      `${REVIEWER_BOUND}, but its model openai-codex/gpt-6-astra could not be selected (No API key for openai-codex/gpt-6-astra)`,
+    // The fault left the session where it was, so no put-back is attempted — only
+    // the live probes of both halves that say so.
+    calls: [...READS, "setModel:openai-codex/gpt-6-astra", "getModel", "getThinkingLevel"],
+  },
+];
+
+for (const row of UNUSABLE_BINDINGS) {
+  test(`each unusable binding warns once and leaves the session as it was: ${row.name}`, async (t) => {
+    if (row.unreadable && process.getuid?.() === 0) {
+      t.skip("root can read a mode-000 file");
+      return;
+    }
+    const fx = await skillFixture(row.skills);
+    const dir = join(fx.agentDir, "agents");
+    // The planner's file is not the one under test; leave only what the row writes.
+    for (const [name, text] of Object.entries(row.files ?? {})) await writeFile(join(dir, name), text);
+    if (row.unreadable) {
+      const file = join(dir, row.unreadable);
+      await chmod(file, 0);
+      t.after(() => chmod(file, 0o600));
+    }
+    const session = fakeSession(row.session);
+
+    await withSkills(
+      fx,
+      session,
+      async ({ input, notifications }) => {
+        assert.equal(await input(row.text ?? "/skill:code-review review the diff"), undefined);
+        assert.deepEqual(notifications, [{ text: row.warning(dir), level: "warning" }]);
+        assert.deepEqual(session.calls, row.calls);
+      },
+      { noRegistry: row.noRegistry },
+    );
+    assert.equal(session.model, "deepseek/deepseek-flash", "the session's model must be as it was");
+    assert.equal(session.thinking, "medium", "the session's level must be as it was");
+  });
+}
+
+test("a throwing registry is reported and the skill still runs", async () => {
+  const fx = await skillFixture();
+  const session = fakeSession();
+  const throwing: ModelRegistryLike = {
+    find: () => {
+      throw new Error("boom");
+    },
+  };
+
+  await withSkills(
+    fx,
+    session,
+    async ({ input, notifications }) => {
+      assert.equal(await input("/skill:implementation-plan"), undefined);
+      assert.deepEqual(notifications, [{ text: `${PLANNER_BOUND}, but applying it failed (boom)`, level: "warning" }]);
+      assert.ok(!session.calls.some((c) => c.startsWith("set")), session.calls.join(", "));
+    },
+    { modelRegistry: throwing },
+  );
+  assert.equal(session.model, "deepseek/deepseek-flash");
+  assert.equal(session.thinking, "medium");
+});
+
+test("a throwing notify does not stop the skill", async () => {
+  const fx = await skillFixture();
+  const session = fakeSession();
+
+  await withSkills(
+    fx,
+    session,
+    async ({ input, notifications }) => {
+      // The success notice throws: the selection stands, and nothing is retried.
+      assert.equal(await input("/skill:implementation-plan"), undefined);
+      assert.deepEqual(session.calls, selectionCalls("claude-bridge/claude-opus-5-5", "high"));
+      assert.equal(notifications.length, 1, notifications.map((n) => n.text).join("\n"));
+
+      // A warning that throws is just as silent.
+      session.calls.length = 0;
+      notifications.length = 0;
+      assert.equal(await input("/skill:code-review"), undefined);
+      assert.deepEqual(session.calls, []);
+      assert.equal(notifications.length, 1, notifications.map((n) => n.text).join("\n"));
+    },
+    { notifyThrows: true },
+  );
+  assert.equal(session.model, "claude-bridge/claude-opus-5-5");
+  assert.equal(session.thinking, "high");
+});
+
+interface FileState {
+  bytes: string;
+  mtimeMs: number;
+}
+
+/** Every entry under `root`, recursively: directories by listing, files by bytes and mtime. */
+async function snapshot(root: string): Promise<Record<string, FileState | string[]>> {
+  const out: Record<string, FileState | string[]> = {};
+  const walk = async (dir: string): Promise<void> => {
+    const entries = (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+    out[dir] = entries.map((e) => e.name);
+    for (const entry of entries) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) await walk(path);
+      else out[path] = { bytes: await readFile(path, "utf8"), mtimeMs: (await stat(path)).mtimeMs };
+    }
+  };
+  await walk(root);
+  return out;
+}
+
+test("an invocation reads no quota and writes no agent file", async (t) => {
+  if (process.getuid?.() === 0) {
+    t.skip("root can write a read-only directory");
+    return;
+  }
+  const fx = await skillFixture();
+  const root = dirname(fx.agentDir);
+  const agentsDir = join(fx.agentDir, "agents");
+  const before = await snapshot(root);
+  // A write, a lock or a temp file in the agents dir now fails outright.
+  await chmod(agentsDir, 0o500);
+  t.after(() => chmod(agentsDir, 0o700));
+  const session = fakeSession();
+
+  // `withSkills` refuses every fetch and asserts none was made.
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    assert.equal(await input("/skill:implementation-plan write the plan"), undefined);
+    assert.equal(await input("/skill:code-review"), undefined);
+    assert.deepEqual(
+      notifications.map((n) => n.level),
+      ["info", "warning"],
+      notifications.map((n) => n.text).join("\n"),
+    );
+  });
+
+  await chmod(agentsDir, 0o700);
+  assert.deepEqual(await snapshot(root), before);
+});
+
+test("a bound invocation after startup evaluates no route, asks no quota and writes no file", async () => {
+  const fx = await skillFixture();
+  const session = fakeSession();
+  // Claude healthy, so startup decides planner stays on its primary.
+  const quota = countingStubFetch({ claudeSession: 10 });
+
+  await withExtension(
+    fx,
+    async ({ sessionStart, input }) => {
+      await sessionStart("startup");
+      const afterStartup = quota.count();
+      assert.ok(afterStartup > 0, "startup must evaluate the routes");
+
+      // Diverge the file from that decision, so a re-evaluation during the
+      // invocation would have to rewrite it to converge. A request count alone
+      // cannot see a cached evaluation; a file it would revert can.
+      await writeFile(
+        fx.plannerFile,
+        agentFile("name: planner", 'model: "openai-codex/gpt-6-sol"', "thinking: low"),
+      );
+      const divergent = await readFile(fx.plannerFile, "utf8");
+
+      assert.equal(await input("/skill:implementation-plan plan it"), undefined);
+      assert.equal(quota.count(), afterStartup, "a bound invocation must make no quota request");
+      assert.equal(
+        await readFile(fx.plannerFile, "utf8"),
+        divergent,
+        "a bound invocation must not evaluate the routes",
+      );
+      assert.deepEqual(session.calls, selectionCalls("openai-codex/gpt-6-sol", "low"));
+    },
+    quota.factory,
+    { session, modelRegistry: KNOWN_MODELS },
+  );
+});
+
+test("a second bound skill replaces the selection and nothing restores the first", async () => {
+  const fx = await skillFixture();
+  await writeFile(join(fx.agentDir, "agents", "reviewer.md"), ASTRA_REVIEWER);
+  const session = fakeSession();
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    await input("/skill:implementation-plan");
+    await input("/skill:code-review look at it");
+    assert.deepEqual(session.calls, [
+      ...selectionCalls("claude-bridge/claude-opus-5-5", "high"),
+      ...selectionCalls("openai-codex/gpt-6-astra", "low"),
+    ]);
+    assert.equal(session.model, "openai-codex/gpt-6-astra");
+    assert.equal(session.thinking, "low");
+
+    const settled = session.calls.length;
+    await input("now carry on with the work");
+    await input("/skill:pdf-tools extract a.pdf");
+    assert.equal(session.calls.length, settled, `nothing may restore: ${session.calls.slice(settled).join(", ")}`);
+    assert.equal(notifications.length, 2);
+  });
+  assert.equal(session.model, "openai-codex/gpt-6-astra");
+  assert.equal(session.thinking, "low");
+});
+
+test("the registered handlers include input", async () => {
+  const fx = await fixture();
+  await withExtension(fx, async ({ events }) => {
+    for (const event of ["session_start", "session_shutdown", "input"]) {
+      assert.ok(events.includes(event), `missing ${event}: ${events.join(", ")}`);
+    }
+  });
+});
+
+/** Clamps anything above `medium` to `medium`, as pi does for a model that supports no more. */
+const UP_TO_MEDIUM = (asked: ThinkingLevel): ThinkingLevel =>
+  asked === "high" || asked === "xhigh" || asked === "max" ? "medium" : asked;
+
+test("a level pi clamps is reported as the level actually running: a stated level", async () => {
+  const fx = await skillFixture();
+  await writeFile(fx.plannerFile, agentFile("name: planner", 'model: "claude-bridge/claude-opus-5-5"', "thinking: xhigh"));
+  const session = fakeSession({ thinking: "low", switchLevel: "minimal", clamp: UP_TO_MEDIUM });
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    await input("/skill:implementation-plan");
+    // The file's level is what is asked for; pi, not the extension, clamps it.
+    assert.deepEqual(session.calls, selectionCalls("claude-bridge/claude-opus-5-5", "xhigh"));
+    assert.deepEqual(notifications, [
+      {
+        text: "Skill implementation-plan → planner: claude-bridge/claude-opus-5-5, thinking xhigh, clamped to medium by pi",
+        level: "info",
+      },
+    ]);
+  });
+  assert.equal(session.thinking, "medium");
+});
+
+test("a level pi clamps is reported as the level actually running: a retained level", async () => {
+  const fx = await skillFixture();
+  await writeFile(fx.plannerFile, agentFile("name: planner", 'model: "claude-bridge/claude-opus-5-5"'));
+  const session = fakeSession({ thinking: "high", switchLevel: "minimal", clamp: UP_TO_MEDIUM });
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    await input("/skill:implementation-plan");
+    assert.deepEqual(session.calls, selectionCalls("claude-bridge/claude-opus-5-5", "high"));
+    assert.deepEqual(notifications, [
+      {
+        text: "Skill implementation-plan → planner: claude-bridge/claude-opus-5-5, thinking retained (medium, clamped from high)",
+        level: "info",
+      },
+    ]);
+  });
+  assert.equal(session.thinking, "medium");
+});
+
+const NOT_RESTORED = " and the previous session selection could not be restored";
+
+/**
+ * Faults after the session has already moved. pi assigns the model (and a
+ * level) before its later steps can throw, so "nothing changed" would be false:
+ * the previous selection is put back, and the warning says whether that worked.
+ */
+const APPLY_FAULTS: Array<{
+  name: string;
+  session: Partial<FakeSession>;
+  calls: string[];
+  restored: boolean;
+  after: { model: string; thinking: ThinkingLevel };
+}> = [
+  {
+    name: "setModel moves and then fails, and the restore succeeds",
+    session: { setModelResult: { moved: true, error: new Error("disk failure") } },
+    calls: [
+      ...READS,
+      "setModel:openai-codex/gpt-6-astra",
+      "getModel",
+      "getThinkingLevel",
+      "setModel:deepseek/deepseek-flash",
+      "setThinkingLevel:medium",
+    ],
+    restored: true,
+    after: { model: "deepseek/deepseek-flash", thinking: "medium" },
+  },
+  {
+    name: "setModel moves and then fails, and the restore fails too",
+    session: {
+      setModelResult: { moved: true, error: new Error("disk failure") },
+      laterSetModelResult: new Error("still failing"),
+    },
+    calls: [
+      ...READS,
+      "setModel:openai-codex/gpt-6-astra",
+      "getModel",
+      "getThinkingLevel",
+      "setModel:deepseek/deepseek-flash",
+    ],
+    restored: false,
+    after: { model: "openai-codex/gpt-6-astra", thinking: "minimal" },
+  },
+  {
+    // The put-back's own `setModel` resolves `false` (pi's no-auth answer), which
+    // `restore` must treat as a failed put-back rather than a silent success — and
+    // it must not go on to write the level either, so the call list is exact.
+    name: "setModel moves and then fails, and the put-back finds no auth",
+    session: {
+      setModelResult: { moved: true, error: new Error("disk failure") },
+      laterSetModelResult: false,
+    },
+    calls: [
+      ...READS,
+      "setModel:openai-codex/gpt-6-astra",
+      "getModel",
+      "getThinkingLevel",
+      "setModel:deepseek/deepseek-flash",
+    ],
+    restored: false,
+    after: { model: "openai-codex/gpt-6-astra", thinking: "minimal" },
+  },
+  {
+    name: "setThinkingLevel applies and then fails, and the restore succeeds",
+    session: { thinkingThrows: new Error("disk failure") },
+    calls: [
+      ...READS,
+      "setModel:openai-codex/gpt-6-astra",
+      "setThinkingLevel:low",
+      "setModel:deepseek/deepseek-flash",
+      "setThinkingLevel:medium",
+    ],
+    restored: true,
+    after: { model: "deepseek/deepseek-flash", thinking: "medium" },
+  },
+  {
+    name: "setThinkingLevel applies and then fails, and the restore fails too",
+    session: { thinkingThrows: new Error("disk failure"), laterSetModelResult: new Error("still failing") },
+    calls: [...READS, "setModel:openai-codex/gpt-6-astra", "setThinkingLevel:low", "setModel:deepseek/deepseek-flash"],
+    restored: false,
+    after: { model: "openai-codex/gpt-6-astra", thinking: "low" },
+  },
+];
+
+for (const fault of APPLY_FAULTS) {
+  test(`a fault while applying warns truthfully and puts the previous selection back: ${fault.name}`, async () => {
+    const fx = await skillFixture();
+    await writeFile(join(fx.agentDir, "agents", "reviewer.md"), ASTRA_REVIEWER);
+    const session = fakeSession(fault.session);
+
+    await withSkills(fx, session, async ({ input, notifications }) => {
+      assert.equal(await input("/skill:code-review"), undefined);
+      const selected = `${REVIEWER_BOUND}, but its model openai-codex/gpt-6-astra could not be selected (disk failure)`;
+      assert.deepEqual(notifications, [
+        { text: fault.restored ? selected : `${selected}${NOT_RESTORED}`, level: "warning" },
+      ]);
+      assert.deepEqual(session.calls, fault.calls);
+    });
+    // A failed restore is reported, not hidden: the session is left where pi left it.
+    assert.equal(session.model, fault.after.model);
+    assert.equal(session.thinking, fault.after.thinking);
+  });
+}
+
+test("a fault that moved only the level puts the level back without re-selecting the model", async () => {
+  const fx = await skillFixture();
+  await writeFile(join(fx.agentDir, "agents", "reviewer.md"), ASTRA_REVIEWER);
+  // The session is already on the file's model object, so `setModel` re-selects
+  // it: pi resets the level by its own rule and a later step throws. The model
+  // did not move — by identity, and it is the same object the registry returns —
+  // but the level did, so the put-back must write the level and only the level.
+  const session = fakeSession({
+    model: "openai-codex/gpt-6-astra",
+    thinking: "high",
+    switchLevel: "minimal",
+    setModelResult: { moved: true, error: new Error("disk failure") },
+  });
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    assert.equal(await input("/skill:code-review"), undefined);
+    assert.deepEqual(notifications, [
+      {
+        text: `${REVIEWER_BOUND}, but its model openai-codex/gpt-6-astra could not be selected (disk failure)`,
+        level: "warning",
+      },
+    ]);
+    assert.deepEqual(session.calls, [
+      "getModel",
+      "getThinkingLevel",
+      "setModel:openai-codex/gpt-6-astra",
+      "getModel",
+      "getThinkingLevel",
+      "setThinkingLevel:high",
+    ]);
+  });
+  // A same-model re-selection is not "untouched": the level was reset and put
+  // back, and the session's model is where it started.
+  assert.equal(session.model, "openai-codex/gpt-6-astra");
+  assert.equal(session.thinking, "high");
+});
+
+test("a session with no previous model cannot be restored when the application selected one", async () => {
+  const fx = await skillFixture();
+  await writeFile(join(fx.agentDir, "agents", "reviewer.md"), ASTRA_REVIEWER);
+  const session = fakeSession({
+    model: undefined,
+    thinking: "high",
+    setModelResult: { moved: true, error: new Error("disk failure") },
+  });
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    assert.equal(await input("/skill:code-review"), undefined);
+    assert.deepEqual(notifications, [
+      {
+        text: `${REVIEWER_BOUND}, but its model openai-codex/gpt-6-astra could not be selected (disk failure)${NOT_RESTORED}`,
+        level: "warning",
+      },
+    ]);
+    // The movement check reads the level too; with no previous model there is
+    // nothing to put back, so the put-back reports failure without writing.
+    assert.deepEqual(session.calls, [
+      "getModel",
+      "getThinkingLevel",
+      "setModel:openai-codex/gpt-6-astra",
+      "getModel",
+      "getThinkingLevel",
+    ]);
+  });
+  // There is no way to unset a model, so the session is left on the one the fault
+  // selected — the warning says so rather than claiming a restore that never was.
+  assert.equal(session.model, "openai-codex/gpt-6-astra");
+});
+
+test("a binding edit is not seen until the extension is reloaded", async () => {
+  const fx = await fixture();
+  const globalConfig = join(fx.agentDir, CONFIG_FILE_NAME);
+  const first = fakeSession();
+
+  await withSkills(fx, first, async ({ input, notifications }) => {
+    assert.equal(await input("/skill:implementation-plan"), undefined);
+    const config: unknown = JSON.parse(await readFile(globalConfig, "utf8"));
+    assert.ok(typeof config === "object" && config !== null);
+    await writeFile(globalConfig, JSON.stringify({ ...config, skills: BINDINGS }));
+    assert.equal(await input("/skill:implementation-plan"), undefined);
+    assert.deepEqual(first.calls, []);
+    assert.deepEqual(notifications, []);
+  });
+
+  const reloaded = fakeSession();
+  await withSkills(fx, reloaded, async ({ input, notifications }) => {
+    await input("/skill:implementation-plan");
+    assert.deepEqual(reloaded.calls, selectionCalls("claude-bridge/claude-opus-5-5", "high"));
+    assert.deepEqual(notifications.map((n) => n.level), ["info"]);
+  });
+});
+
+test("the skill name is split exactly as pi splits it", async () => {
+  assert.equal(explicitSkill("/skill:"), undefined);
+  assert.equal(explicitSkill("/skill: x"), undefined);
+  assert.equal(explicitSkill("/skills:x"), undefined);
+  assert.equal(explicitSkill("\n/skill:x"), undefined);
+  assert.equal(explicitSkill(" /skill:x"), undefined);
+  assert.equal(explicitSkill("/skill:x"), "x");
+  assert.equal(explicitSkill("/skill:x  two spaces"), "x");
+  assert.equal(explicitSkill("/skill:a\tb x"), "a\tb");
+  assert.equal(explicitSkill("/skill:a\tb "), "a\tb");
+  assert.equal(explicitSkill("/skill:x\nnext line"), "x\nnext");
+
+  // `pdf tools` is rejected by the config (it could never be invoked), so the
+  // `/skill:pdf tools` below names `pdf`, which nothing binds.
+  const fx = await skillFixture({ "a\tb": "planner", rôle: "planner", "pdf tools": "planner" });
+  const notice = (skill: string) =>
+    `Skill ${skill} → planner: claude-bridge/claude-opus-5-5, thinking high`;
+
+  for (const [text, skill] of [
+    ["/skill:a\tb x", "a\tb"],
+    ["/skill:rôle x", "rôle"],
+    ["/skill:a\tb ", "a\tb"],
+  ] as const) {
+    const session = fakeSession();
+    await withSkills(fx, session, async ({ input, notifications }) => {
+      assert.equal(await input(text), undefined);
+      assert.deepEqual(session.calls, selectionCalls("claude-bridge/claude-opus-5-5", "high"), JSON.stringify(text));
+      assert.deepEqual(notifications, [{ text: notice(skill), level: "info" }]);
+    });
+  }
+
+  const session = fakeSession();
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    assert.equal(await input("/skill:pdf tools"), undefined);
+    assert.deepEqual(session.calls, []);
+    assert.deepEqual(notifications, []);
+  });
 });
