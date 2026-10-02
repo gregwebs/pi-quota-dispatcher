@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 
@@ -11,7 +11,9 @@ import type { ThinkingLevel } from "../src/config.ts";
 import extension, {
   checkAgentFiles,
   DEFAULT_CONFIG,
+  evaluationFence,
   explicitSkill,
+  fencedEvaluation,
   parseInvocation,
   readAgentDirectory,
   unknownFormNotice,
@@ -286,6 +288,11 @@ interface Harness {
   run: (args: string) => Promise<string>;
   /** As `run`, but every notification in order — a warning may be its own. */
   runAll: (args: string) => Promise<string[]>;
+  /**
+   * Invoke the command with a fresh context and touch nothing else, so a test
+   * can race two invocations without `run`'s one-notification assertion.
+   */
+  invoke: (args: string) => Promise<void>;
   /** Fire the `session_start` handler the extension registered. */
   sessionStart: (reason?: string) => Promise<void>;
   /** Fire the registered `input` handler with typed text and return what it returned. */
@@ -396,6 +403,9 @@ async function withExtension(
         notifications.length = 0;
         await handler(args, makeCtx());
         return notifications.map((n) => n.text);
+      },
+      invoke: async (args: string) => {
+        await handler(args, makeCtx());
       },
       sessionStart: async (reason = "startup") => {
         await eventHandlers.session_start?.({ type: "session_start", reason }, makeCtx());
@@ -546,6 +556,21 @@ test("the argument is a whole form name, not a substring of one", () => {
   assert.deepEqual(parseInvocation("apply"), { form: "apply" });
 });
 
+test("generate selects the global layer, or the project one with a single word", () => {
+  assert.deepEqual(parseInvocation("generate"), { form: "generate", scope: "global" });
+  assert.deepEqual(parseInvocation("  generate  "), { form: "generate", scope: "global" });
+  assert.deepEqual(parseInvocation("generate project"), { form: "generate", scope: "project" });
+  assert.deepEqual(parseInvocation("generate\tproject\n"), { form: "generate", scope: "project" });
+  // A generated layer replaces one of the two known files, so the scope is a
+  // whole word from a closed set; anything else is not guessed at.
+  assert.deepEqual(parseInvocation("generate global"), { form: "unknown", arg: "generate global" });
+  assert.deepEqual(parseInvocation("generate project extra"), {
+    form: "unknown",
+    arg: "generate project extra",
+  });
+  assert.deepEqual(parseInvocation("generatex"), { form: "unknown", arg: "generatex" });
+});
+
 test("an argument that names no form is unknown rather than a guess", () => {
   // Under the `includes` test this read as `apply`: a word that could have meant
   // "just look" selected the one form that writes.
@@ -564,7 +589,7 @@ test("the registered description names every form", async () => {
   const fx = await fixture();
 
   await withExtension(fx, async ({ description }) => {
-    for (const form of ["refresh", "config", "apply"]) {
+    for (const form of ["refresh", "config", "apply", "generate"]) {
       assert.ok(description?.includes(form), `the description must name ${form}: ${description}`);
     }
   });
@@ -597,6 +622,467 @@ test("an unknown form is reported, reads no quota, and writes nothing", async ()
 
   assert.equal(fetches, 0, "an unknown form must not read a quota");
   assert.equal(await readFile(fx.plannerFile, "utf8"), before, "an unknown form must not write");
+});
+
+// ---------------------------------------------------------------- generate
+
+/** How long a poll cadence is lifted to so the background timer never fires. */
+const MAX_POLL_MS = 2_147_483_647;
+
+interface GenerateFixture {
+  agentDir: string;
+  projectDir: string;
+  plannerFile: string;
+  globalPath: string;
+  projectPath: string;
+  layerPath: string;
+  marker: string;
+}
+
+/**
+ * A fixture whose global config declares `command` as its generator. The layer
+ * the command is expected to print is written beside it, and a marker path is
+ * offered so a command can record that it actually ran.
+ */
+async function generateFixture(
+  layer: unknown,
+  command: (layerPath: string) => string = (layerPath) => `cat '${layerPath}'`,
+  pollMs = MAX_POLL_MS,
+): Promise<GenerateFixture> {
+  const root = await mkdtemp(join(tmpdir(), "pqd-gen-cmd-"));
+  const agentDir = join(root, "agent");
+  const projectDir = join(root, "project");
+  const agentsDir = join(agentDir, "agents");
+  await mkdir(agentsDir, { recursive: true });
+  await mkdir(join(projectDir, CONFIG_DIR_NAME), { recursive: true });
+
+  const claudeCredsPath = join(root, "claude-credentials.json");
+  await writeFile(
+    claudeCredsPath,
+    JSON.stringify({ claudeAiOauth: { accessToken: "test-token", expiresAt: Date.now() + 3_600_000 } }),
+    "utf8",
+  );
+  await writeFile(
+    join(agentDir, "auth.json"),
+    JSON.stringify({ "openai-codex": { access: "test-token", accountId: "acct-test" } }),
+    "utf8",
+  );
+
+  const globalPath = join(agentDir, CONFIG_FILE_NAME);
+  const projectPath = join(projectDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+  const layerPath = join(root, "layer.json");
+  await writeFile(layerPath, JSON.stringify(layer, null, 2), "utf8");
+  await writeFile(
+    globalPath,
+    JSON.stringify({
+      claudeCredsPath,
+      pollMs,
+      generator: { command: command(layerPath) },
+      agents: CONFIGURED_AGENTS,
+    }),
+    "utf8",
+  );
+  await writeFile(projectPath, JSON.stringify({ margin: 10 }), "utf8");
+
+  const plannerFile = join(agentsDir, "planner.md");
+  await writeFile(plannerFile, TEMPLATE("planner", "claude-bridge/claude-opus-5-5"), "utf8");
+
+  return {
+    agentDir,
+    projectDir,
+    plannerFile,
+    globalPath,
+    projectPath,
+    layerPath,
+    marker: join(root, "ran"),
+  };
+}
+
+/** The ordinary config an existing ``/quota-dispatch generate`` invocation produces. */
+const GENERATED_LAYER = {
+  // A scalar the project layer beneath does not override, so the effective config
+  // visibly moves with the generated global layer.
+  weeklySwitchAt: 33,
+  agents: {
+    planner: {
+      primary: { model: "openai-codex/gpt-6-sol", rail: "codex" },
+      alternates: [{ model: "claude-bridge/claude-opus-5-5", rail: "claude" }],
+    },
+    reviewer: { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } },
+  },
+  skills: { "code-review": "reviewer" },
+};
+
+test("generate publishes the printed layer and activates it without a reload", async () => {
+  const fx = await generateFixture(GENERATED_LAYER);
+  const command = `cat '${fx.layerPath}'`;
+
+  await withExtension(fx, async ({ run, statuses }) => {
+    const text = await run("generate");
+    assert.ok(text.startsWith(`[generated] ${fx.globalPath}`), text);
+
+    // The footer follows the prepared runtime: a configured install with no
+    // unknown models carries no footer line.
+    assert.deepEqual(statuses.at(-1), { key: "quota-dispatch", text: undefined });
+
+    // The file now holds the printed layer with its declaration preserved.
+    const written = JSON.parse(await readFile(fx.globalPath, "utf8"));
+    assert.deepEqual(written.generator, { command });
+    assert.equal(written.weeklySwitchAt, 33);
+    assert.equal(written.agents.planner.primary.model, "openai-codex/gpt-6-sol");
+
+    // The active configuration moved with it: the provenance form answers from
+    // the new layer, with no `/reload`.
+    const config = await run("config");
+    assert.ok(config.includes("weeklySwitchAt = 33  [global]"), config);
+    assert.ok(config.includes("skills.code-review = reviewer  [global]"), config);
+  });
+
+  // The post-publication evaluation wrote the agent file for the new policy:
+  // planner's primary is now the codex model, so that is what its file holds.
+  assert.match(await readFile(fx.plannerFile, "utf8"), /^model: "openai-codex\/gpt-6-sol"$/m);
+});
+
+test("generate project replaces only the project file", async () => {
+  const fx = await generateFixture({});
+  const projectLayer = { margin: 44, agents: {} };
+  const layerPath = join(dirname(fx.projectPath), "project-layer.json");
+  await writeFile(layerPath, JSON.stringify(projectLayer), "utf8");
+
+  // The project file declares its own generator, whose command prints the layer
+  // in the project config directory (the run's working directory).
+  await writeFile(
+    fx.projectPath,
+    JSON.stringify({ generator: { command: "cat project-layer.json" } }),
+    "utf8",
+  );
+  const globalBefore = await readFile(fx.globalPath, "utf8");
+
+  await withExtension(fx, async ({ run }) => {
+    const text = await run("generate project");
+    // The run's working directory is the project config dir, and cwd is its
+    // physical path, so the notice names that.
+    assert.ok(text.startsWith("[generated] ") && text.includes(await realpath(fx.projectPath)), text);
+    const written = JSON.parse(await readFile(fx.projectPath, "utf8"));
+    assert.equal(written.margin, 44);
+    assert.deepEqual(written.generator, { command: "cat project-layer.json" });
+  });
+
+  assert.equal(await readFile(fx.globalPath, "utf8"), globalBefore, "the global layer must be untouched");
+});
+
+test("nothing but the generate form runs the declared command", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let marker = "";
+  const fx = await generateFixture(
+    {},
+    (layerPath) => {
+      marker = join(dirname(layerPath), "ran");
+      return `touch '${marker}' && cat '${layerPath}'`;
+    },
+    // A real cadence, so the poll tick below is not vacuous.
+    40,
+  );
+
+  await withExtension(fx, async ({ run, sessionStart, input }) => {
+    await sessionStart("startup");
+    await run("");
+    await run("refresh");
+    await run("config");
+    await run("apply");
+    await sessionStart("reload");
+    await input("hello");
+    // A bound-skill input reads the cached config, which is the other path that
+    // could plausibly reach the generator.
+    await input("/skill:code-review");
+    // And a real poll tick, not merely the absence of one.
+    t.mock.timers.tick(40);
+    await new Promise((done) => setImmediate(done));
+    await assert.rejects(readFile(marker, "utf8"), "no other form may run the generator");
+
+    await run("generate");
+  });
+
+  await readFile(marker, "utf8");
+});
+
+test("a failed generator leaves the file and the active configuration unchanged", async () => {
+  const fx = await generateFixture({}, () => "echo 'the script died' >&2; exit 2");
+  const plannerBefore = await readFile(fx.plannerFile, "utf8");
+  const failedBefore = await readFile(fx.globalPath, "utf8");
+
+  await withExtension(fx, async ({ run }) => {
+    const text = await run("generate");
+    assert.ok(text.includes("exited with code 2"), text);
+    assert.ok(text.includes("the script died"), text);
+    assert.ok(text.includes("This run did not change"), text);
+    const config = await run("config");
+    assert.ok(config.includes("agents.planner.primary.model = claude-bridge/claude-opus-5-5"), config);
+  });
+
+  assert.equal(await readFile(fx.globalPath, "utf8"), failedBefore);
+  assert.equal(await readFile(fx.plannerFile, "utf8"), plannerBefore);
+});
+
+test("an overlapping generation is refused rather than queued", async () => {
+  const fx = await generateFixture(GENERATED_LAYER, (layerPath) => `sleep 0.4; cat '${layerPath}'`);
+
+  await withExtension(fx, async ({ invoke, notifications }) => {
+    const first = invoke("generate");
+    // Let the first reach its subprocess, which sleeps, before racing the second.
+    await new Promise((done) => setTimeout(done, 80));
+    const second = invoke("generate");
+    await Promise.all([first, second]);
+    assert.ok(
+      notifications.some((n) => n.text.includes("already running")),
+      notifications.map((n) => n.text).join("\n"),
+    );
+    assert.ok(notifications.some((n) => n.text.startsWith("[generated]")), notifications.map((n) => n.text).join("\n"));
+  });
+});
+
+test("generate project fails when the project file declares no generator", async () => {
+  const fx = await generateFixture({});
+  await withExtension(fx, async ({ run }) => {
+    const text = await run("generate project");
+    assert.ok(text.includes('declares no "generator"'), text);
+  });
+});
+
+test("a UI failure after publication does not undo or relabel the committed change", async () => {
+  const fx = await generateFixture(GENERATED_LAYER);
+  await withExtension(
+    fx,
+    async ({ invoke }) => {
+      // The success notice throws; the file has already moved, so the change
+      // must stand rather than be reported (or rolled) as unchanged.
+      await assert.rejects(invoke("generate"));
+    },
+    stubFetch,
+    { notifyThrows: true },
+  );
+  const written = JSON.parse(await readFile(fx.globalPath, "utf8"));
+  assert.equal(written.weeklySwitchAt, 33);
+  assert.equal(written.agents.planner.primary.model, "openai-codex/gpt-6-sol");
+});
+
+test("the evaluation fence drains a running evaluation and refuses a new one", async () => {
+  const fence = evaluationFence();
+  const order: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((done) => {
+    release = done;
+  });
+
+  const running = fence.run(async () => {
+    order.push("run:start");
+    await gate;
+    order.push("run:end");
+  });
+  const acquired = fence.acquire().then((rel) => {
+    order.push("fenced");
+    return rel;
+  });
+
+  // A new evaluation cannot start while the fence is up; it is refused, not queued.
+  assert.equal(await fence.run(async () => order.push("late")), undefined);
+
+  release();
+  await running;
+  const rel = await acquired;
+  assert.deepEqual(order, ["run:start", "run:end", "fenced"]);
+
+  rel();
+  assert.equal(await fence.run(async () => "ok"), "ok");
+});
+
+/**
+ * The boot the runtime holds is a mutable reference; a generation replaces it.
+ * An evaluation must read it when the fence admits the evaluation, not when the
+ * evaluation was requested, or a `session_start` awaiting an old boot could
+ * evaluate the superseded policy after the generation's own evaluation.
+ */
+test("a fenced evaluation reads the current boot only after the fence admits it", async () => {
+  const fence = evaluationFence();
+  let boot: string | undefined = "old";
+  const seen: string[] = [];
+  const evaluate = async (value: unknown): Promise<void> => {
+    seen.push(String(value));
+  };
+
+  const release = await fence.acquire();
+  // A generation supersedes the boot while the fence is held.
+  boot = "new";
+  assert.equal(await fencedEvaluation(fence, async () => boot, evaluate), undefined);
+  assert.deepEqual(seen, [], "a refused evaluation must not read the boot at all");
+
+  release();
+  await fencedEvaluation(fence, async () => boot, evaluate);
+  assert.deepEqual(seen, ["new"], "the evaluation must use the boot current when it starts");
+
+  // No boot at all is a no-op, not a crash.
+  await fencedEvaluation(fence, () => undefined, evaluate);
+  assert.deepEqual(seen, ["new"]);
+});
+
+/**
+ * A `session_start` evaluation is awaited by the session, so when a generation
+ * holds the fence it waits for the release instead of being dropped. The boot it
+ * runs against is then the one the generation installed, not the one current
+ * when the request arrived. This is the seam `session_start` uses; the poll tick
+ * and `apply` keep the drop/refuse behaviour above.
+ */
+test("a waiting evaluation is admitted when the fence lowers and reads the boot it installed", async () => {
+  const fence = evaluationFence();
+  let boot = "old";
+  const seen: string[] = [];
+  const evaluate = async (value: unknown): Promise<void> => {
+    seen.push(String(value));
+  };
+
+  const release = await fence.acquire();
+  boot = "new";
+
+  let settled = false;
+  const evaluation = fencedEvaluation(fence, async () => boot, evaluate, { wait: true }).then((result) => {
+    settled = true;
+    return result;
+  });
+
+  // A macrotask of real time, so a refused evaluation that resolved in a
+  // microtask cannot sneak past the assertion.
+  await new Promise((done) => setImmediate(done));
+  assert.equal(settled, false, "a waiting evaluation must not resolve while the fence is held");
+  assert.deepEqual(seen, [], "it must not read the boot while the fence is held");
+
+  release();
+  await evaluation;
+  assert.deepEqual(seen, ["new"], "it must read the boot current at the release, not at the request");
+});
+
+test("a generated table that manages no agent asks no vendor for quota", async () => {
+  const fx = await generateFixture({}, () => "printf '{}'");
+  let fetches = 0;
+  const base = stubFetch();
+  const counting = (async (...args: Parameters<typeof fetch>) => {
+    fetches++;
+    return base(...args);
+  }) as typeof fetch;
+
+  await withExtension(
+    fx,
+    async ({ run }) => {
+      const text = await run("generate");
+      assert.ok(text.startsWith("[generated]"), text);
+    },
+    () => counting,
+  );
+
+  assert.equal(fetches, 0, "an empty generated table must cost no usage request");
+});
+
+test("a failed generation leaves the write fence usable", async () => {
+  const fx = await generateFixture({}, () => "echo dead >&2; exit 3");
+  await withExtension(fx, async ({ run }) => {
+    const failed = await run("generate");
+    assert.ok(failed.includes("exited with code 3"), failed);
+    // The fence a generation takes around its final transition must be down, so
+    // a later write-capable form is not refused as "generation finishing".
+    const applied = await run("apply");
+    assert.ok(applied.startsWith("[applied]"), applied);
+  });
+});
+
+test("a held lock fails the run and still releases the fence", async () => {
+  const fx = await generateFixture(GENERATED_LAYER);
+  const lockPath = join(dirname(fx.globalPath), ".quota-dispatch.json.lock");
+  await writeFile(lockPath, JSON.stringify({ pid: process.pid, host: hostname(), at: Date.now() }), "utf8");
+  try {
+    await withExtension(fx, async ({ run }) => {
+      const failed = await run("generate");
+      assert.ok(failed.includes("lock"), failed);
+      await rm(lockPath, { force: true });
+      const applied = await run("apply");
+      assert.ok(applied.startsWith("[applied]"), applied);
+    });
+  } finally {
+    await rm(lockPath, { force: true });
+  }
+});
+
+/**
+ * The overlap R1 and R2 are about, driven through the real handlers. A
+ * generation is parked on a foreign file lock, so it holds the write fence but
+ * has not published or swapped the boot yet. A `session_start` arriving then
+ * must wait for the generation rather than being dropped, and must evaluate the
+ * boot the generation installs — not the one it could have read before waiting.
+ *
+ * The two policies decide differently on purpose: the old table's claude
+ * primary stays claude, and the generated table's codex primary stays codex,
+ * because both rails read healthy. A stale evaluation of the old boot after the
+ * release would write claude over the codex the generation chose.
+ */
+test("session_start waits out a generation's fence and evaluates the boot it installs", async () => {
+  const fx = await generateFixture(GENERATED_LAYER);
+  const lockPath = join(dirname(fx.globalPath), ".quota-dispatch.json.lock");
+  await writeFile(lockPath, JSON.stringify({ pid: process.pid, host: hostname(), at: Date.now() }), "utf8");
+  try {
+    await withExtension(
+      fx,
+      async ({ invoke, runAll, sessionStart }) => {
+        const generating = invoke("generate");
+
+        // `apply` is refused for exactly as long as the fence is up, so the
+        // refusal is the observable that the generation is parked inside it.
+        let fenced = false;
+        for (let i = 0; i < 3000 && !fenced; i++) {
+          fenced = (await runAll("apply")).some((line) => line.includes("generation is finishing"));
+          if (!fenced) await new Promise((done) => setImmediate(done));
+        }
+        assert.ok(fenced, "the generation must be parked on the fence before the session starts");
+
+        let started = false;
+        const starting = sessionStart().then(() => {
+          started = true;
+        });
+        // The fence is held, so a session start that did not wait would have
+        // resolved by the next macrotask.
+        await new Promise((done) => setImmediate(done));
+        assert.equal(started, false, "session_start must wait for the release, not be dropped by the fence");
+
+        await rm(lockPath, { force: true });
+        await starting;
+        await generating;
+      },
+      () => stubFetch({ claudeSession: 10, codexSession: 10 }),
+    );
+  } finally {
+    await rm(lockPath, { force: true });
+  }
+
+  // The generation's codex policy stands: the waiting session_start evaluated
+  // the boot installed by the release, not the claude boot it saw at arrival.
+  assert.match(await readFile(fx.plannerFile, "utf8"), /^model: "openai-codex\/gpt-6-sol"$/m);
+});
+
+test("a generation that changes pollMs reschedules the poll", async () => {
+  const fx = await generateFixture({ ...GENERATED_LAYER, pollMs: 40 });
+  const delays: number[] = [];
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = ((fn: () => void, ms?: number) => {
+    delays.push(ms ?? 0);
+    return realSetInterval(fn, ms);
+  }) as typeof setInterval;
+  try {
+    await withExtension(fx, async ({ run }) => {
+      await run("generate");
+    });
+  } finally {
+    globalThis.setInterval = realSetInterval;
+  }
+  // The first load schedules the fixture's lifted cadence; generation reschedules
+  // from the generated one, and that is the cadence the extension is left on.
+  assert.equal(delays.at(-1), 40, `scheduled delays: ${delays.join(", ")}`);
 });
 
 // ---------------------------------------------------------------- session_start

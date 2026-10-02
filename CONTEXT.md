@@ -191,3 +191,12 @@ The record of which config layer supplied each effective value, printed by
 `/quota-dispatch config`. A warning is not provenance: the **report** and the
 provenance block both carry it.
 _Avoid_: config dump, debug output, source block
+
+**Configuration generator**:
+A command a config file declares, which prints a whole ordinary configuration
+layer as JSON. What it prints replaces that one file's ordinary configuration —
+all-or-nothing, one invalid entry rejecting the whole run — leaving the
+declaration that named it in place. The routes a generator emits are ordinary
+configuration, so reusable routes and model swaps are the generator's business,
+not new dispatcher behaviour.
+_Avoid_: route template, generator config, config script, dynamic config

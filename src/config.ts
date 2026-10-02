@@ -286,6 +286,38 @@ export interface DispatcherConfig {
   agents: Record<string, AgentRoute>;
 }
 
+/**
+ * A command a configuration file may declare to print a whole configuration
+ * layer as JSON on stdout.
+ *
+ * This is the one key that lets a configuration be computed rather than
+ * written: an external program emits ordinary configuration JSON, and the
+ * explicit `/quota-dispatch generate` form swaps one file's ordinary contents
+ * for it. The declaration itself is never part of the effective config — it
+ * says how the file is produced, not what it routes — and it is preserved
+ * verbatim across a replacement, so the next generation still knows its command.
+ * See docs/adr/0015-configuration-generation.md.
+ */
+export interface GeneratorDeclaration {
+  /** The Bash command to run, kept verbatim. */
+  command: string;
+  /**
+   * Bound on the run, in whole milliseconds. Omitted means
+   * `DEFAULT_GENERATOR_TIMEOUT_MS`; it is deliberately not defaulted into the
+   * declaration, so "the user did not say" stays distinguishable.
+   */
+  timeoutMs?: number;
+}
+
+/**
+ * How long a declared generator may run before it is killed and the run fails.
+ *
+ * Five seconds because the command is ordinary local configuration assembly —
+ * the timeout exists to keep a wedged script from hanging the command, not to
+ * budget real work.
+ */
+export const DEFAULT_GENERATOR_TIMEOUT_MS = 5_000;
+
 /** Name of the file, in both the global and the project directory. */
 export const CONFIG_FILE_NAME = "quota-dispatch.json";
 
@@ -328,6 +360,14 @@ const NUMBER_RANGES: ReadonlyMap<ScalarKey, NumberRange> = new Map([
   ["margin", { min: 0, max: 100 }],
   ["sessionAlwaysSwitchAt", { min: 0, max: 100 }],
 ]);
+
+/**
+ * The range a generator's `timeoutMs` must fall in, the same whole-milliseconds
+ * bound the polling timers use. A timeout outside Node's timer range is not a
+ * longer wait, it is an interval Node runs as 1 ms — a generator killed
+ * instantly rather than one given more room.
+ */
+const GENERATOR_TIMEOUT_MS_RANGE: NumberRange = { min: 1, max: 2_147_483_647, integer: true };
 
 /**
  * Path scalars that are pi's to own, and therefore not settable from a config
@@ -472,6 +512,56 @@ function disabledAgentOf(key: string): string | undefined {
 /** JSON objects only; arrays, `null` and primitives are not layers or routes. */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A `generator` declaration as accepted, or every sentence that rejects it.
+ *
+ * All the rejections are collected rather than the first, because a declaration
+ * is small and a user who mistyped two fields should see both. The accepted
+ * command is kept verbatim — the seam does not trim it, because the shell's own
+ * word splitting is what the user wrote it for.
+ *
+ * The declaration is validated here once, for both the tolerant loader (where a
+ * bad one warns and the file's routes still apply) and the strict check of a
+ * generated layer (where it is part of the all-or-nothing output).
+ */
+export function parseGeneratorDeclaration(
+  value: unknown,
+): { declaration: GeneratorDeclaration } | { rejections: string[] } {
+  if (!isPlainObject(value)) {
+    return { rejections: ['"generator" must be an object with a "command"'] };
+  }
+  const rejections: string[] = [];
+  let command: string | undefined;
+  if (typeof value.command !== "string" || value.command.trim() === "") {
+    rejections.push('"generator.command" must be a non-empty string');
+  } else {
+    command = value.command;
+  }
+  let timeoutMs: number | undefined;
+  if (value.timeoutMs !== undefined) {
+    const { min, max, integer } = GENERATOR_TIMEOUT_MS_RANGE;
+    const requirement = `${integer ? "an integer" : "a number"} in [${min}, ${max}]`;
+    if (
+      typeof value.timeoutMs !== "number" ||
+      !Number.isFinite(value.timeoutMs) ||
+      (integer === true && !Number.isInteger(value.timeoutMs)) ||
+      value.timeoutMs < min ||
+      value.timeoutMs > max
+    ) {
+      rejections.push(`"generator.timeoutMs" must be ${requirement}`);
+    } else {
+      timeoutMs = value.timeoutMs;
+    }
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== "command" && key !== "timeoutMs") {
+      rejections.push(`unknown key "generator.${key}"`);
+    }
+  }
+  if (rejections.length) return { rejections };
+  return { declaration: { command: command!, ...(timeoutMs !== undefined ? { timeoutMs } : {}) } };
 }
 
 /** A skill name and the agent route its explicit `/skill:<name>` invocation selects from. */
@@ -908,8 +998,12 @@ function faultText(fault: ConfigFileFault): string {
 }
 
 /** A message with its invisible characters spelled out, so one warning stays
- * one line and a character the reader cannot see is a character they can read. */
-function escapeInvisible(text: string): string {
+ * one line and a character the reader cannot see is a character they can read.
+ *
+ * Exported because the generate form's stderr rendering needs the same rule: it
+ * prints a user's own program's output, which can hold exactly these characters.
+ */
+export function escapeInvisible(text: string): string {
   return text.replace(INVISIBLE, (ch) => {
     if (ch === " ") return ch;
     const code = ch.codePointAt(0) ?? 0;
@@ -920,6 +1014,65 @@ function escapeInvisible(text: string): string {
       ? `\\u{${code.toString(16).toUpperCase()}}`
       : `\\u${code.toString(16).toUpperCase().padStart(4, "0")}`;
   });
+}
+
+/**
+ * Parse config text as the one JSON object a layer must be, or the fault that
+ * stops it.
+ *
+ * The single spelling of "is this text a layer?", shared by the loader and by
+ * the check of a generated layer, so a fault the loader reports and one the
+ * generate form reports cannot disagree. Text that parses to a non-object — an
+ * array, `null`, a number — is its own fault rather than a JSON error, because
+ * it is the shape rather than the syntax that is wrong.
+ */
+export function parseConfigObject(
+  text: string,
+): { kind: "object"; data: Record<string, unknown> } | { kind: "fault"; fault: ConfigFileFault } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    return { kind: "fault", fault: notJsonFault(text, err) };
+  }
+  if (!isPlainObject(parsed)) return { kind: "fault", fault: NOT_AN_OBJECT };
+  return { kind: "object", data: parsed };
+}
+
+/**
+ * Read one config file into its state and, when it is a layer, its data.
+ *
+ * The single spelling of "what is this file?", shared by `loadConfig` and by
+ * the replacement loader. Sharing it is what makes an accepted generated layer
+ * and a later ordinary load of the same bytes agree: absence is not a layer,
+ * anything else that will not parse is unusable whole, and only text parsing to
+ * an object is a layer.
+ */
+async function readLayerFile(
+  source: "global" | "project",
+  path: string,
+  read: (path: string) => Promise<string>,
+): Promise<{ state: ConfigFileState; layer?: MergeLayer }> {
+  let text: string;
+  try {
+    text = await read(path);
+  } catch (err) {
+    // An absent file is ordinary; anything else is worth reporting but must
+    // not stop the other layer from applying.
+    return {
+      state:
+        (err as { code?: unknown }).code === "ENOENT"
+          ? { kind: "absent" }
+          : { kind: "unusable", fault: unreadableFault(err) },
+    };
+  }
+
+  const parsed = parseConfigObject(text);
+  if (parsed.kind === "fault") return { state: { kind: "unusable", fault: parsed.fault } };
+  // It read, parsed, and is an object: this *is* the layer. The label is the
+  // file path, so `mergeConfig` outputs warnings in the shape a reader needs to
+  // act on directly.
+  return { state: { kind: "applied" }, layer: { source, label: path, data: parsed.data } };
 }
 
 /**
@@ -960,38 +1113,9 @@ export async function loadConfig(deps: LoadConfigDeps = {}): Promise<LoadedConfi
   const layers: MergeLayer[] = [];
 
   for (const entry of entries) {
-    const file = { source: entry.source, path: entry.path };
-    let text: string;
-    try {
-      text = await read(entry.path);
-    } catch (err) {
-      // An absent file is ordinary; anything else is worth reporting but must
-      // not stop the other layer from applying.
-      if ((err as { code?: unknown }).code === "ENOENT") {
-        files.push({ ...file, state: { kind: "absent" } });
-        continue;
-      }
-      files.push({ ...file, state: { kind: "unusable", fault: unreadableFault(err) } });
-      continue;
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch (err) {
-      files.push({ ...file, state: { kind: "unusable", fault: notJsonFault(text, err) } });
-      continue;
-    }
-    if (!isPlainObject(parsed)) {
-      files.push({ ...file, state: { kind: "unusable", fault: NOT_AN_OBJECT } });
-      continue;
-    }
-    // It read, parsed, and is an object: this *is* the layer. Every other way
-    // out of this loop left a file that was there but unusable.
-    files.push({ ...file, state: { kind: "applied" } });
-    // Each layer labels its warnings with the file path, so `mergeConfig`
-    // outputs them in the shape a reader needs to act on directly.
-    layers.push({ source: entry.source, label: entry.path, data: parsed });
+    const { state, layer } = await readLayerFile(entry.source, entry.path, read);
+    files.push({ source: entry.source, path: entry.path, state });
+    if (layer !== undefined) layers.push(layer);
   }
 
   // Derived from the states rather than pushed as each fault is found, so the
@@ -1014,6 +1138,104 @@ export async function loadConfig(deps: LoadConfigDeps = {}): Promise<LoadedConfi
   return { config: merged.config, files, sources: merged.sources, warnings };
 }
 
+/**
+ * A request to swap one config file's layer for a generated one.
+ *
+ * `data` is the already-parsed ordinary configuration the generator printed,
+ * with its own `generator` stripped. The other layer is read from disk as an
+ * ordinary load would read it, so the merge sees the same two layers it would
+ * have seen with `loadConfig`, only one of them supplied in memory.
+ */
+export interface ReplacementRequest {
+  /** Which layer the generated output replaces. */
+  source: "global" | "project";
+  /** The target file's path, used for the layer's warning label. */
+  path: string;
+  /** The parsed ordinary configuration layer. */
+  data: Record<string, unknown>;
+  agentDir?: string;
+  cwd?: string;
+  readFile?: (path: string) => Promise<string>;
+}
+
+/**
+ * The result of checking a generated layer in the context of the other one.
+ *
+ * `accepted` carries a `LoadedConfig` describing exactly the configuration the
+ * file would have after the write; `rejected` carries the sentences that refute
+ * it. Rejection is all-or-nothing: no value from the generated layer is
+ * returned, because accepting some of it is the partial fallback the generate
+ * form exists to avoid.
+ */
+export type ReplacementResult =
+  | { kind: "accepted"; loaded: LoadedConfig }
+  | { kind: "rejected"; rejections: string[] };
+
+/**
+ * Merge a generated layer over the layer beneath it and decide whether the
+ * whole of it is valid.
+ *
+ * The generated layer is checked strictly — every finding it raises is a
+ * rejection — while the other layer is read and folded exactly as an ordinary
+ * load would, so its warnings stay visible without being able to reject an
+ * otherwise valid generated layer. The two layers are named the way a user has
+ * to know them: the target file's path, and `generated output for <path>` for
+ * the replacement, so a rejection points at the file to edit rather than at the
+ * script that wrote it.
+ */
+export async function loadConfigReplacingLayer(req: ReplacementRequest): Promise<ReplacementResult> {
+  const agentDir = req.agentDir ?? getAgentDir();
+  const cwd = req.cwd ?? process.cwd();
+  const read = req.readFile ?? ((path: string) => readFile(path, "utf8"));
+
+  const otherSource = req.source === "global" ? "project" : "global";
+  const otherPath = otherSource === "global" ? globalConfigPath(agentDir) : projectConfigPath(cwd);
+
+  const files: ConfigFile[] = [];
+  const bySource = new Map<"global" | "project", ConfigFile>();
+  const layers: MergeLayer[] = [];
+
+  // The layer beneath, read the tolerant way: an absent file is not a layer, an
+  // unusable one is reported (and folded as nothing), and either way the
+  // generated layer is the only thing that can reject the result.
+  const other = await readLayerFile(otherSource, otherPath, read);
+  bySource.set(otherSource, { source: otherSource, path: otherPath, state: other.state });
+  if (other.layer !== undefined) layers.push(other.layer);
+
+  // The generated layer, labelled so its rejections name where the file is. It
+  // is the layer the strict check applies to, and `data` already carries the
+  // preserved generator declaration, so the declaration is validated with the
+  // rest of the output rather than trusted.
+  layers.push({ source: req.source, label: `generated output for ${req.path}`, data: req.data });
+  bySource.set(req.source, { source: req.source, path: req.path, state: { kind: "applied" } });
+
+  // Layer order is precedence order — global before project — whatever the
+  // replacement's source is. Built explicitly rather than pushed in call order,
+  // because the two layers are read in the opposite order.
+  const byLayer = new Map<ConfigSource, MergeLayer>();
+  for (const layer of layers) byLayer.set(layer.source, layer);
+  const ordered = [byLayer.get("global"), byLayer.get("project")].filter(
+    (layer): layer is MergeLayer => layer !== undefined,
+  );
+  files.push(bySource.get("global")!, bySource.get("project")!);
+
+  const merged = mergeConfig(defaultConfig(agentDir), ordered, { strict: req.source });
+  const rejections = merged.diagnostics
+    .filter((diagnostic) => diagnostic.sources.includes(req.source))
+    .map((diagnostic) => diagnostic.text);
+  if (rejections.length) return { kind: "rejected", rejections };
+
+  return {
+    kind: "accepted",
+    loaded: {
+      config: merged.config,
+      files,
+      sources: merged.sources,
+      warnings: [...unusableConfigFileLines(files), ...merged.warnings],
+    },
+  };
+}
+
 export interface MergeLayer {
   source: ConfigSource;
   /**
@@ -1031,6 +1253,36 @@ export interface MergeResult {
   config: DispatcherConfig;
   sources: Record<string, ConfigSource>;
   warnings: string[];
+  /**
+   * The same warnings with the layer(s) each came from.
+   *
+   * `warnings` is exactly `diagnostics.map((d) => d.text)`. The attribution is
+   * carried beside the rendered line rather than recovered from it: a caller
+   * that has to know whether a *specific layer* produced a finding — the strict
+   * check of a generated layer — must not have to parse a path and a colon back
+   * out of a sentence a user is meant to read.
+   */
+  diagnostics: ConfigDiagnostic[];
+}
+
+/** One finding and the layer(s) responsible for it. */
+export interface ConfigDiagnostic {
+  /** The rendered warning line, exactly as it appears in `warnings`. */
+  text: string;
+  /** The supplying layer(s); the cross-field conflict names both. */
+  sources: ConfigSource[];
+}
+
+/**
+ * How a merge should treat one layer beyond the tolerant default.
+ *
+ * `strict` names the source of a layer that is being checked all-or-nothing
+ * rather than folded tolerantly: every finding it produces is attributed to it,
+ * so the caller can reject the whole layer instead of accepting the values the
+ * tolerant rules would have kept. Passing nothing is the ordinary load.
+ */
+export interface MergeOptions {
+  strict?: ConfigSource;
 }
 
 /**
@@ -1131,6 +1383,7 @@ function parseCandidate(
   warn: (message: string) => void,
   registeredRail: (model: string) => { rail: Rail; source: ConfigSource } | undefined,
   inheritedRail: WeakSet<Candidate>,
+  strict: boolean,
 ): { candidate: Candidate; sources: Map<string, ConfigSource> } | undefined {
   if (!isPlainObject(value)) {
     warn(`"${dotted}" must be an object`);
@@ -1232,6 +1485,14 @@ function parseCandidate(
     // Only ever reached for a candidate a layer introduces: an existing one
     // already carries both fields, so a partial override completes it.
     warn(`"${dotted}" needs a "model"`);
+  } else if (strict) {
+    // Tolerant loading is silent here: a candidate that named neither field
+    // ("`alternates: [{}]`") contributes nothing, and the list it sits in is
+    // accepted or rejected as a unit, so the old list simply stands. A strict
+    // check cannot accept that — the layer is all-or-nothing, and "preserve the
+    // old list" is exactly the partial fallback the generate form forbids — so
+    // a supplied candidate with neither field is a rejection of its own.
+    warn(`"${dotted}" needs a "model" and a "rail"`);
   }
   return undefined;
 }
@@ -1276,8 +1537,19 @@ function labelOf(layer: MergeLayer): string {
   return layer.label ?? layer.source;
 }
 
-export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): MergeResult {
+export function mergeConfig(
+  base: DispatcherConfig,
+  layers: MergeLayer[],
+  options: MergeOptions = {},
+): MergeResult {
+  const strictSource = options.strict;
   const warnings: string[] = [];
+  const diagnostics: ConfigDiagnostic[] = [];
+  /** One finding: push the line and remember which layer(s) raised it. */
+  const note = (text: string, sources: ConfigSource[]): void => {
+    warnings.push(text);
+    diagnostics.push({ text, sources });
+  };
   const agents: Record<string, AgentRoute> = {};
   for (const [agent, route] of Object.entries(base.agents)) {
     // Normally the base is `defaultConfig()`, which ships no agents at all, so
@@ -1287,7 +1559,7 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
     // config.
     const rejection = agentNameRejection(agent);
     if (rejection) {
-      warnings.push(`built-in: ${rejection}`);
+      note(`built-in: ${rejection}`, ["built-in"]);
       continue;
     }
     agents[agent] = {
@@ -1306,14 +1578,15 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
   for (const [id, entry] of Object.entries(base.models)) {
     const rejection = modelIdRejection(id);
     if (rejection) {
-      warnings.push(`built-in: ${rejection}`);
+      note(`built-in: ${rejection}`, ["built-in"]);
       continue;
     }
     if (entry.rail !== undefined) {
       const implied = mismatchedRail(id, entry.rail);
       if (implied !== undefined) {
-        warnings.push(
+        note(
           `built-in: model "${id}" reads as the ${implied} rail but its registered rail is "${entry.rail}"`,
+          ["built-in"],
         );
       }
     }
@@ -1324,7 +1597,7 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
   const skills: Record<string, string> = {};
   foldSkillEntries(
     Object.entries(base.skills),
-    (reason) => warnings.push(`built-in: ${reason}`),
+    (reason) => note(`built-in: ${reason}`, ["built-in"]),
     (binding) => bindSkill(skills, binding),
   );
   const config: DispatcherConfig = { ...base, models, skills, agents };
@@ -1437,6 +1710,7 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
     data: Record<string, unknown>,
     source: ConfigSource,
     warn: (message: string) => void,
+    strict: boolean,
   ): void => {
     // Own property only, so `{"agents":{"constructor":{}}}` does not resolve
     // to `Object.prototype.constructor` and commit a phantom agent.
@@ -1458,10 +1732,24 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       warn(`"${key}.${flag}" must be true or false`);
       return false;
     };
-    if (skipFlag("ignore")) return;
-    if (skipFlag("disable")) {
-      disableAgent(agent, source);
-      return;
+    // A parked entry — one a skip instruction removes from the fold — is not
+    // looked inside at all when the layer is folded tolerantly: the instruction
+    // is a complete answer, and `ignore` deliberately ends the entry before
+    // `disable` is even read. A strict check cannot stop there, because "this
+    // entry does not govern" must not be a place an invalid value can hide:
+    // both flags are validated, and every supplied field is validated too, with
+    // nothing committed. Only then does the instruction act.
+    let parkedIgnore = false;
+    let parkedDisable = false;
+    if (strict) {
+      parkedIgnore = skipFlag("ignore");
+      parkedDisable = skipFlag("disable");
+    } else {
+      if (skipFlag("ignore")) return;
+      if (skipFlag("disable")) {
+        disableAgent(agent, source);
+        return;
+      }
     }
 
     // `primary` is aliased rather than copied so that a candidate whose rail
@@ -1534,6 +1822,7 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
           warn,
           registeredRail,
           inheritedRail,
+          strict,
         );
         if (!parsed) continue;
         holders.primary = parsed.candidate;
@@ -1565,6 +1854,7 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
           warn,
           registeredRail,
           inheritedRail,
+          strict,
         );
         if (!parsed) {
           usable = false;
@@ -1591,6 +1881,14 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
       for (const stage of nextStages) {
         for (const [key, from] of stage) pending.set(key, from);
       }
+    }
+
+    // The instruction acts only after the fields above have been validated: in
+    // a strict check the entry is parked to be looked at, not applied.
+    if (parkedIgnore) return;
+    if (parkedDisable) {
+      disableAgent(agent, source);
+      return;
     }
 
     if (!holders.primary) {
@@ -1642,7 +1940,7 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
   const labelWarn = (layer: MergeLayer): ((message: string) => void) => {
     const label = labelOf(layer);
     return (message: string) => {
-      warnings.push(`${label}: ${message}`);
+      note(`${label}: ${message}`, [layer.source]);
     };
   };
 
@@ -1709,6 +2007,10 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
   for (const layer of layers) {
     const { source } = layer;
     const warn = labelWarn(layer);
+    // Whether this layer is the one under an all-or-nothing check. Every finding
+    // it produces is attributed to its source, so `loadConfigReplacingLayer` can
+    // reject the whole layer instead of keeping the values tolerance would keep.
+    const strict = strictSource === source;
 
     if (!isPlainObject(layer.data)) {
       warn("config must be a JSON object");
@@ -1735,7 +2037,7 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
           } else if (!isPlainObject(agentValue)) {
             warn(`agent "${agent}" must be an object`);
           } else {
-            applyAgent(agent, agentValue, source, warn);
+            applyAgent(agent, agentValue, source, warn, strict);
           }
         }
         continue;
@@ -1749,6 +2051,21 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
 
       if (key === "skills") {
         applySkills(value, source, warn);
+        continue;
+      }
+
+      if (key === "generator") {
+        // A declaration is not ordinary configuration: it says how the file is
+        // produced, not what it routes. The tolerant loader warns about a malformed
+        // one and then ignores it — the rest of the file still applies — and it is
+        // deliberately absent from the effective config and from provenance. What
+        // the generate form does with an accepted declaration lives in
+        // `src/generator.ts`; the parser is shared so a declaration cannot be read
+        // two ways.
+        const parsed = parseGeneratorDeclaration(value);
+        if ("rejections" in parsed) {
+          for (const rejection of parsed.rejections) warn(rejection);
+        }
         continue;
       }
 
@@ -1814,12 +2131,15 @@ export function mergeConfig(base: DispatcherConfig, layers: MergeLayer[]): Merge
           },
   });
   if (conflict !== undefined) {
-    warnings.push(conflict);
+    // The two sources are read before the override's value and source are
+    // cleared, because a strict replacement must be able to tell whether it
+    // supplied either effective conflicting value.
+    note(conflict, [sources["sessionSwitchAt"] ?? "built-in", sources["sessionAlwaysSwitchAt"] ?? "built-in"]);
     delete config.sessionAlwaysSwitchAt;
     clearSource("sessionAlwaysSwitchAt");
   }
 
-  return { config, sources, warnings };
+  return { config, sources, warnings, diagnostics };
 }
 
 /**

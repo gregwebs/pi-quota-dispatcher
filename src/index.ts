@@ -63,12 +63,19 @@ import {
   describeConfig,
   describeConfigLayers,
   describeConfigWarnings,
+  errorText,
   globalConfigPath,
   loadConfig,
+  projectConfigPath,
   railFromModel,
   thinkingFor,
   unusableConfigFileLines,
 } from "./config.ts";
+
+// The generator module is where a declared command's output replaces one config
+// layer. Its orchestration is a call the command handler makes, not a public
+// surface: the tests import the module directly, so nothing is re-exported here.
+import { generateConfig } from "./generator.ts";
 
 // Config is a separate module because it is read from disk at run time; it is
 // re-exported here so `src/index.ts` remains the one import path for the
@@ -77,6 +84,7 @@ export {
   CLAUDE_REFRESH_MODES,
   CONFIG_FILE_NAME,
   DEFAULT_CONFIG,
+  DEFAULT_GENERATOR_TIMEOUT_MS,
   THINKING_LEVELS,
   agentKey,
   configFilesFor,
@@ -90,6 +98,7 @@ export {
   loadConfig,
   mergeConfig,
   modelIdRejection,
+  parseGeneratorDeclaration,
   projectConfigPath,
   railFromModel,
   skillKey,
@@ -105,6 +114,7 @@ export type {
   ConfigPosition,
   ConfigSource,
   DispatcherConfig,
+  GeneratorDeclaration,
   LoadConfigDeps,
   LoadedConfig,
   MergeLayer,
@@ -3104,6 +3114,7 @@ export type Invocation =
   | { form: "report"; force: boolean }
   | { form: "config" }
   | { form: "apply" }
+  | { form: "generate"; scope: "global" | "project" }
   | { form: "unknown"; arg: string };
 
 /**
@@ -3124,6 +3135,16 @@ export function parseInvocation(args: string): Invocation {
   if (arg === "refresh") return { form: "report", force: true };
   if (arg === "config") return { form: "config" };
   if (arg === "apply") return { form: "apply" };
+  // `generate` takes exactly one optional word, `project`; ordinary whitespace
+  // between and around the words is allowed. Anything else — `generate global`,
+  // a second word — is unknown, and answered with the catalogue rather than
+  // guessed at. The scope is not a path and not a layer name to search: it
+  // selects which of the two known files the declared command replaces.
+  const words = arg.split(/\s+/);
+  if (words[0] === "generate") {
+    if (words.length === 1) return { form: "generate", scope: "global" };
+    if (words.length === 2 && words[1] === "project") return { form: "generate", scope: "project" };
+  }
   return { form: "unknown", arg };
 }
 
@@ -3135,8 +3156,98 @@ export function parseInvocation(args: string): Invocation {
 export function unknownFormNotice(arg: string): string[] {
   return [
     `quota-dispatcher: "${arg}" is not a form.`,
-    "Forms: /quota-dispatch, /quota-dispatch refresh, /quota-dispatch config, /quota-dispatch apply.",
+    "Forms: /quota-dispatch, /quota-dispatch refresh, /quota-dispatch config, /quota-dispatch apply, /quota-dispatch generate [project].",
   ];
+}
+
+/**
+ * The mutual exclusion between same-extension evaluations and a generation's
+ * final transition.
+ *
+ * An evaluation reads the current configuration and writes agent files. A
+ * generation changes the configuration and then evaluates once. Without this,
+ * an evaluation that started on the *old* configuration could finish its writes
+ * after the new one, leaving an agent on a model the new policy would not pick.
+ * `acquire` refuses new evaluations and waits for running ones to drain; its
+ * release lets them through again. It is deliberately tiny — no queue, no
+ * cancellation, no arbitration between processes — because it only has to close
+ * the instant between publication and cache swap.
+ */
+export interface EvaluationFence {
+  /**
+   * Run one evaluation, or `undefined` while the fence is up.
+   *
+   * `wait` is for the one caller whose result is a promise to the session: it
+   * waits for the generation to release the fence and then runs, instead of
+   * being refused. A refusal stays the default for a poll tick (the next one
+   * catches up) and for `apply` (the user can try again).
+   */
+  run<T>(body: () => Promise<T>, options?: { wait?: boolean }): Promise<T | undefined>;
+  /** Raise the fence, wait for running evaluations, and return its release. */
+  acquire(): Promise<() => void>;
+}
+
+export function evaluationFence(): EvaluationFence {
+  let fenced = false;
+  let running = 0;
+  const idle: Array<() => void> = [];
+  const cleared: Array<() => void> = [];
+  return {
+    async run<T>(body: () => Promise<T>, options: { wait?: boolean } = {}): Promise<T | undefined> {
+      // The loop is not for a queue: `acquire` is the only raiser, and it waits
+      // for `running` before it hands back a release, so one release wakes every
+      // waiter at once and the re-check is only for a second generation that
+      // took the fence in the same instant.
+      while (fenced) {
+        if (!options.wait) return undefined;
+        await new Promise<void>((done) => cleared.push(done));
+      }
+      running += 1;
+      try {
+        return await body();
+      } finally {
+        running -= 1;
+        if (running === 0) for (const done of idle.splice(0)) done();
+      }
+    },
+    async acquire(): Promise<() => void> {
+      fenced = true;
+      if (running > 0) await new Promise<void>((done) => idle.push(done));
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        fenced = false;
+        for (const done of cleared.splice(0)) done();
+      };
+    },
+  };
+}
+
+/**
+ * Run one policy evaluation under the fence, reading the boot it evaluates only
+ * once the fenced body has been entered.
+ *
+ * The indirection is the point. A `session_start` can await a boot that a
+ * generation then supersedes: had it captured that boot's dispatcher before the
+ * wait, it would evaluate the old policy *after* the generation had evaluated
+ * the new one. Reading the boot inside the body puts the read in the same step
+ * as the fence check, so a body that starts at all starts against the policy the
+ * generation left, and one that would have started stale is refused instead —
+ * or, with `wait`, released once the generation is done and then started
+ * against the policy it left.
+ */
+export function fencedEvaluation<T, R>(
+  fence: EvaluationFence,
+  current: () => Promise<T> | undefined,
+  evaluate: (value: T) => Promise<R>,
+  options?: { wait?: boolean },
+): Promise<R | undefined> {
+  return fence.run(async () => {
+    const pending = current();
+    if (pending === undefined) return undefined;
+    return evaluate(await pending);
+  }, options);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -3176,42 +3287,186 @@ export default function (pi: ExtensionAPI) {
   let boot:
     | Promise<{ loaded: LoadedConfig; dispatcher: Dispatcher; misses: ModelMiss[] }>
     | undefined;
-  const bootOnce = (ctx: ExtensionContext) =>
-    (boot ??= loadedOnce().then(async (base) => {
-      const directory = await readAgentDirectory(base.config.agentDir);
-      // Both checks join the load warnings, so the log, the report's warning
-      // tail and `describeConfig` carry them: the agent-file check first, in the
-      // place its warning used to sit when `loadConfig` still made it.
-      const agentFileWarnings = checkAgentFiles(base.config, directory);
-      const checked = checkModels(base.config, modelLookup(ctx));
-      return {
-        // The checked config is the effective one; `sources` still describe the
-        // config that resulted, because the check only drops candidates it
-        // cannot spawn.
-        loaded: {
-          ...base,
-          config: checked.config,
-          warnings: [...base.warnings, ...agentFileWarnings, ...checked.warnings],
-        },
-        dispatcher: createDispatcher(checked.config, {
-          held: checked.held,
-          droppedAlternates: checked.droppedAlternates,
-        }),
-        // The occurrences the same check warned about, for `session_start` to
-        // surface. Rendered lines would have to be read back apart to be listed
-        // as a warning, which is the work `checkModels` already did.
-        misses: checked.misses,
-      };
-    }));
+
+  /**
+   * Build the runtime a validated configuration implies: read the agent dir,
+   * run the two checks that need pi, and create the dispatcher.
+   *
+   * Split out of `bootOnce` because generation needs it before it publishes: a
+   * configuration that cannot be booted must fail before it reaches the disk,
+   * so the prepared runtime is built from the generated layer and handed back
+   * for the caches to swap in once the file has moved. It writes neither the
+   * config file nor an agent file.
+   */
+  const bootFrom = async (
+    base: LoadedConfig,
+    ctx: ExtensionContext,
+  ): Promise<{ loaded: LoadedConfig; dispatcher: Dispatcher; misses: ModelMiss[] }> => {
+    const directory = await readAgentDirectory(base.config.agentDir);
+    // Both checks join the load warnings, so the log, the report's warning
+    // tail and `describeConfig` carry them: the agent-file check first, in the
+    // place its warning used to sit when `loadConfig` still made it.
+    const agentFileWarnings = checkAgentFiles(base.config, directory);
+    const checked = checkModels(base.config, modelLookup(ctx));
+    return {
+      // The checked config is the effective one; `sources` still describe the
+      // config that resulted, because the check only drops candidates it
+      // cannot spawn.
+      loaded: {
+        ...base,
+        config: checked.config,
+        warnings: [...base.warnings, ...agentFileWarnings, ...checked.warnings],
+      },
+      dispatcher: createDispatcher(checked.config, {
+        held: checked.held,
+        droppedAlternates: checked.droppedAlternates,
+      }),
+      // The occurrences the same check warned about, for `session_start` to
+      // surface. Rendered lines would have to be read back apart to be listed
+      // as a warning, which is the work `checkModels` already did.
+      misses: checked.misses,
+    };
+  };
+
+  const bootOnce = (ctx: ExtensionContext) => (boot ??= loadedOnce().then((base) => bootFrom(base, ctx)));
 
   let timer: ReturnType<typeof setInterval> | undefined;
   let stopped = false;
+  // Whether generation has already chosen the polling cadence. The first load's
+  // scheduling runs from a callback registered before any command could run, so
+  // this only matters if a generation somehow settles first — and then the
+  // generated cadence must not be overwritten by the older one.
+  let cadenceFromGeneration = false;
+  // One generation at a time. Overlap is refused rather than queued: two runs
+  // would both read the file, run a script and race to publish, and the second
+  // would either lose its work to the compare-and-swap or clobber a change the
+  // first had just made.
+  let generating = false;
+
+  // ------------------------------------------------------------- evaluation fence
+  //
+  // An evaluation reads the current config and writes agent files. A generation
+  // changes the config and then evaluates once. Without a fence an evaluation
+  // that started on the *old* config could finish its writes after the new
+  // evaluation, leaving an agent on a model the new policy would not pick. The
+  // fence is deliberately tiny: new evaluations are refused only for the final
+  // transition, and already-running ones are drained before the file is
+  // published. It is not a scheduler and does not arbitrate across processes.
+  const fence = evaluationFence();
+  const acquireFence = () => fence.acquire();
+
+  /**
+   * (Re)schedule the periodic evaluation for `cfg`.
+   *
+   * The one place a cadence is chosen, so the first load and a generation cannot
+   * each set a timer: a generation whose output changed `pollMs`, emptied the
+   * table or named different agents reschedules here rather than leaving the old
+   * interval running. A stopped extension or an empty table gets no timer.
+   */
+  function scheduleTimer(cfg: DispatcherConfig): void {
+    if (timer !== undefined) {
+      clearInterval(timer);
+      timer = undefined;
+    }
+    if (stopped || managesNothing(cfg)) return;
+    timer = setInterval(() => {
+      void fencedEvaluation(fence, () => boot, ({ dispatcher }) => dispatcher.evaluate()).catch(() => {});
+    }, cfg.pollMs);
+    timer.unref?.();
+  }
+
+  /**
+   * Run the explicit generation form for one scope.
+   *
+   * The subprocess, the strict check and the atomic publication all live in
+   * `generateConfig`; what happens here is the part that only the extension can
+   * do — prepare a runtime, swap the two cached handles together, choose the
+   * cadence and evaluate the new policy once. A failure is reported and changes
+   * nothing: no cache, no cadence, no footer.
+   */
+  async function runGenerate(scope: "global" | "project", ctx: ExtensionContext): Promise<void> {
+    if (generating) {
+      ctx.ui.notify("quota-dispatcher: a configuration generation is already running.", "warning");
+      return;
+    }
+    generating = true;
+    try {
+      // The initial load is awaited before committing anything: its cadence
+      // callback was registered at setup, and letting generation finish first
+      // must not leave that older cadence able to overwrite the generated one.
+      await loadedOnce();
+      const path = scope === "global" ? globalConfigPath() : projectConfigPath();
+      const result = await generateConfig({
+        source: scope,
+        path,
+        prepare: (loaded) => bootFrom(loaded, ctx),
+        acquireFence,
+      });
+      if (result.kind === "failed") {
+        ctx.ui.notify(result.lines.join("\n"), "warning");
+        return;
+      }
+
+      // Published. The two in-memory handles swap together, so the active
+      // configuration cannot disagree with itself. The file was already
+      // published a moment earlier, so a read in that instant can still see the
+      // new file beside the old cached config — harmless, because this fence's
+      // job is to order evaluations, not readers. The fence stays held through
+      // the new evaluation so no poll tick can race it, and is released once
+      // that work is done — or once it fails.
+      loadedPromise = Promise.resolve(result.loaded);
+      boot = Promise.resolve(result.prepared);
+      try {
+        cadenceFromGeneration = true;
+        scheduleTimer(result.prepared.loaded.config);
+        // The footer is a statement about the install, and generation can change
+        // it: the table may now be configured, or a model this pi does not know
+        // may have appeared. "resume" sets the line without a fresh notify — the
+        // success notice below already carries every warning.
+        if (managesNothing(result.prepared.loaded.config)) {
+          setFooterStatus(ctx, STATUS_TEXT);
+        } else {
+          announceUnknownModels(result.prepared.misses, result.prepared.loaded, ctx, "resume");
+        }
+
+        const lines: string[] = [`[generated] ${result.path}`];
+        let note: string | undefined = result.cleanupNote;
+        try {
+          // The same evaluation `session_start` runs: skipped when the new table
+          // manages nothing (an empty table has no files to decide, and asking
+          // two vendors for quota to decide about none is a request the user
+          // never asked for), and unforced so the freshly built dispatcher's own
+          // empty cache is what fetches — not a bypass that would re-fetch a
+          // dispatcher that already held readings.
+          const rows = managesNothing(result.prepared.loaded.config)
+            ? []
+            : await result.prepared.dispatcher.evaluate();
+          lines.push(...rows.flatMap((r) => describeDecisionLines(r.decision, r.outcome)));
+        } catch (err) {
+          // The file moved and the caches swapped; a failure here cannot undo
+          // that, so it is reported as a note rather than as an unchanged state.
+          note = `the configuration was activated, but evaluating it once failed (${errorText(err)})`;
+        }
+        lines.push(
+          "",
+          describeConfigLayers(result.prepared.loaded),
+          ...describeConfigWarnings(result.prepared.loaded),
+        );
+        if (note !== undefined) lines.push(`  note: ${note}`);
+        ctx.ui.notify(lines.join("\n"), "info");
+      } finally {
+        result.release();
+      }
+    } finally {
+      generating = false;
+    }
+  }
 
   pi.registerCommand("quota-dispatch", {
     // The forms are named here because this is the only place pi shows them:
     // a user who never opens the README would not otherwise learn that the
     // provenance form exists.
-    description: "Show subscription headroom and each agent's model; forms: refresh, config, apply",
+    description: "Show subscription headroom and each agent's model; forms: refresh, config, apply, generate",
     handler: async (args, ctx) => {
       const invocation = parseInvocation(args ?? "");
 
@@ -3222,13 +3477,30 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // Generation runs the declared command and replaces one file; it builds
+      // its own runtime from the generated layer, so it does not boot the current
+      // one first. Answered before any boot for the same reason a typo is.
+      if (invocation.form === "generate") {
+        await runGenerate(invocation.scope, ctx);
+        return;
+      }
+
       const { loaded, dispatcher } = await bootOnce(ctx);
 
-      // Only `apply` writes, and only `config` skips the quota read: it is about
-      // the files on this machine, so it answers without costing a request.
+      // Only `apply` and `generate` write, and only `config` skips the quota
+      // read: it is about the files on this machine, so it answers without
+      // costing a request.
       let lines: string[];
       if (invocation.form === "apply") {
-        const rows = await dispatcher.evaluate({ force: true });
+        const rows = await fencedEvaluation(
+          fence,
+          () => bootOnce(ctx),
+          ({ dispatcher }) => dispatcher.evaluate({ force: true }),
+        );
+        if (rows === undefined) {
+          ctx.ui.notify("quota-dispatcher: a configuration generation is finishing; try again.", "warning");
+          return;
+        }
         lines = [
           "[applied]",
           ...rows.flatMap((r) => describeDecisionLines(r.decision, r.outcome)),
@@ -3263,27 +3535,41 @@ export default function (pi: ExtensionAPI) {
   // An unconfigured install evaluates nothing: with no agents there is nothing
   // to write, and asking two vendors for quota to then decide about no files is
   // a request the user never asked for. It says so instead.
+  //
+  // The whole body — the gate, the announcements and the evaluation — runs on
+  // one boot read *inside* the fence. Reading it here, before the fence, would
+  // let a generation commit while this boot was pending and leave the gate and
+  // the footer describing a superseded table; the generation has its own
+  // announcement, so the cost is a stale footer plus a quota request the new
+  // empty table did not ask for. Waiting (rather than being refused) is also
+  // what keeps this handler's promise: unlike a poll tick, the session's first
+  // spawn is held on this evaluation.
   pi.on("session_start", async (event, ctx) => {
-    const { loaded, dispatcher, misses } = await bootOnce(ctx);
+    await fencedEvaluation(
+      fence,
+      () => bootOnce(ctx),
+      async ({ loaded, misses, dispatcher }) => {
+        if (managesNothing(loaded.config)) {
+          await announceUnconfigured(loaded, ctx, event.reason);
+          return;
+        }
 
-    if (managesNothing(loaded.config)) {
-      await announceUnconfigured(loaded, ctx, event.reason);
-      return;
-    }
-
-    // Before the evaluation, so the warning is on screen while the quota reads
-    // that follow it are still in flight. It also replaces the footer line an
-    // unconfigured install left: the table is read once per extension load, so
-    // the state has to change here or nowhere.
-    //
-    // A config file that could not be used is reported here too, not only when
-    // it leaves the table empty: the layer it lost is not the whole config, so
-    // the other symptom is a route that is quietly not the one the reader wrote
-    // — the same invisible-from-the-outside state ADR 0009 raised for a model
-    // this pi cannot spawn.
-    announceUnusableConfig(loaded, ctx, event.reason);
-    announceUnknownModels(misses, loaded, ctx, event.reason);
-    await dispatcher.evaluate().catch(() => {});
+        // Before the evaluation, so the warning is on screen while the quota
+        // reads that follow it are still in flight. It also replaces the footer
+        // line an unconfigured install left: the table is read once per
+        // extension load, so the state has to change here or nowhere.
+        //
+        // A config file that could not be used is reported here too, not only
+        // when it leaves the table empty: the layer it lost is not the whole
+        // config, so the other symptom is a route that is quietly not the one
+        // the reader wrote — the same invisible-from-the-outside state ADR 0009
+        // raised for a model this pi cannot spawn.
+        announceUnusableConfig(loaded, ctx, event.reason);
+        announceUnknownModels(misses, loaded, ctx, event.reason);
+        await dispatcher.evaluate().catch(() => {});
+      },
+      { wait: true },
+    );
   });
 
   // Periodic re-evaluation so workflow and mention spawns, which bypass the
@@ -3296,12 +3582,12 @@ export default function (pi: ExtensionAPI) {
   // therefore reuses the cached boot a session has already built, and does
   // nothing at all if no session has started yet. Starting a boot here would
   // skip the check silently, which is the failure this whole change is about.
+  //
+  // A cadence a generation has already chosen is not overwritten by this first
+  // callback, which was registered before any command could run.
   void loadedOnce().then((loaded) => {
-    if (stopped || managesNothing(loaded.config)) return;
-    timer = setInterval(() => {
-      boot?.then(({ dispatcher }) => dispatcher.evaluate()).catch(() => {});
-    }, loaded.config.pollMs);
-    timer.unref?.();
+    if (cadenceFromGeneration) return;
+    scheduleTimer(loaded.config);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
