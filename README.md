@@ -214,11 +214,13 @@ stays the durable record. More in
 | `/quota-dispatch` | Show rail budgets and the current decision per agent, plus any agent files no route names. Read-only. |
 | `/quota-dispatch refresh` | Force a re-fetch, then show. Read-only. |
 | `/quota-dispatch config` | Print where each configured value came from. Local, so it reads no quota and touches no file. |
-| `/quota-dispatch apply` | Write the decisions out now. The only form that touches a file. |
+| `/quota-dispatch apply` | Write the decisions out now. |
+| `/quota-dispatch generate [project]` | Run the declared generator and replace that file's configuration with its output. See [Generating configuration](#generating-configuration). |
 
 The argument is a form name and nothing else, matched whole: `/quota-dispatch
 refresh apply` is not read as `apply`, and a word that names no form is answered
-with the list above rather than silently showing the report.
+with the list above rather than silently showing the report. `generate` takes
+the single optional word `project`; nothing else is a scope.
 
 The two reporting forms are read-only by construction — `report()` has no way to
 be asked to write, so "show me the state" cannot rewrite your agents — and
@@ -549,6 +551,12 @@ Bad configuration never stops the dispatcher from starting:
   the skill is invoked.
 - **A skip flag that is not `true` or `false`, or a `null` anywhere** — logged
   and treated as absent, so the previous layer's value stands.
+- **A malformed `generator` declaration** — logged and ignored, and the file's
+  routes still apply: a declaration says how the file is produced, not what it
+  routes. `/quota-dispatch generate` is the only thing that reads it, and it
+  fails without changing anything when the declaration cannot be used. A
+  generated layer is the exception to all of the above — see
+  [Generating configuration](#generating-configuration).
 - **A final `sessionAlwaysSwitchAt` below the effective `sessionSwitchAt`** —
   logged once, naming both values and both supplying layers, and it disables
   only the override: `sessionSwitchAt` and every other value are untouched and
@@ -596,6 +604,57 @@ that is not doing what you meant says so instead of quietly routing you
 somewhere else.
 
 Config is read once when the extension loads; `/reload` after editing.
+
+### Generating configuration
+
+A config file may declare a command that prints a whole ordinary configuration
+layer as JSON, so a program can compute the table instead of you editing it by
+hand:
+
+```json
+{
+  "generator": { "command": "my-dispatcher-config", "timeoutMs": 5000 },
+  "agents": {
+    "planner": {
+      "primary": { "model": "claude-bridge/claude-opus-5-5", "rail": "claude" }
+    }
+  }
+}
+```
+
+Then `/quota-dispatch generate` runs it and replaces that file's ordinary
+configuration with what it printed; `/quota-dispatch generate project` does the
+same for `.pi/quota-dispatch.json`. The `generator` declaration is preserved (as
+the same JSON value, so its spelling may be normalized), so the next run still
+knows its command. The command runs under Bash with the file's own directory as
+the working directory and your environment, and must print strictly valid
+configuration JSON — **any problem in the generated layer rejects the run** and
+leaves the file and the running configuration exactly as they were. That is
+stricter than a hand-written file, which tolerates a bad value by keeping the
+one beneath it; a generator printed a whole layer, so a half-accepted one would
+activate a configuration nobody wrote. A generator's own `generator` key in its
+output is ignored: the target file's declaration is the one that governs.
+
+Generation replaces **one layer, not the merged config**, and it happens **only
+on those two commands** — never on load, `/reload`, a poll, or a session event.
+A successful run activates the new configuration immediately; there is no
+`/reload`. That immediacy is about *this* pi process, though: another running
+session keeps the configuration it read (and keeps polling and writing shared
+agent files with that policy) until it runs `/reload` too. Two sessions on
+opposing policies will take turns rewriting the same agent files every `pollMs`,
+so reload the others — or stop them — after a swap. A failure is reported with
+the command's own `stderr` and changes nothing. Unlike the other forms,
+generation also evaluates the new policy once, exactly as `session_start` does
+(including doing nothing when the new table manages no agents), so it writes
+agent files exactly as `apply` does.
+
+**A project-declared `generator` is code the repository ships.** Running
+`/quota-dispatch generate project` in a repository executes that repository's
+command, on your machine, before you have read it. Prefer a global generator, or
+read the project file before generating from it. The run is bounded — a timeout
+(default 5s, settable with `timeoutMs`), capped output, and a process-group kill
+— but it is not a sandbox. See
+[0015](docs/adr/0015-configuration-generation.md).
 
 ### Out of scope
 
