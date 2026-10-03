@@ -215,7 +215,7 @@ stays the durable record. More in
 | `/quota-dispatch refresh` | Force a re-fetch, then show. Read-only. |
 | `/quota-dispatch config` | Print where each configured value came from. Local, so it reads no quota and touches no file. |
 | `/quota-dispatch apply` | Write the decisions out now. |
-| `/quota-dispatch generate [project]` | Run the declared generator and replace that file's configuration with its output. See [Generating configuration](#generating-configuration). |
+| `/quota-dispatch generate [project]` | Run the declared generator and replace that file's configuration with its output. It is fed the current rail readings on stdin. See [Generating configuration](#generating-configuration). |
 
 The argument is a form name and nothing else, matched whole: `/quota-dispatch
 refresh apply` is not read as `apply`, and a word that names no form is answered
@@ -646,14 +646,105 @@ so reload the others — or stop them — after a swap. A failure is reported wi
 the command's own `stderr` and changes nothing. Unlike the other forms,
 generation also evaluates the new policy once, exactly as `session_start` does
 (including doing nothing when the new table manages no agents), so it writes
-agent files exactly as `apply` does.
+agent files exactly as `apply` does. It is also the one form that **reads a
+quota before it has a table to decide about**: the input below is gathered
+first, so a rail the active dispatcher does not already hold is read now. A
+generated table that manages agents is activated and reads both capped rails
+again straight away; an empty one has no activation to warm it, so on an
+unconfigured install **every** generate reads both. (A read may be retried once
+— a 5xx or a transport failure, never a 4xx — and can trigger a Claude token
+refresh. See [Where the numbers come from](#where-the-numbers-come-from).)
 
 **A project-declared `generator` is code the repository ships.** Running
 `/quota-dispatch generate project` in a repository executes that repository's
-command, on your machine, before you have read it. Prefer a global generator, or
-read the project file before generating from it. The run is bounded — a timeout
+command, on your machine, before you have read it — and that command is now
+handed both vendors' response bodies on stdin, which may carry account details
+(see below). Prefer a global generator, or read the project file before
+generating from it. The run is bounded — a timeout
 (default 5s, settable with `timeoutMs`), capped output, and a process-group kill
 — but it is not a sandbox. See
+[0015](docs/adr/0015-configuration-generation.md).
+
+#### What the generator reads on stdin
+
+Every run writes one JSON document to the command's stdin and closes it, so a
+generator can make quota-aware choices instead of printing a fixed table.
+**Reading it is optional** — a command that ignores stdin, or exits before
+reading it, still succeeds.
+
+```json
+{
+  "version": 1,
+  "rails": {
+    "claude": {
+      "ok": true,
+      "readAt": "2025-02-03T09:14:22.431Z",
+      "windows": [
+        { "label": "5h", "used": 42, "budget": "session", "resetsAt": "2025-02-03T12:30:00.000Z" },
+        { "label": "7d", "used": 11, "budget": "weekly" }
+      ],
+      "raw": { "five_hour": { "utilization": 42, "resets_at": "2025-02-03T12:30:00.000Z" }, "seven_day": { "utilization": 11 } },
+      "latestFailure": { "at": "2025-02-03T09:20:07.118Z", "note": "HTTP 500 after 2 attempts" }
+    },
+    "codex": {
+      "ok": true,
+      "readAt": "2025-02-03T09:20:07.902Z",
+      "windows": [
+        { "label": "5h", "used": 100, "budget": "session", "resetsAt": "2025-02-03T10:20:07.902Z" },
+        { "label": "7d", "used": 100, "budget": "weekly" }
+      ],
+      "raw": { "rate_limit": { "limit_reached": true, "primary_window": { "used_percent": 7, "limit_window_seconds": 18000, "reset_after_seconds": 3600 }, "secondary_window": { "used_percent": 3, "limit_window_seconds": 604800 } } },
+      "note": "limit_reached=true"
+    },
+    "deepseek": { "metered": true, "windows": [], "raw": null }
+  }
+}
+```
+
+The claude entry above is the **last good reading**: its newest read failed, so
+the previous success is sent and `latestFailure` says what the newer read ran
+into. That is the only thing the marker means. The codex entry shows a `note`:
+under `limit_reached` every window reads 100 while `raw` keeps the vendor's own
+lower percentages, and the note is what tells a generator why they disagree.
+
+| Field | Meaning |
+|---|---|
+| `version` | `1`. A change to this shape bumps it. |
+| `rails` | One key per rail, **always all three**. A capped rail with no usable reading is not sent empty — it refuses the run instead (below). |
+| `ok` | `true`: what follows is a reading, not a failure. The metered rail has no `ok` at all, so a generator should test `metered` before it tests `ok`. |
+| `readAt` | ISO 8601, when the reading sent was taken — the last good reading's own time when `latestFailure` is present. |
+| `windows` | Every window that read reported. `used` is percent; `budget` (`session` or `weekly`) is present only when the window counts toward one; `resetsAt` (ISO 8601) only when the vendor said when it clears. |
+| `raw` | The vendor's response body as parsed JSON — the document `windows` was parsed from — re-serialized, so its formatting and number spelling may differ (an integer beyond 2^53 loses precision, and a duplicate key is already gone). It may carry account details, so do not log it. `used` is not always recomputable from it: under Codex's `limit_reached` every window reads 100 whatever `raw` says. |
+| `note` | A display-only qualifier the read carried, when it carried one: Codex's `limit_reached=true`, or a note from refreshing the Claude credential (which may be this extension's own, not the vendor's). |
+| `latestFailure` | `{ at, note }` of the newest failed read. Present only when that read failed and an earlier success stood in for it. |
+| `metered` | A per-token rail: `{ "metered": true, "windows": [], "raw": null }`, and nothing to decide. |
+
+The document is **facts only**: nothing in it says a budget is *tight*, because
+that judgment is the policy's, and the numbers your generator prints may change
+where the thresholds should sit. The input is what this process already holds,
+**whatever its age**, and a rail with no reading at all is read once before the
+command runs. Run
+[`/quota-dispatch refresh`](#commands) first when you want fresh numbers. There
+is no `generate refresh` form.
+
+If **`claude` or `codex` has no successful reading** in what the active
+dispatcher holds — nothing since it was built, which is since startup, a
+`/reload` or a previous generate — the command is **not run** and the failure
+says which rail and why. A cached failure is not retried: a rail that has never
+succeeded since the dispatcher was built counts as having no reading, and the
+refusal says so. That is deliberate: a generator cannot choose without the
+numbers, and a placeholder would be a guess the policy itself refuses to make.
+One consequence: an install with only one of the two quota-capped rails cannot
+generate.
+
+`generator.timeoutMs` covers the command only, starting when it is spawned. The
+quota reads before it are bounded by the reads' own limits (see
+[Where the numbers come from](#where-the-numbers-come-from)), so a slow vendor
+never eats the command's time.
+
+The reasoning behind all of this — why the input is what the dispatcher already
+holds rather than a fresh read, why a failed rail sends its last good reading,
+and when a run is refused — is in
 [0015](docs/adr/0015-configuration-generation.md).
 
 ### Out of scope

@@ -7,8 +7,10 @@
  * replaces that one file's ordinary contents, preserving the declaration that
  * named the command. This module is the whole of that: the bounded execution,
  * the strict check in the context of the layer beneath, the atomic publication,
- * and the failure rendering. It knows nothing about dispatchers, pi, timers or
- * UI; the runtime is supplied by a `prepare` callback run before publication.
+ * the failure rendering, and the wire document the command reads on stdin (see
+ * `GeneratorInput`). It knows nothing about dispatchers, pi, timers or UI; the
+ * runtime is supplied by a `prepare` callback run before publication, and the
+ * generator's input by an `input` callback.
  *
  * Two things are deliberately narrower than they might look. A generated layer
  * replaces *one* file, not the merged configuration: the other layer is read as
@@ -26,6 +28,7 @@ import {
   type ConfigFileFault,
   type GeneratorDeclaration,
   type LoadedConfig,
+  type Rail,
   DEFAULT_GENERATOR_TIMEOUT_MS,
   errorText,
   escapeInvisible,
@@ -53,6 +56,15 @@ export interface BashRunInput {
   /** The working directory; the target config file's own directory. */
   cwd: string;
   timeoutMs: number;
+  /**
+   * Written to the command's stdin, which is then closed.
+   *
+   * A string rather than a promise or a callback, so the runner cannot start its
+   * timeout and then wait on work that belongs outside it: the quota read behind
+   * this document is bounded by its own limits, never by `timeoutMs`. Every
+   * generator gets its input, so the field is not optional.
+   */
+  stdin: string;
 }
 
 /**
@@ -71,6 +83,88 @@ export interface BashRun {
 
 /** The execution seam, so tests can exercise the orchestration without Bash. */
 export type BashRunner = (input: BashRunInput) => Promise<BashRun>;
+
+/**
+ * The version the generator's stdin document carries. A change to the shape
+ * below bumps it, so a generator can refuse a document it does not understand.
+ */
+export const GENERATOR_INPUT_VERSION = 1;
+
+/** One rail window as a generator reads it: the report's fields, in text. */
+export interface GeneratorWindowInput {
+  readonly label: string;
+  /**
+   * Percent of the window used. This is the policy's own figure, which is not
+   * always a restatement of `raw`: Codex's `limit_reached` path reads 100 here
+   * over the vendor's lower percentages, which `note` explains.
+   */
+  readonly used: number;
+  /** Which budget the window counts toward, when it was classified. */
+  readonly budget?: "session" | "weekly";
+  /** ISO 8601 UTC, when the vendor reported when the window clears. */
+  readonly resetsAt?: string;
+}
+
+/**
+ * One quota-capped rail as a generator reads it: the reading that was sent — the
+ * latest one, or the last good one when the newest read failed — together with
+ * the failure that made the older reading stand in.
+ */
+export interface GeneratorReadingInput {
+  readonly ok: true;
+  /** ISO 8601 UTC: when the reading sent was taken, not when it was handed over. */
+  readonly readAt: string;
+  readonly windows: readonly GeneratorWindowInput[];
+  /**
+   * The vendor's response body as parsed JSON — the document `windows` was parsed
+   * from, re-serialized, so its formatting and number spelling may differ from
+   * the wire (an integer beyond 2^53 loses precision). It may carry account
+   * details, so it is for the generator and not for a log.
+   */
+  readonly raw: unknown;
+  /**
+   * A display-only qualifier the read carried, e.g. Codex's
+   * `limit_reached=true`. Not necessarily the vendor's own: refreshing the Claude
+   * credential can append this extension's note to the read.
+   */
+  readonly note?: string;
+  /** Set only when the newest read failed and the reading sent is the last good one. */
+  readonly latestFailure?: { readonly at: string; readonly note: string };
+}
+
+/** A rail billed per token: no budgets to report, and never read. */
+export interface GeneratorMeteredInput {
+  readonly metered: true;
+  readonly windows: readonly [];
+  readonly raw: null;
+}
+
+export type GeneratorRailInput = GeneratorReadingInput | GeneratorMeteredInput;
+
+/**
+ * The document fed to a generator on stdin, once per run: the rail readings the
+ * active configuration's dispatcher holds, projected onto a versioned wire
+ * shape.
+ *
+ * Facts only: whether a budget is tight is the policy's judgment and a generator
+ * owns its own, so the thresholds its output may change are not baked in here.
+ * The contract is documented in the README and in
+ * docs/adr/0015-configuration-generation.md.
+ */
+export interface GeneratorInput {
+  readonly version: typeof GENERATOR_INPUT_VERSION;
+  /** Every rail key is always present. */
+  readonly rails: Readonly<Record<Rail, GeneratorRailInput>>;
+}
+
+/**
+ * What the generator is fed, or why it must not run. `refused` is a run that
+ * never starts because a capped rail has no reading a generator could use — the
+ * reasons are rendered as the run's failure.
+ */
+export type GeneratorInputOutcome =
+  | { readonly kind: "ready"; readonly input: GeneratorInput }
+  | { readonly kind: "refused"; readonly reason: readonly string[] };
 
 /** Concatenate a chunk list, preserving order. */
 function join(chunks: readonly Buffer[]): Buffer {
@@ -93,6 +187,22 @@ function trimTail(chunks: Buffer[], state: { bytes: number }, cap: number): void
 }
 
 /**
+ * Whether a stdin write error means the generator stopped reading — which the
+ * contract allows — rather than that this run failed to write.
+ *
+ * A generator may exit without reading its stdin, or close it partway; either
+ * leaves the pipe with no reader, and the write then fails with a reader-gone
+ * code. The code seen in practice is `EPIPE` (a generator that exits without
+ * reading); `ECONNRESET` and `ERR_STREAM_DESTROYED` are the same class of
+ * "nothing is reading" that a socket can raise. This process is the pipe's only
+ * writer, so a reader-gone error cannot be a mistake this code made, and the
+ * run's verdict is the child's exit status.
+ */
+function stdinReaderIsGone(err: unknown): boolean {
+  return errnoIs(err, "EPIPE") || errnoIs(err, "ECONNRESET") || errnoIs(err, "ERR_STREAM_DESTROYED");
+}
+
+/**
  * Run `bash -c <command>` under a timeout, capturing bounded output.
  *
  * A local runner rather than pi's own `exec`, for three reasons the contract
@@ -104,8 +214,9 @@ function trimTail(chunks: Buffer[], state: { bytes: number }, cap: number): void
  * settles when the timeout fires, rather than hanging on a pipe a grandchild
  * holds open.
  *
- * stdin is the null device, so a generator that reads it sees EOF and cannot
- * block waiting for input nobody is there to type.
+ * stdin is a pipe carrying `input.stdin`, closed once it is written, so a
+ * generator that reads it gets the document and one that ignores it sees its
+ * writes fail without the run being blamed for that — see `BashRunInput.stdin`.
  */
 export function runBash(input: BashRunInput): Promise<BashRun> {
   return new Promise<BashRun>((settle) => {
@@ -170,7 +281,7 @@ export function runBash(input: BashRunInput): Promise<BashRun> {
         // rather than only the shell. Not on Windows, where `detached` means a
         // console rather than a group and signalling is per-process.
         detached: process.platform !== "win32",
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (err) {
       finish({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), failure: `could not be started (${errorText(err)})` });
@@ -192,6 +303,17 @@ export function runBash(input: BashRunInput): Promise<BashRun> {
       input.timeoutMs,
     );
     timer.unref?.();
+
+    // A stdin `error` is handled here, not swallowed. A reader-gone error is
+    // allowed — the contract makes reading stdin optional — but any other one is
+    // a write this run could not make, so it settles the run like any other
+    // failed write. The handler also exists because an unhandled stream `error`
+    // event would take the whole process down.
+    child.stdin?.on("error", (err: unknown) => {
+      if (stdinReaderIsGone(err)) return;
+      settleFailure(`its stdin could not be written (${errorText(err)})`);
+    });
+    child.stdin?.end(input.stdin);
 
     child.on("exit", (code, signal) => {
       // Recorded separately from `close`, which waits for the output pipes: a
@@ -283,6 +405,16 @@ export interface GenerateConfigRequest<P> {
   /** Lock pacing, for tests and for a caller that wants different patience. */
   coordination?: Coordination;
   /**
+   * Gather the document the generator reads on stdin, or the reasons it must not
+   * run. Called once, after the target's declaration is validated and before the
+   * subprocess is spawned: a file that declares no generator costs no quota read,
+   * and the read is not counted against `timeoutMs`. Must not write the config
+   * file or an agent file — though gathering readings may run a Claude refresh
+   * ping, which rewrites Claude's own credential store. A throw is a generation
+   * failure.
+   */
+  input: () => Promise<GeneratorInputOutcome>;
+  /**
    * Build the runtime for the validated configuration *before* anything is
    * published, so a configuration that cannot boot never reaches the disk. Must
    * not write the config file or an agent file.
@@ -371,10 +503,28 @@ export async function generateConfig<P>(
   }
   const declaration: GeneratorDeclaration = declared.declaration;
 
+  // Gathered after the declaration is validated, so a file that declares no
+  // generator — or declares one badly — costs no quota read, and before `run`,
+  // so the read is bounded by the quota read's own limits rather than by
+  // `timeoutMs`. A refusal is the same kind of failure as any other, rendered by
+  // the same `fail`/`renderFailure` path, so the header and the "nothing
+  // changed" line are stated once rather than per kind.
+  let outcome: GeneratorInputOutcome;
+  try {
+    outcome = await req.input();
+  } catch (err) {
+    return fail([`the rail readings could not be gathered (${errorText(err)})`]);
+  }
+  if (outcome.kind === "refused") return fail([...outcome.reason]);
+
   const ran = await run({
     command: declaration.command,
     cwd: dirname(target),
     timeoutMs: declaration.timeoutMs ?? DEFAULT_GENERATOR_TIMEOUT_MS,
+    // Compact, on one line with a trailing newline: a reader that takes one
+    // line at a time (`read -r`, `jq`) gets the whole document either way, and
+    // the newline closes the last line rather than leaving it unterminated.
+    stdin: `${JSON.stringify(outcome.input)}\n`,
   });
   // Captured once, and carried through every later failure: the generator's own
   // account of what went wrong is what the user needs, whether the run failed

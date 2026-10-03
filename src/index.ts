@@ -75,7 +75,16 @@ import {
 // The generator module is where a declared command's output replaces one config
 // layer. Its orchestration is a call the command handler makes, not a public
 // surface: the tests import the module directly, so nothing is re-exported here.
-import { generateConfig } from "./generator.ts";
+// The stdin document's types come back the other way, so the projection onto
+// them can be built where the readings live without generator.ts learning about
+// dispatchers.
+import {
+  type GeneratorInputOutcome,
+  type GeneratorReadingInput,
+  type GeneratorWindowInput,
+  GENERATOR_INPUT_VERSION,
+  generateConfig,
+} from "./generator.ts";
 
 // Config is a separate module because it is read from disk at run time; it is
 // re-exported here so `src/index.ts` remains the one import path for the
@@ -334,6 +343,33 @@ export type RailReadings =
   | { readonly latest: FailedReading; readonly lastGood?: GoodReading }
   | { readonly latest: GoodReading; readonly lastGood: GoodReading };
 
+/**
+ * A vendor rail's readings: the arms of `RailReadings` the cache can produce,
+ * with the metered arm — which only the metered rail can have — excluded.
+ */
+export type VendorRailReadings = Exclude<RailReadings, { readonly latest: MeteredReading }>;
+
+/** The metered arm, which only the metered rail can have. */
+export type MeteredRailReadings = Extract<RailReadings, { readonly latest: MeteredReading }>;
+
+/**
+ * A rail the dispatcher asks a vendor about: every rail but the metered one,
+ * which has no endpoint to ask and no cache entry to hold.
+ */
+export type VendorRail = Exclude<Rail, "deepseek">;
+
+/**
+ * Every rail's readings as the dispatcher already holds them, keyed by the rail
+ * itself so a reader needs no case for a missing rail and none for "is this one
+ * metered". The policy's `Map<Rail, RailReading>` cannot promise which arm a rail
+ * carries; this can, because its keys are the rails.
+ */
+export interface KnownReadings {
+  readonly claude: VendorRailReadings;
+  readonly codex: VendorRailReadings;
+  readonly deepseek: MeteredRailReadings;
+}
+
 /** A reading that came from asking: every rail but a metered one, and the only kind the cache holds. */
 type VendorReading = GoodReading | FailedReading;
 
@@ -362,10 +398,135 @@ interface CachedReadings {
  * and a failure omits `lastGood` rather than setting it to `undefined`, so a
  * strict deep comparison sees only the keys that exist.
  */
-function asReadings(entry: CachedReadings): RailReadings {
+function asReadings(entry: CachedReadings): VendorRailReadings {
   const { latest } = entry;
   if (latest.ok) return { latest, lastGood: latest };
   return entry.lastGood === undefined ? { latest } : { latest, lastGood: entry.lastGood };
+}
+
+/**
+ * One vendor rail projected onto the wire, or the reason there is nothing to
+ * send. Tagged rather than `undefined` for the absent case, so the refusal
+ * carries the failure note with the type proving a note exists: only a failed
+ * newest read with no last good reading behind it produces `no-reading`.
+ */
+type VendorRailProjection =
+  | { readonly kind: "reading"; readonly reading: GeneratorReadingInput }
+  | { readonly kind: "no-reading"; readonly note: string };
+
+/**
+ * An epoch instant as the wire document states it.
+ *
+ * Safe by construction: a `resetsAt` that reaches here passed
+ * `representableInstant`, and a `readAt` comes from the dispatcher's clock.
+ * A throw is still left to propagate rather than clamped into a plausible-
+ * looking instant — the `input` seam turns it into a failed run, which is the
+ * honest report for a reading this process cannot write out.
+ */
+function isoInstant(ms: number): string {
+  return new Date(ms).toISOString();
+}
+
+/**
+ * One report window in the wire's text form. `budget` and `resetsAt` are spread
+ * in only when the reading carries them, because an absent key and a key whose
+ * value is `null` are different documents: a generator testing for the key
+ * would read a judgment out of the second that the reading never made.
+ */
+function windowInput(w: RailWindow): GeneratorWindowInput {
+  return {
+    label: w.label,
+    used: w.used,
+    ...(w.budget === undefined ? {} : { budget: w.budget }),
+    ...(w.resetsAt === undefined ? {} : { resetsAt: isoInstant(w.resetsAt) }),
+  };
+}
+
+/** One reading in the wire's shape, apart from the failure that may qualify it. */
+function readingInput(sent: GoodReading): GeneratorReadingInput {
+  return {
+    ok: true,
+    readAt: isoInstant(sent.readAt),
+    windows: sent.windows.map(windowInput),
+    raw: sent.raw,
+    ...(sent.note === undefined ? {} : { note: sent.note }),
+  };
+}
+
+/**
+ * The document for one capped rail, or why there is none to send.
+ *
+ * A newest read that failed sends the last good reading marked `latestFailure`,
+ * rather than its own empty windows: the generator routes on the vendor's last
+ * word, and the marker is what keeps it from reading that word as current. The
+ * `note` is the sent reading's — a qualifier explaining `used: 100` (Codex's
+ * `limit_reached=true`) travels with the reading it qualifies, never with the
+ * failure that made an older one stand in.
+ */
+function projectVendorRail(readings: VendorRailReadings): VendorRailProjection {
+  const { latest } = readings;
+  if (latest.ok) return { kind: "reading", reading: readingInput(latest) };
+  const { lastGood } = readings;
+  if (lastGood === undefined) return { kind: "no-reading", note: latest.note };
+  return {
+    kind: "reading",
+    reading: {
+      ...readingInput(lastGood),
+      latestFailure: { at: isoInstant(latest.readAt), note: latest.note },
+    },
+  };
+}
+
+/**
+ * The generator's stdin document, or the refusal when a capped rail has never
+ * been read successfully.
+ *
+ * Pure: the readings are its only input, so the shape a generator sees is
+ * testable without a dispatcher, a clock or a subprocess. Facts only, and every
+ * rail key present — see `GeneratorInput` for the document and
+ * docs/adr/0015-configuration-generation.md for the contract and its reasons.
+ *
+ * The refusal is stated as facts too: one sentence per rail naming it and the
+ * note its latest read left, so the reason is the vendor's own account rather
+ * than this process's opinion about it. A rail that has never been read cannot
+ * be filled with a placeholder instead — a generator would route on a guess,
+ * which is the guess ADR 0006's hold exists to refuse.
+ */
+export function generatorInput(known: KnownReadings): GeneratorInputOutcome {
+  const claude = projectVendorRail(known.claude);
+  const codex = projectVendorRail(known.codex);
+  if (claude.kind === "no-reading" || codex.kind === "no-reading") {
+    return {
+      kind: "refused",
+      reason: [
+        "the generator was not run: a quota-capped rail has no successful reading yet.",
+        ...refusalLine("claude", claude),
+        ...refusalLine("codex", codex),
+        // Advice, not a fact about the readings, but the refusal is the only
+        // place the user learns the run was skipped before the vendor was
+        // asked — and an unforced read is exactly what would clear it. A
+        // credential that is missing rather than stale is not something a
+        // refresh can fix, which is why the sentence is conditional.
+        "Run /quota-dispatch refresh once the rail can be read, then generate again.",
+      ],
+    };
+  }
+  return {
+    kind: "ready",
+    input: {
+      version: GENERATOR_INPUT_VERSION,
+      rails: {
+        claude: claude.reading,
+        codex: codex.reading,
+        deepseek: { metered: true, windows: [], raw: null },
+      },
+    },
+  };
+}
+
+/** A rail's one line in a refusal, or nothing when it has a reading to send. */
+function refusalLine(rail: VendorRail, projection: VendorRailProjection): string[] {
+  return projection.kind === "no-reading" ? [`the ${rail} rail has no valid reading yet (${projection.note}).`] : [];
 }
 
 export type Outcome =
@@ -422,8 +583,8 @@ function num(v: unknown): number | undefined {
  * The largest instant a JavaScript `Date` can represent, in epoch milliseconds
  * (±100,000,000 days, `8.64e15`). Past it `new Date(ms)` is invalid and
  * `.toISOString()` throws, so a reading carrying one is not usable by the
- * serializer #60 builds — the same reason `instant` drops an unparseable Claude
- * reset.
+ * serializer `generatorInput` builds — the same reason `instant` drops an
+ * unparseable Claude reset.
  */
 const MAX_EPOCH_MS = 8.64e15;
 
@@ -2804,6 +2965,19 @@ export interface Dispatcher {
    * it does not touch the cache — not a synchronized sample of the rails.
    */
   allReadings(force?: boolean): Promise<Map<Rail, RailReadings>>;
+  /**
+   * Every rail's readings, whatever their age: a cached entry is returned
+   * without consulting its TTL, and only a rail with no entry at all is read,
+   * once, unforced. A rail whose newest read failed is returned as it stands —
+   * its `latest` failure beside the last good reading, when one was left behind
+   * — rather than retried. It does not de-duplicate against a read another
+   * caller already has in flight; sharing one fetch between processes is a
+   * separate change.
+   *
+   * The one seam a reader outside the policy uses for "what is already known",
+   * so #61 can re-back it with readings shared across processes.
+   */
+  knownReadings(): Promise<KnownReadings>;
   evaluate(opts?: { force?: boolean; dry?: boolean }): Promise<Array<{ decision: Decision; outcome: Outcome }>>;
   report(opts?: { force?: boolean }): Promise<string[]>;
 }
@@ -3066,8 +3240,7 @@ export function createDispatcher(
     };
   }
 
-  async function railReadings(rail: Rail, force = false): Promise<RailReadings> {
-    if (rail === "deepseek") return { latest: deepseekReading() };
+  async function vendorRailReadings(rail: VendorRail, force: boolean): Promise<VendorRailReadings> {
     const hit = cache.get(rail);
     if (!force && hit && now() - hit.at < cfg.ttlMs) return asReadings(hit);
 
@@ -3089,10 +3262,39 @@ export function createDispatcher(
     return asReadings(entry);
   }
 
+  async function railReadings(rail: Rail, force = false): Promise<RailReadings> {
+    // The metered rail has no endpoint to ask and no cache entry to hold: its
+    // reading is a fact about the account, so there is nothing that could go
+    // stale or fail.
+    if (rail === "deepseek") return { latest: deepseekReading() };
+    return vendorRailReadings(rail, force);
+  }
+
   async function allReadings(force = false): Promise<Map<Rail, RailReadings>> {
     const rails: Rail[] = ["claude", "codex", "deepseek"];
     const readings = await Promise.all(rails.map((r) => railReadings(r, force)));
     return new Map(readings.map((r) => [r.latest.rail, r]));
+  }
+
+  /**
+   * One capped rail for the generator input: a cached entry is returned whatever
+   * its age, and only the absence of an entry costs a read. Deliberately not
+   * `railReadings(rail)`, whose TTL is the policy's freshness rule for routing —
+   * a reader asking what is already known is not asking what is fresh.
+   */
+  async function knownVendorRailReadings(rail: VendorRail): Promise<VendorRailReadings> {
+    const hit = cache.get(rail);
+    return hit === undefined ? vendorRailReadings(rail, false) : asReadings(hit);
+  }
+
+  async function knownReadings(): Promise<KnownReadings> {
+    // Both rails in flight together: the two reads are independent, and a
+    // sequential pair would make generation wait out two vendor latencies.
+    const [claude, codex] = await Promise.all([
+      knownVendorRailReadings("claude"),
+      knownVendorRailReadings("codex"),
+    ]);
+    return { claude, codex, deepseek: { latest: deepseekReading() } };
   }
 
   async function decideAll(
@@ -3227,7 +3429,7 @@ export function createDispatcher(
     return lines;
   }
 
-  return { railReadings, allReadings, evaluate, report };
+  return { railReadings, allReadings, knownReadings, evaluate, report };
 }
 
 // ---------------------------------------------------------------- extension
@@ -3524,8 +3726,9 @@ export default function (pi: ExtensionAPI) {
    * This is why a boot needs the context, and why the timer reads the cached
    * `boot` rather than starting one of its own: a boot without a registry skips
    * the model check silently, which would pin agents to models this pi cannot
-   * spawn. `session_start` always precedes the first tick, so the cache is warm
-   * by then; a tick before any session is a no-op rather than a ctx-less boot.
+   * spawn. `session_start` precedes the first tick, and generation boots the same
+   * way, so the cache is warm by then; a tick with no cached boot at all is a
+   * no-op rather than a ctx-less boot.
    */
   let boot:
     | Promise<{ loaded: LoadedConfig; dispatcher: Dispatcher; misses: ModelMiss[] }>
@@ -3623,9 +3826,16 @@ export default function (pi: ExtensionAPI) {
    *
    * The subprocess, the strict check and the atomic publication all live in
    * `generateConfig`; what happens here is the part that only the extension can
-   * do — prepare a runtime, swap the two cached handles together, choose the
-   * cadence and evaluate the new policy once. A failure is reported and changes
-   * nothing: no cache, no cadence, no footer.
+   * do — gather the readings the command is fed, prepare a runtime, swap the two
+   * cached handles together, choose the cadence and evaluate the new policy once.
+   * A failure is reported and changes nothing: no cache, no cadence, no footer.
+   *
+   * The readings come from the runtime of the configuration active *before* the
+   * run — its credential paths — so this boots that runtime, where every other
+   * pass on this path would not have had to. It is the same cached boot a session
+   * start or a report uses, it writes nothing, and it is read lazily inside the
+   * `input` callback: a file that declares no generator, or declares one badly,
+   * still costs neither a boot nor a quota request.
    */
   async function runGenerate(scope: "global" | "project", ctx: ExtensionContext): Promise<void> {
     if (generating) {
@@ -3642,6 +3852,13 @@ export default function (pi: ExtensionAPI) {
       const result = await generateConfig({
         source: scope,
         path,
+        // The active configuration's own readings, not the generated one's: a
+        // generator is told what this install knows as it is being asked, and it
+        // is about to change what that is.
+        input: async () => {
+          const booted = await bootOnce(ctx);
+          return generatorInput(await booted.dispatcher.knownReadings());
+        },
         prepare: (loaded) => bootFrom(loaded, ctx),
         acquireFence,
       });
@@ -3720,9 +3937,10 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Generation runs the declared command and replaces one file; it builds
-      // its own runtime from the generated layer, so it does not boot the current
-      // one first. Answered before any boot for the same reason a typo is.
+      // Generation runs the declared command and replaces one file, so it is
+      // answered before the ordinary boot: it prepares its *own* runtime from the
+      // generated layer, and the current runtime is booted separately inside the
+      // run, only for the readings its command is fed.
       if (invocation.form === "generate") {
         await runGenerate(invocation.scope, ctx);
         return;
