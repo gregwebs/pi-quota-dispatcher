@@ -577,6 +577,7 @@ test("a committed change whose lock release failed is reported as a note, not as
   // The path the lock resolves to; the compare-and-swap re-read names it, and it
   // is the last hook before the rename.
   const resolvedTarget = await realpath(box.target);
+  let prepared = false;
   const result = await generateConfig({
     source: "global",
     path: box.target,
@@ -587,13 +588,18 @@ test("a committed change whose lock release failed is reported as a note, not as
     // directory, so the release's `readFile` fails after the rename has landed.
     readFile: async (path: string) => {
       const text = await readFile(path, "utf8");
-      if (path === resolvedTarget) {
+      // On Linux the initial path already equals its realpath; only inject
+      // after preparation, when this read is the locked compare-and-swap.
+      if (prepared && path === resolvedTarget) {
         await rm(lockPath, { force: true });
         await mkdir(lockPath, { recursive: true });
       }
       return text;
     },
-    prepare: async () => ({}),
+    prepare: async () => {
+      prepared = true;
+      return {};
+    },
   });
   try {
     assert.equal(result.kind, "generated");
