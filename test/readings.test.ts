@@ -65,6 +65,9 @@ async function fixture(t: TestContext) {
     bodies: { claude: bodyFor("claude"), codex: bodyFor("codex", 3, 4) } as Record<LiveRail, unknown>,
     failed: { claude: false, codex: false },
     calls: { claude: 0, codex: 0 },
+    // A hook the concurrency test installs; the stub awaits it before answering,
+    // so a test can hold both reads in flight at once. Undefined everywhere else.
+    beforeRespond: undefined as undefined | ((rail: LiveRail) => Promise<void>),
   };
   // A definite HTTP answer avoids retries or real-time backoff in cache tests.
   const fetchImpl = (async (url: string | URL) => {
@@ -72,6 +75,7 @@ async function fixture(t: TestContext) {
     const rail = u.includes("anthropic.com") ? "claude" : u.includes("chatgpt.com") ? "codex" : undefined;
     assert.ok(rail, `unexpected network request: ${u}`);
     probe.calls[rail]++;
+    if (probe.beforeRespond) await probe.beforeRespond(rail);
     return { ok: !probe.failed[rail], status: probe.failed[rail] ? 429 : 200, json: async () => probe.bodies[rail] };
   }) as unknown as typeof fetch;
   const dispatcher = createDispatcher({
@@ -373,4 +377,126 @@ test("report uses latest rail lines and never exposes raw account details or abs
   assert.ok(lines.includes(`claude: unavailable — ${failed.latest.note}`));
   assert.ok(!lines.some((line) => line.startsWith("claude: 5h")), "lastGood must not masquerade as the latest rail line");
   assertPrivate(lines);
+});
+
+// ---------------------------------------------------------------- knownReadings
+
+test("knownReadings reads both capped rails in flight together, not one after the other", async (t) => {
+  const { dispatcher, probe } = await fixture(t);
+  // A barrier both reads must reach before either answers. Started together, the
+  // second arrival releases the pair. A sequential implementation never starts
+  // the second read while the first waits, so the first is released only by the
+  // safety timer and `peakInFlight` stays 1. The assertion is on `peakInFlight`,
+  // not on the clock: the timer only bounds how long a regression takes to fail.
+  let inFlight = 0;
+  let peakInFlight = 0;
+  let release!: () => void;
+  const bothArrived = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  probe.beforeRespond = async () => {
+    inFlight++;
+    peakInFlight = Math.max(peakInFlight, inFlight);
+    if (inFlight >= 2) release();
+    const safety = setTimeout(release, 2_000);
+    try {
+      await bothArrived;
+    } finally {
+      clearTimeout(safety);
+      inFlight--;
+    }
+  };
+
+  const known = await dispatcher.knownReadings();
+  assert.equal(peakInFlight, 2, "the two capped reads must overlap; a sequential pair waits out both vendor latencies");
+  assert.deepEqual(probe.calls, { claude: 1, codex: 1 });
+  assert.equal(good(known.claude.latest).readAt, NOW);
+  assert.equal(good(known.codex.latest).readAt, NOW);
+});
+
+test("knownReadings returns an entry older than ttlMs as it is, without a fetch", async (t) => {
+  const { dispatcher, probe } = await fixture(t);
+  const claude = await dispatcher.railReadings("claude");
+  const codex = await dispatcher.railReadings("codex");
+  assert.deepEqual(probe.calls, { claude: 1, codex: 1 });
+  // Far past the TTL: `railReadings` would re-read both now. What is already
+  // known is what the generator is fed, whatever its age.
+  probe.clock += TTL * 100;
+  probe.bodies.claude = bodyFor("claude", 1, 1);
+  const known = await dispatcher.knownReadings();
+  assert.deepEqual(probe.calls, { claude: 1, codex: 1 }, "an aged entry must not be re-read");
+  assert.deepEqual(known.claude, claude);
+  assert.deepEqual(known.codex, codex);
+  assert.equal(good(known.claude.latest).readAt, NOW, "the reading sent is the old one, with its own time");
+});
+
+test("knownReadings reads a never-read rail once, unforced, and caches what it read", async (t) => {
+  const { dispatcher, probe } = await fixture(t);
+  const first = await dispatcher.knownReadings();
+  assert.deepEqual(probe.calls, { claude: 1, codex: 1 });
+  assert.deepEqual(good(first.claude.latest).windows.map((w) => w.used), [93, 21]);
+  assert.deepEqual(good(first.codex.latest).windows.map((w) => w.used), [3, 4]);
+
+  const second = await dispatcher.knownReadings();
+  assert.deepEqual(probe.calls, { claude: 1, codex: 1 }, "a second call must read nothing");
+  assert.deepEqual(second, first);
+
+  // The read went through the cache, so the policy's own path within the TTL
+  // sees it too rather than asking again.
+  probe.clock += TTL - 1;
+  assert.deepEqual((await dispatcher.railReadings("claude")).latest, first.claude.latest);
+  assert.deepEqual(probe.calls, { claude: 1, codex: 1 }, "the snapshot's read must have been cached");
+});
+
+test("knownReadings reads only the rail with no entry and leaves the cached one alone", async (t) => {
+  const { dispatcher, probe } = await fixture(t);
+  await dispatcher.railReadings("claude");
+  probe.clock += TTL * 100;
+  const known = await dispatcher.knownReadings();
+  assert.deepEqual(probe.calls, { claude: 1, codex: 1 });
+  assert.equal(good(known.claude.latest).readAt, NOW);
+  assert.equal(good(known.codex.latest).readAt, NOW + TTL * 100);
+});
+
+test("knownReadings returns a failure beside the last good reading it left behind", async (t) => {
+  const { dispatcher, probe } = await fixture(t);
+  const earlier = good((await dispatcher.railReadings("codex", true)).latest);
+  probe.failed.codex = true;
+  probe.clock += 500;
+  const failure = (await dispatcher.railReadings("codex", true)).latest;
+  assert.equal(failure.ok, false);
+  await dispatcher.railReadings("claude");
+  probe.clock += TTL * 100;
+
+  const known = await dispatcher.knownReadings();
+  assert.deepEqual(known.codex, { latest: failure, lastGood: earlier });
+  assert.deepEqual(probe.calls, { claude: 1, codex: 2 }, "a cached failure is not retried");
+});
+
+test("knownReadings returns a cached failure with no last good as it is, with no hidden retry", async (t) => {
+  const { dispatcher, probe } = await fixture(t);
+  probe.failed.claude = true;
+  await dispatcher.railReadings("claude");
+  // The vendor would answer now; the snapshot must still not ask. A failure is
+  // an entry, and "no forced read" means only a rail with *no* entry is read —
+  // the refusal this leads to points the user at `refresh`.
+  probe.failed.claude = false;
+  probe.clock += TTL * 100;
+  const known = await dispatcher.knownReadings();
+  assert.equal(probe.calls.claude, 1, "a cached failure must not be re-read");
+  assert.equal(known.claude.latest.ok, false);
+  assert.equal(known.claude.latest.readAt, NOW);
+  assert.ok(!("lastGood" in known.claude), "a never-successful rail has no last good reading");
+});
+
+test("knownReadings gives deepseek the metered arm and never fetches it", async (t) => {
+  const { dispatcher, probe } = await fixture(t);
+  const known = await dispatcher.knownReadings();
+  assert.deepEqual(known.deepseek, await dispatcher.railReadings("deepseek"));
+  assert.equal(known.deepseek.latest.metered, true);
+  assert.ok(!("lastGood" in known.deepseek));
+  assert.deepEqual(Object.keys(known).sort(), ["claude", "codex", "deepseek"]);
+  // The fetch stub rejects any URL but the two vendors', so a deepseek request
+  // would already have failed; the count pins that each vendor was asked once.
+  assert.deepEqual(probe.calls, { claude: 1, codex: 1 });
 });

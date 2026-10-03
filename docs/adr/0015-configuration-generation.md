@@ -39,8 +39,10 @@ the only safe trigger is the user typing its name.
 A run is **bounded**, not sandboxed. The command runs in its own process group
 (POSIX) with stdout capped at 1 MiB and stderr kept as a 16 KiB tail; on timeout
 or overflow the group is killed and the run fails, without waiting on a pipe a
-descendant holds open. stdin is the null device, so a command that reads it sees
-EOF rather than blocking. What that does *not* promise is containment: a
+descendant holds open. stdin is a pipe carrying the rail readings document
+(below), closed once it has been written, so a command that reads it gets the
+document and one that never reads it has its writes fail without that being the
+run's verdict. What that does *not* promise is containment: a
 descendant that deliberately detaches survives, and side effects the command
 performs are the command's own. There is no rollback of a generator's work, only
 of this extension's.
@@ -77,10 +79,11 @@ with no file — stay warnings, because they are not things a generator got wron
 
 ## Publication and activation
 
-The order is: read the target, run the command outside any lock, validate the
-exact bytes to be written, build the runtime the new configuration implies, take
-the same-extension write fence, then take the file lock, compare the bytes the
-run started from, and rename the new file into place.
+The order is: read the target, validate the declaration, gather the rail
+readings, run the command outside any lock with those readings on its stdin,
+validate the exact bytes to be written, build the runtime the new configuration
+implies, take the same-extension write fence, then take the file lock, compare
+the bytes the run started from, and rename the new file into place.
 
 Every step before the rename is failure-preserving. A nonzero exit, a timeout,
 unparseable output, an invalid entry, a configuration that cannot be built into
@@ -110,6 +113,94 @@ next one catches up) and `apply` is refused (the user can try again). The fence
 is not a scheduler and does not arbitrate between processes (see
 [0013](0013-agent-file-writes-are-coordinated.md)).
 
+## The generator's input
+
+Every run writes one JSON document to the command's stdin and closes the pipe. It
+reports what the **active** configuration's dispatcher already knows: the
+readings are the ones its two credential paths produced, since those are the
+paths in force before the run, and a generator is being asked what to change
+*because of* what they say. The shape is versioned (`version: 1`) and every rail
+key is always present. A capped rail is never sent empty, though: one with no
+usable reading refuses the run, so `rails.codex` being present is a promise the
+generator can rely on rather than a key it has to test.
+
+It is the cheapest honest input, not a fresh one. A reading the dispatcher
+already holds is sent **whatever its age** — generation is explicit, so the
+numbers describe the moment the user asked rather than the moment a vendor
+answered — and there is no forced read and no `generate refresh` form. Only a
+rail with no reading at all is read, once and unforced, before the command
+starts. Because the readings live in the dispatcher's memory, whatever replaces
+that dispatcher also empties the cache: a `/reload`, or a generation, whose
+publication swaps in a freshly built dispatcher. A generated table that manages
+agents warms that fresh dispatcher with its activation evaluation, so the next
+generate usually costs nothing. An empty table has no activation to warm it, so
+its fresh dispatcher starts empty and **every** generate on an unconfigured
+install reads both capped rails — the one case where a generate reads without
+anything else having asked for them.
+
+When the newest read of a rail failed, its **last good reading** is sent with a
+`latestFailure` marker beside it, naming the newer failure and when it happened.
+That is the one place a failed read does not simply hold: nothing is routed on
+the reading here, and refusing every run whose cache held a failure would take
+generation away on a transient 500. The alternative — sending the failure, with
+its empty windows — was rejected because it tells a generator less than the
+input already holds.
+
+If `claude` or `codex` has **no successful reading** in what the dispatcher
+holds, the generator is not run: the failure names the rail and why, and the file
+and the active configuration are left as they were, like any other generation
+failure. Without a single reading the command could not make the choice it exists
+to make, and a placeholder is the guess [0006](0006-bounded-quota-reads.md)
+refuses to route on. The refusal covers only a failure with no earlier success: a
+failure that left a last good reading behind is sent as that reading instead, so
+an install whose vendor is flaky can still generate.
+
+A cached failure is deliberately **not** retried, even though it may be one
+transient error standing between the user and a working generate. "A rail with no
+entry at all is read once" makes a recorded failure an entry, and re-reading it
+is the forced read this design does not have. The refusal is not silent about it:
+it names the rail, quotes the failure, and points at `/quota-dispatch refresh`,
+which is a forced read the user asked for. A configured install also recovers on
+its own, because the poll re-reads the rail once its `ttlMs` has lapsed, within
+about a polling interval; an unconfigured one has no poll, so `refresh` is the
+way out. The known consequence is that an install with only one of the two
+quota-capped rails cannot generate.
+
+The document is **facts only**; what each field means is the README's
+["What the generator reads on stdin"](../../README.md#what-the-generator-reads-on-stdin)
+section, which is the canonical contract. It carries the vendor's response body
+beside the windows parsed from it (`raw`), because normalization drops what a
+generator may need — a window no parser classifies, a limit flag, an account
+figure. That body may carry account details, so it is for the generator and not
+for a log. What the ADR fixes is why the document carries no verdict: it does not
+say a budget is **tight**, because that judgment belongs to the policy, and the
+policy is one of the things a generator's output may change — so a generator
+receives the numbers and owns its own thresholds.
+
+`generator.timeoutMs` covers the subprocess alone, starting when it is spawned.
+Gathering the readings happens before the spawn and is bounded by the quota
+read's own limits (ADR 0006), so a slow vendor cannot consume the command's time
+— which is why the readings reach the runner as text rather than as a promise it
+would have to wait on.
+
+Reading stdin is optional: a command that ignores it, or exits before reading it,
+is not a failure. Success stays the process's exit status. A stdin write error
+that means the reader is gone — the contract's own case — is not the run's
+verdict either; one that means anything else is a write this run could not make,
+so it fails the run like any other failed write.
+
+The readings live in the dispatcher's memory, and the generator path reads them
+through one dispatcher method, `knownReadings()`. That method is the seam a later
+change re-backs when readings are shared across pi processes — and the reason
+nothing else in the generator path reads the cache directly. It is deliberately
+**age-blind**: a cached entry is returned whatever its TTL, unlike
+`railReadings`/`allReadings`, whose TTL is the policy's freshness rule for
+routing. #61 must preserve that, because the caller is asking what is already
+known, not what is fresh: a shared store still answers per rail and credential,
+and must not start applying a freshness rule the policy owns. The per-rail
+projection is a pure function of the readings, so the contract is testable
+without a dispatcher, a clock or a subprocess.
+
 ## Considered options
 
 A `generator` that produced the *whole* config was rejected: it would make the
@@ -127,6 +218,23 @@ Reusing pi's own `exec` helper was rejected: its capture is unbounded, its exit
 status is ambiguous when a signal killed the child, and its timeout leaves the
 process alive. A small local runner is the bounded thing the contract needs, and
 it is not a sandbox either way.
+
+Feeding the generator only on request, or not at all unless the generator
+advertises that it wants the document, was rejected: the two explicit forms are
+the whole opt-in, a flag inside the config would be a second one, and a generator
+that had to be told it may read stdin could not be written portably.
+
+Forcing a fresh read before every generation was rejected: it would make an
+explicit form pay a vendor round trip whether or not the user wanted fresh
+numbers, and it would tie generation's latency to vendor health beyond the
+refusal rule. Sending an empty or unknown reading in place of a never-read rail
+was rejected for the reason the refusal exists — a generator would be choosing on
+a guess.
+
+Handing a generator the **failure** when the newest read failed, instead of the
+last good reading, was rejected: the input already holds real numbers and when
+they were taken, and a generator that is told both is strictly better served than
+one told the read failed.
 
 Templates, a `swap` policy, or per-agent "primary preference" keys were
 considered and rejected: they would grow the routing vocabulary to serve one
