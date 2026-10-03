@@ -11,7 +11,7 @@ import {
   type DispatcherConfig,
   type ModelLookup,
   type Rail,
-  type RailState,
+  type RailReading,
   type RailWindow,
   DEFAULT_CONFIG,
   checkModels,
@@ -57,14 +57,14 @@ function unknownLine(path: string, model: string): string {
 }
 
 /** One rail's readings, as a policy test describes them. */
-function railState(rail: Rail, r: { session?: number; weekly?: number } = {}): RailState {
+function railState(rail: Rail, r: { session?: number; weekly?: number } = {}): RailReading {
   const windows: RailWindow[] = [];
   if (r.session !== undefined) windows.push({ label: "5h", used: r.session, budget: "session" });
   if (r.weekly !== undefined) windows.push({ label: "7d", used: r.weekly, budget: "weekly" });
-  return { rail, ok: true, windows };
+  return { rail, ok: true, windows, readAt: 0, raw: {} };
 }
 
-function railMap(...states: RailState[]): Map<Rail, RailState> {
+function railMap(...states: RailReading[]): Map<Rail, RailReading> {
   return new Map(states.map((s) => [s.rail, s]));
 }
 
@@ -707,7 +707,7 @@ test("a model-id miss is dropped while an unreadable rail holds — the asymmetr
     ["openai-codex/gpt-sol-6", "deepseek/deepseek-flash"],
     "a known model is not dropped",
   );
-  const unreadableCodex: RailState = { rail: "codex", ok: false, windows: [], note: "HTTP 500" };
+  const unreadableCodex: RailReading = { rail: "codex", ok: false, windows: [], readAt: 0, note: "HTTP 500" };
   const b = decide(
     definitionOf("planner", checkedB.config),
     checkedB.config.agents.planner,

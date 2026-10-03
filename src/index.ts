@@ -184,38 +184,188 @@ export type { AgentFileSelection, SessionSelection, SkillBindingDeps } from "./s
 export type Budget = "session" | "weekly";
 
 export interface RailWindow {
-  label: string;
-  used: number;
+  readonly label: string;
+  /**
+   * How much of the window is used, in percent. This is the figure the policy
+   * weighs and the report prints, which on one path is not a transcription of
+   * the vendor's document: Codex's `limit_reached` path reports every window
+   * full (`100`) even where the response's own percentages say less (see
+   * `GoodReading.raw`). The windows and the raw body therefore come from the
+   * same response, but `used` is the policy-effective number rather than an
+   * arithmetic shadow of `raw`.
+   */
+  readonly used: number;
   /**
    * Set when this window belongs to a budget the policy weighs. Windows left
    * unclassified are display-only: model-specific sub-caps and vendor windows
    * we do not recognise.
    */
-  budget?: Budget;
-  /** Seconds until this window resets, when the endpoint reports it. */
-  resetsInSeconds?: number;
+  readonly budget?: Budget;
+  /**
+   * When this window resets, in epoch milliseconds on the clock
+   * `DispatcherDeps.now` reads, when the vendor reports it.
+   *
+   * Absolute rather than "seconds from now" because a reading is consulted after
+   * it was taken — by a later report, by whoever reads the cache — and a relative
+   * figure is wrong by however long it sat. Codex states its reset relative to
+   * the response, so it is converted against the reading's `readAt`; Claude's is
+   * already absolute.
+   *
+   * Milliseconds rather than ISO text: every other time here is on that clock,
+   * so freshness is a subtraction, and Claude's own text beside a converted
+   * Codex instant would be two dialects of one field. Text is a choice for
+   * whoever writes a reading out.
+   */
+  readonly resetsAt?: number;
 }
 
-export interface RailState {
-  rail: Rail;
-  ok: boolean;
+/**
+ * A read the vendor answered with windows we could classify.
+ *
+ * `raw` is the document those windows were parsed from — the same response, not
+ * a second request. It is kept whole and uninterpreted: it is for readers that
+ * want what normalization leaves out, never for the policy, and never printed in
+ * a report or a note, since a vendor's account document is not ours to echo.
+ */
+export interface GoodReading {
+  readonly rail: Rail;
+  readonly ok: true;
+  /** Declared only so `reading.metered` narrows a `RailReading`: a rail that was read is not metered. */
+  readonly metered?: undefined;
   /** Every window the endpoint reported, for display. Only some carry a budget. */
-  windows: RailWindow[];
+  readonly windows: readonly RailWindow[];
   /**
-   * Billed per token rather than quota-capped, so there is no budget to read:
-   * `budgetUsed` reports 0 on both and the rail can never block a switch.
-   * Distinct from reporting no windows, which for a capped rail is a partial
-   * reading the policy must not guess at.
+   * When the read ended, on the `DispatcherDeps.now` clock. Codex's relative
+   * resets are converted against it; it is not the cache's TTL origin, which is
+   * stamped when the finished reading is stored.
    */
-  metered?: boolean;
+  readonly readAt: number;
   /**
-   * Free text: why a failed read failed, or a display-only qualifier such as
-   * `limit_reached=true`. A failed read that was given up on says how many
+   * The vendor's response body as it arrived — the document `windows` was parsed
+   * from, never a second request. It is what normalization leaves out. It does
+   * not promise that `windows[].used` can be recomputed from it: the Codex
+   * limiter reports `used: 100` over the vendor's own percentages (see
+   * `RailWindow.used`).
+   */
+  readonly raw: unknown;
+  /**
+   * A display-only qualifier — Codex's `limit_reached=true`, or the sticky
+   * refresh anomaly — that the report must still show on a healthy rail.
+   */
+  readonly note?: string;
+}
+
+/**
+ * A read that left the rail without a usable reading: the endpoint refused or
+ * never answered, answered with nothing we could classify, or there was no
+ * credential to ask with. It reports no windows and no `raw` — not the last ones
+ * seen — because a failure states only why it failed; what was last known is
+ * the last good reading's job.
+ */
+export interface FailedReading {
+  readonly rail: Rail;
+  readonly ok: false;
+  /** Declared only so `reading.metered` narrows a `RailReading`. */
+  readonly metered?: undefined;
+  readonly windows: readonly [];
+  /** When the read gave up, on the `DispatcherDeps.now` clock. */
+  readonly readAt: number;
+  /**
+   * Why the read failed. A failed read that was given up on says how many
    * attempts it cost (`HTTP 500 after 2 attempts`); a failure another request
    * would not have fixed is reported as that failure alone — see
    * `afterAttempts`.
    */
-  note?: string;
+  readonly note: string;
+}
+
+/**
+ * A rail billed per token rather than quota-capped, so there is no budget to
+ * read: `budgetUsed` reports 0 on both and the rail can never block a switch.
+ * Distinct from reporting no windows, which for a capped rail is a partial
+ * reading the policy must not guess at.
+ *
+ * It is never read, so it has no `readAt` and no `raw`: there is no instant it
+ * was taken at and no response it came from.
+ */
+export interface MeteredReading {
+  /** The one metered rail: `deepseekReading` is this reading's only producer. */
+  readonly rail: "deepseek";
+  readonly ok: true;
+  readonly metered: true;
+  readonly windows: readonly [];
+  readonly note?: string;
+}
+
+/**
+ * What one quota read reports for one rail — the policy's only evidence. It
+ * states facts; whether a budget is tight is the judgment `decide` makes about
+ * it, not part of it.
+ */
+export type RailReading = GoodReading | FailedReading | MeteredReading;
+
+/**
+ * A rail's latest reading beside its last good one.
+ *
+ * They answer different questions, so neither stands in for the other. `latest`
+ * is what the policy decides on: a failed latest read holds whatever an earlier
+ * read said, because routing on numbers the latest read could not confirm is the
+ * guess the hold exists to refuse (ADR 0006). `lastGood` is the vendor's last
+ * word together with when it was said, for readers outside the policy, and it is
+ * never routed on.
+ *
+ * The union proves the outcome correlation. A vendor success is paired with its
+ * own last good reading — required, never `undefined`, and the *same object* — so
+ * a consumer knows a success is also the last word; a failure may carry the good
+ * reading left behind; a metered rail carries neither. It does not prove that
+ * `latest` and `lastGood` are about the same rail: the variants do not name their
+ * rails, though rail literals or a mapped type could correlate them if they did.
+ * Nor does it prove a `lastGood` was really recorded before `latest` — object
+ * identity and history are the writer's job. Two writers build this shape:
+ * `asReadings` projects the cached vendor rails, and the `deepseek` arm of
+ * `railReadings` builds the metered reading directly.
+ *
+ * The metered arm's `lastGood?: never` is deliberate. Without it, structural
+ * typing lets the other arms' `lastGood` property through to a metered entry,
+ * because a union's excess-property check accepts a key any arm declares.
+ */
+export type RailReadings =
+  | { readonly latest: MeteredReading; readonly lastGood?: never }
+  | { readonly latest: FailedReading; readonly lastGood?: GoodReading }
+  | { readonly latest: GoodReading; readonly lastGood: GoodReading };
+
+/** A reading that came from asking: every rail but a metered one, and the only kind the cache holds. */
+type VendorReading = GoodReading | FailedReading;
+
+/**
+ * One cached rail: the reading that was stored, and when storing it made it the
+ * newest.
+ *
+ * There are two times because they mean different things. `latest.readAt` is a
+ * fact about the response — when the vendor answered, which relative resets are
+ * converted against; the TTL must not start before the finished reading is
+ * stored, so it counts from `at`, stamped at the one `cache.set` call after
+ * parsing. Counting from `readAt` would let parse and continuation time consume
+ * the TTL.
+ */
+interface CachedReadings {
+  at: number;
+  latest: VendorReading;
+  lastGood?: GoodReading;
+}
+
+/**
+ * One cache entry as the seam's shape. The cache's only projection into
+ * `RailReadings` (`railReadings`' `deepseek` arm builds the metered entry
+ * itself), so the union's invariants hold by construction rather than by each
+ * caller's care: a success is paired with itself as its own last good reading,
+ * and a failure omits `lastGood` rather than setting it to `undefined`, so a
+ * strict deep comparison sees only the keys that exist.
+ */
+function asReadings(entry: CachedReadings): RailReadings {
+  const { latest } = entry;
+  if (latest.ok) return { latest, lastGood: latest };
+  return entry.lastGood === undefined ? { latest } : { latest, lastGood: entry.lastGood };
 }
 
 export type Outcome =
@@ -269,11 +419,44 @@ function num(v: unknown): number | undefined {
 }
 
 /**
+ * The largest instant a JavaScript `Date` can represent, in epoch milliseconds
+ * (±100,000,000 days, `8.64e15`). Past it `new Date(ms)` is invalid and
+ * `.toISOString()` throws, so a reading carrying one is not usable by the
+ * serializer #60 builds — the same reason `instant` drops an unparseable Claude
+ * reset.
+ */
+const MAX_EPOCH_MS = 8.64e15;
+
+/**
+ * Whether `ms` is an instant a `Date` can hold: finite and inside
+ * `MAX_EPOCH_MS`. A derived reset that fails this is dropped like a malformed
+ * absolute one, rather than reaching a reader as `Infinity` or an out-of-range
+ * number.
+ */
+function representableInstant(ms: number): boolean {
+  return Number.isFinite(ms) && Math.abs(ms) <= MAX_EPOCH_MS;
+}
+
+/**
+ * An absolute time a vendor wrote as text, in epoch milliseconds — `undefined`
+ * when it is absent or not a time at all, so a malformed value is dropped like a
+ * missing one rather than reaching a reader as `NaN`.
+ */
+function instant(v: unknown): number | undefined {
+  if (typeof v !== "string") return undefined;
+  const ms = Date.parse(v);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+/**
  * Claude reports an account-wide session cap (`five_hour`) alongside weekly
  * caps: one account-wide plus per-model ones. Every weekly figure is classified
  * as the same budget, so the worst of them is what the weekly guard sees — a
  * Sonnet cap at 95% does block you, even when the account-wide week is
  * comfortable.
+ *
+ * Claude states each window's reset as absolute text (`resets_at`), taken as an
+ * instant so a reading consulted later still says when the window clears.
  */
 export function parseClaudeUsage(data: any): RailWindow[] {
   const keys: Array<[string, string, Budget | undefined]> = [
@@ -286,7 +469,15 @@ export function parseClaudeUsage(data: any): RailWindow[] {
   const windows: RailWindow[] = [];
   for (const [key, label, budget] of keys) {
     const used = num(data?.[key]?.utilization);
-    if (used !== undefined) windows.push(budget ? { label, used, budget } : { label, used });
+    if (used !== undefined) {
+      const resetsAt = instant(data?.[key]?.resets_at);
+      windows.push({
+        label,
+        used,
+        ...(budget ? { budget } : {}),
+        ...(resetsAt !== undefined ? { resetsAt } : {}),
+      });
+    }
   }
   return windows;
 }
@@ -306,8 +497,14 @@ function durationLabel(seconds: number | undefined, fallback: string): string {
  * Codex reports a short "primary" window and a long "secondary" one. The
  * positions are the vendor's stable meaning; the labels come from the advertised
  * window length, and `reset_after_seconds` tells us when each recovers.
+ *
+ * `reset_after_seconds` is relative to the response, so it is converted against
+ * `readAt`, the instant the read ended.
  */
-export function parseCodexUsage(data: any): {
+export function parseCodexUsage(
+  data: any,
+  { readAt }: { readAt: number },
+): {
   windows: RailWindow[];
   limited: boolean;
 } {
@@ -317,12 +514,13 @@ export function parseCodexUsage(data: any): {
     const w = rl?.[key];
     const used = num(w?.used_percent);
     if (used === undefined) return;
-    const resetsInSeconds = num(w?.reset_after_seconds);
+    const after = num(w?.reset_after_seconds);
+    const resetsAt = after === undefined ? undefined : readAt + after * 1000;
     windows.push({
       label: durationLabel(num(w?.limit_window_seconds), fallback),
       used,
       budget,
-      ...(resetsInSeconds !== undefined ? { resetsInSeconds } : {}),
+      ...(resetsAt !== undefined && representableInstant(resetsAt) ? { resetsAt } : {}),
     });
   };
   push("primary_window", "session", "5h");
@@ -428,9 +626,9 @@ function pctExact(n: number): string {
  * A metered rail is billed per token rather than capped, so it has no budget to
  * report and honestly reads 0 on both.
  */
-export function budgetUsed(state: RailState, budget: Budget): number | undefined {
-  if (state.metered) return 0;
-  const used = state.windows.filter((w) => w.budget === budget).map((w) => w.used);
+export function budgetUsed(reading: RailReading, budget: Budget): number | undefined {
+  if (reading.metered) return 0;
+  const used = reading.windows.filter((w) => w.budget === budget).map((w) => w.used);
   return used.length ? Math.max(...used) : undefined;
 }
 
@@ -441,16 +639,16 @@ export function budgetUsed(state: RailState, budget: Budget): number | undefined
  * before this is consulted, so anything returned here is a partial reading. The
  * policy holds rather than guessing: an unreported budget is not an idle one.
  */
-function absentBudgets(state: RailState): Budget[] {
-  return BUDGET_ORDER.filter((b) => budgetUsed(state, b) === undefined);
+function absentBudgets(reading: RailReading): Budget[] {
+  return BUDGET_ORDER.filter((b) => budgetUsed(reading, b) === undefined);
 }
 
 /** Both budgets, for the decision's `why`. */
-function budgetSummary(state: RailState): string {
-  if (state.metered) return state.note ?? "metered";
-  if (!state.windows.length) return state.note ?? "no windows";
+function budgetSummary(reading: RailReading): string {
+  if (reading.metered) return reading.note ?? "metered";
+  if (!reading.windows.length) return reading.note ?? "no windows";
   return BUDGET_ORDER.map((b) => {
-    const used = budgetUsed(state, b);
+    const used = budgetUsed(reading, b);
     return `${b} ${used === undefined ? "unreported" : pct(used)}`;
   }).join(", ");
 }
@@ -531,7 +729,7 @@ function isInside(dir: string, file: string): boolean {
 export function decide(
   definition: AgentDefinition,
   route: AgentRoute,
-  rails: Map<Rail, RailState>,
+  rails: Map<Rail, RailReading>,
   cfg: DispatcherConfig,
   droppedAlternates: readonly DroppedAlternate[] = [],
 ): Decision {
@@ -1690,10 +1888,6 @@ export function describeDecisionLines(decision: Decision, outcome: Outcome): str
 
 // ---------------------------------------------------------------- rails
 
-function unavailable(rail: Rail, note: string): RailState {
-  return { rail, ok: false, windows: [], note };
-}
-
 /**
  * How long one quota read may stall, and how many times it is asked again
  * before the rail reads as unreadable.
@@ -1791,8 +1985,16 @@ function afterAttempts(note: string, attempts: number): string {
  * policy can rest there without evidence to the contrary. `budgetUsed` reads
  * that as 0.
  */
-function deepseekState(): RailState {
+function deepseekReading(): MeteredReading {
   return { rail: "deepseek", ok: true, windows: [], metered: true, note: "metered" };
+}
+
+/**
+ * The policy's view of the readings: each rail's latest and nothing else. A
+ * last good reading never reaches `decide` — see `RailReadings`.
+ */
+function latestReadings(readings: ReadonlyMap<Rail, RailReadings>): Map<Rail, RailReading> {
+  return new Map([...readings].map(([rail, r]) => [rail, r.latest]));
 }
 
 // ---------------------------------------------------------------- credentials
@@ -2580,8 +2782,28 @@ export interface DispatcherDeps {
 }
 
 export interface Dispatcher {
-  railState(rail: Rail, force?: boolean): Promise<RailState>;
-  allRails(force?: boolean): Promise<Map<Rail, RailState>>;
+  /**
+   * One rail's readings, read again only when its latest is older than `ttlMs`
+   * or `force` is set.
+   *
+   * This and `allReadings` are the one way out of the reading cache, so a reader
+   * outside the policy depends on this shape and not on what backs it.
+   */
+  railReadings(rail: Rail, force?: boolean): Promise<RailReadings>;
+  /**
+   * Every rail's readings, one entry per rail. Worth a second method over
+   * `railReadings` because the policy and the report need the whole picture at
+   * once. Each rail receives the same `force` flag, but each applies its own
+   * TTL, so a pass deliberately mixes a still-warm cached rail with a lapsed one
+   * that was just read.
+   *
+   * A caller can rely on exactly one entry per rail, and on each entry being the
+   * same shape `railReadings` gives: `deepseek` is the metered variant, the
+   * others carry their latest reading and, when a failure left one behind, the
+   * last good reading. The returned `Map` is a snapshot — adding to or clearing
+   * it does not touch the cache — not a synchronized sample of the rails.
+   */
+  allReadings(force?: boolean): Promise<Map<Rail, RailReadings>>;
   evaluate(opts?: { force?: boolean; dry?: boolean }): Promise<Array<{ decision: Decision; outcome: Outcome }>>;
   report(opts?: { force?: boolean }): Promise<string[]>;
 }
@@ -2606,7 +2828,16 @@ export function createDispatcher(
   // module owns their defaults, and merging them here as well would be a second
   // copy of that rule to keep in step.
   const fileWrite: Coordination = { pacing: deps.fileWrite, now };
-  const cache = new Map<Rail, { at: number; state: RailState }>();
+  const cache = new Map<Rail, CachedReadings>();
+  /**
+   * A failed read, stamped with the dispatcher's own clock at the moment it
+   * gave up. That is `readAt` — when the read gave up — not the TTL origin: the
+   * TTL counts from the cache entry's `at`, stamped at insertion after this
+   * returns.
+   */
+  function unavailable(rail: Rail, note: string): FailedReading {
+    return { rail, ok: false, windows: [], readAt: now(), note };
+  }
   // A `claudeCredsPath` naming anything but the default file belongs to another
   // profile, whose credential the login keychain never holds — so the fallback
   // is not offered to it.
@@ -2617,7 +2848,7 @@ export function createDispatcher(
   // skips a ping and the plan that would run one cannot disagree about why.
   const plan = refreshPlan(cfg, deps.refreshClaude);
 
-  // One ping in flight at a time, however many callers race `railState`.
+  // One ping in flight at a time, however many callers race `railReadings`.
   let inFlight: Promise<ClaudePing> | undefined;
   // The gates over the next attempt. `cooldown` is a time gate armed by a
   // `failed` attempt only. `halted` is armed by anything that could have spent
@@ -2686,7 +2917,7 @@ export function createDispatcher(
   }
 
   /** The Claude rail's ordinary read, once a token has been supplied. */
-  async function claudeUsage(token: string): Promise<RailState> {
+  async function claudeUsage(token: string): Promise<VendorReading> {
     const read = await readUsage("https://api.anthropic.com/api/oauth/usage", {
       headers: {
         Authorization: `Bearer ${token}`,
@@ -2696,9 +2927,10 @@ export function createDispatcher(
     });
     if ("note" in read) return unavailable("claude", read.note);
 
+    const readAt = now();
     const windows = parseClaudeUsage(read.json);
     if (!windows.length) return unavailable("claude", "no usage windows returned");
-    return { rail: "claude", ok: true, windows };
+    return { rail: "claude", ok: true, windows, readAt, raw: read.json };
   }
 
   /**
@@ -2787,15 +3019,15 @@ export function createDispatcher(
     return { note: expiredNote(reread.error, decision) };
   }
 
-  async function fetchClaude(): Promise<RailState> {
+  async function fetchClaude(): Promise<VendorReading> {
     const outcome = await claudeToken();
     if (!("token" in outcome)) return unavailable("claude", outcome.note);
-    const state = await claudeUsage(outcome.token);
-    if (outcome.note === undefined) return state;
-    return { ...state, note: state.note === undefined ? outcome.note : `${state.note}; ${outcome.note}` };
+    const reading = await claudeUsage(outcome.token);
+    if (outcome.note === undefined) return reading;
+    return { ...reading, note: reading.note === undefined ? outcome.note : `${reading.note}; ${outcome.note}` };
   }
 
-  async function fetchCodex(): Promise<RailState> {
+  async function fetchCodex(): Promise<VendorReading> {
     if (!existsSync(cfg.piAuthPath)) return unavailable("codex", "no pi auth file");
     let cred: any;
     try {
@@ -2818,42 +3050,53 @@ export function createDispatcher(
     });
     if ("note" in read) return unavailable("codex", read.note);
 
-    const { windows, limited } = parseCodexUsage(read.json);
+    const readAt = now();
+    const { windows, limited } = parseCodexUsage(read.json, { readAt });
     if (!windows.length) return unavailable("codex", "no rate_limit windows returned");
-    if (!limited) return { rail: "codex", ok: true, windows };
+    if (!limited) return { rail: "codex", ok: true, windows, readAt, raw: read.json };
     // `limit_reached` means blocked outright, not merely close, so every budget
     // reads full rather than leaving a comfortable-looking percentage behind.
     return {
       rail: "codex",
       ok: true,
       windows: windows.map((w) => ({ ...w, used: 100 })),
+      readAt,
+      raw: read.json,
       note: "limit_reached=true",
     };
   }
 
-  async function railState(rail: Rail, force = false): Promise<RailState> {
-    if (rail === "deepseek") return deepseekState();
+  async function railReadings(rail: Rail, force = false): Promise<RailReadings> {
+    if (rail === "deepseek") return { latest: deepseekReading() };
     const hit = cache.get(rail);
-    if (!force && hit && now() - hit.at < cfg.ttlMs) return hit.state;
+    if (!force && hit && now() - hit.at < cfg.ttlMs) return asReadings(hit);
 
-    let state: RailState;
+    let latest: VendorReading;
     try {
-      state = rail === "claude" ? await fetchClaude() : await fetchCodex();
+      latest = rail === "claude" ? await fetchClaude() : await fetchCodex();
     } catch (err) {
-      state = unavailable(rail, (err as Error).message);
+      latest = unavailable(rail, (err as Error).message);
     }
-    cache.set(rail, { at: now(), state });
-    return state;
+    // Read the entry again after the await rather than reusing `hit`: a
+    // concurrent read of this rail may have landed a newer success meanwhile,
+    // and a failure must not roll the last good reading back past it.
+    const lastGood = latest.ok ? latest : cache.get(rail)?.lastGood;
+    // Stamped now, after the read has been normalized, not with the reading's
+    // `readAt`: the TTL counts from when the finished reading is stored, so
+    // parsing and continuation time cannot eat into it.
+    const entry: CachedReadings = { at: now(), latest, ...(lastGood === undefined ? {} : { lastGood }) };
+    cache.set(rail, entry);
+    return asReadings(entry);
   }
 
-  async function allRails(force = false): Promise<Map<Rail, RailState>> {
+  async function allReadings(force = false): Promise<Map<Rail, RailReadings>> {
     const rails: Rail[] = ["claude", "codex", "deepseek"];
-    const states = await Promise.all(rails.map((r) => railState(r, force)));
-    return new Map(states.map((s) => [s.rail, s]));
+    const readings = await Promise.all(rails.map((r) => railReadings(r, force)));
+    return new Map(readings.map((r) => [r.latest.rail, r]));
   }
 
   async function decideAll(
-    rails: Map<Rail, RailState>,
+    rails: Map<Rail, RailReading>,
     dry: boolean,
     directory: AgentDirectory,
   ): Promise<Array<{ decision: Decision; outcome: Outcome }>> {
@@ -2920,7 +3163,7 @@ export function createDispatcher(
     opts: { force?: boolean; dry?: boolean } = {},
   ): Promise<Array<{ decision: Decision; outcome: Outcome }>> {
     const directory = await readAgentDirectory(cfg.agentDir);
-    return decideAll(await allRails(opts.force), opts.dry ?? false, directory);
+    return decideAll(latestReadings(await allReadings(opts.force)), opts.dry ?? false, directory);
   }
 
   /**
@@ -2939,7 +3182,7 @@ export function createDispatcher(
    * two HTTP requests rather than four.
    */
   async function report(opts: { force?: boolean } = {}): Promise<string[]> {
-    const rails = await allRails(opts.force);
+    const rails = latestReadings(await allReadings(opts.force));
     // Read before the decisions, and shared with them and with the unmanaged
     // list below, so the pass makes one read of the agent dir rather than two
     // that could disagree.
@@ -2984,7 +3227,7 @@ export function createDispatcher(
     return lines;
   }
 
-  return { railState, allRails, evaluate, report };
+  return { railReadings, allReadings, evaluate, report };
 }
 
 // ---------------------------------------------------------------- extension
