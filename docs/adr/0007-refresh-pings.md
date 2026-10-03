@@ -153,7 +153,7 @@ a bounded kill; and a do-not-kill race that lets a slow run finish once it has
 signalled it is refreshing, which needs a signal the child does not provide. A
 future reader with a reason to revisit this should start here.
 
-Single-flight covers the callers that race: `railState` is reached from the
+Single-flight covers the callers that race: `railReadings` is reached from the
 startup path, the poll, and `/quota-dispatch refresh`, and there is only ever one
 Claude Code process being used as a token refresher here.
 

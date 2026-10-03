@@ -85,6 +85,18 @@ One account whose quota is consumed by model calls. A rail is per-account, not
 per-provider: several model prefixes can draw on the same rail.
 _Avoid_: provider, plan, account, budget
 
+**Rail reading**:
+What one quota read reports for one rail: each window the vendor reported, how
+much of it is used, which budget it counts toward and when it resets — or why
+the read failed. A reading states facts only; whether a budget is **tight** is a
+judgment the policy makes about it, not part of it.
+_Avoid_: usage data, quota data, rail state, usage snapshot
+
+**Last good reading**:
+A rail's most recent successful **rail reading**, kept even after later reads of
+that rail fail.
+_Avoid_: cached reading, stale reading, fallback reading
+
 **Session budget**:
 A rail's short-window cap — the acute one that blocks work mid-task and clears
 within hours.

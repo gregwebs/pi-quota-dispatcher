@@ -1154,7 +1154,7 @@ for (const reason of ["resume", "fork"]) {
 /**
  * The plain form reads a cache warmed within `ttlMs`; `refresh` is the one that
  * forces a re-fetch. `createDispatcher` caches each rail's reading and
- * `railState` returns the cached state unless `force` is set, so a cold report
+ * `railReadings` returns the cached reading unless `force` is set, so a cold report
  * makes two fetches (claude + codex; deepseek is metered) and a second plain
  * report makes none, while `refresh` makes two more. The cold-only test above
  * would pass an implementation that ignored the flag, so the readings are

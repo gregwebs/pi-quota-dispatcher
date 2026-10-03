@@ -757,7 +757,7 @@ test("a healthy claude credential never starts a refresh ping", async () => {
     { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => NOW, refreshClaude },
   );
 
-  const state = await d.railState("claude", true);
+  const { latest: state } = await d.railReadings("claude", true);
 
   assert.equal(state.ok, true, state.note);
   assert.equal(refreshes, 0, "a readable credential is no reason to run anything");
@@ -776,7 +776,7 @@ test("a credential failure that is not an expiry is reported unchanged, with no 
     { fetchImpl: stubFetch(), now: () => NOW, refreshClaude },
   );
 
-  const state = await d.railState("claude", true);
+  const { latest: state } = await d.railReadings("claude", true);
 
   assert.equal(state.ok, false);
   // A store that never yielded a token is not an expiry a ping fixes, so the
@@ -811,7 +811,7 @@ test("an expired credential is refreshed, and the rail reads with the new token"
     { fetchImpl: stubFetch(seenAuth), readKeychain: noKeychain, now: () => NOW, refreshClaude },
   );
 
-  const state = await d.railState("claude", true);
+  const { latest: state } = await d.railReadings("claude", true);
 
   assert.equal(state.ok, true, state.note);
   assert.equal(state.note, undefined, "a readable rail carries no note");
@@ -853,7 +853,7 @@ test("an expired credential the ping cannot fix holds, and the note names the at
     { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => NOW, refreshClaude },
   );
 
-  const state = await d.railState("claude", true);
+  const { latest: state } = await d.railReadings("claude", true);
 
   assert.equal(state.ok, false);
   assert.ok(state.note?.includes("refresh ping"), `the note must name the attempt: ${state.note}`);
@@ -888,7 +888,7 @@ test("claudeRefresh off skips the ping and says so in the note", async () => {
     { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => NOW },
   );
 
-  const state = await d.railState("claude", true);
+  const { latest: state } = await d.railReadings("claude", true);
 
   assert.equal(state.ok, false, "with no refresh the expired credential stays expired");
   assert.ok(state.note?.includes("claudeRefresh"), `the note must name the key: ${state.note}`);
@@ -913,7 +913,7 @@ test("a non-default claudeCredsPath leaves the mode inert and says so in the not
     { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => NOW },
   );
 
-  const state = await d.railState("claude", true);
+  const { latest: state } = await d.railReadings("claude", true);
 
   assert.equal(state.ok, false);
   assert.ok(state.note?.includes("claudeCredsPath"), `the note must name the path rule: ${state.note}`);
@@ -941,7 +941,7 @@ test("a failed ping is not retried inside the cooldown, and is after it", async 
   );
 
   for (let i = 0; i < 3; i++) {
-    const state = await d.railState("claude", true);
+    const { latest: state } = await d.railReadings("claude", true);
     assert.ok(state.note?.includes("refresh ping"), `attempt ${i}: ${state.note}`);
     // A cooldown is not a halt: the note must leave the retry open.
     assert.ok(!state.note?.includes("no further attempt will be made"), state.note);
@@ -950,7 +950,7 @@ test("a failed ping is not retried inside the cooldown, and is after it", async 
   assert.equal(refreshes, 1, "inside the cooldown the attempt is not repeated");
 
   clock = NOW + CLAUDE_PING_COOLDOWN_MS;
-  await d.railState("claude", true);
+  await d.railReadings("claude", true);
   assert.equal(refreshes, 2, "the cooldown expires and the next read may try again");
 });
 
@@ -978,13 +978,13 @@ test("a cooldown gate hit does not re-arm the cooldown", async () => {
     { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => clock, refreshClaude },
   );
 
-  await d.railState("claude", true); // arms the cooldown at NOW
+  await d.railReadings("claude", true); // arms the cooldown at NOW
 
   // Three polls strictly inside the window. A re-armed gate would restart the
   // window from the last of them.
   for (const offset of [60_000, 300_000, 840_000]) {
     clock = NOW + offset;
-    const state = await d.railState("claude", true);
+    const { latest: state } = await d.railReadings("claude", true);
     assert.ok(state.note?.includes("refresh ping"), `offset ${offset}: ${state.note}`);
     assert.equal(refreshes, 1, `offset ${offset}: a gate hit must not attempt`);
   }
@@ -993,7 +993,7 @@ test("a cooldown gate hit does not re-arm the cooldown", async () => {
   // hit. A re-armed gate is still holding here, so this is the assertion that
   // fails on it.
   clock = NOW + CLAUDE_PING_COOLDOWN_MS;
-  await d.railState("claude", true);
+  await d.railReadings("claude", true);
   assert.equal(refreshes, 2, "the window runs from the attempt, not from the last gate hit");
 });
 
@@ -1014,8 +1014,8 @@ test("a deferred ping does not arm the cooldown", async () => {
     { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => NOW, refreshClaude },
   );
 
-  const first = await d.railState("claude", true);
-  const second = await d.railState("claude", true);
+  const { latest: first } = await d.railReadings("claude", true);
+  const { latest: second } = await d.railReadings("claude", true);
 
   // A collided ping is the other process's work in flight, so the next read
   // must try again rather than being locked out for a quarter of an hour.
@@ -1045,7 +1045,7 @@ test("concurrent evaluations make exactly one ping attempt", async () => {
     { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => NOW, refreshClaude },
   );
 
-  await Promise.all([d.railState("claude", true), d.railState("claude", true)]);
+  await Promise.all([d.railReadings("claude", true), d.railReadings("claude", true)]);
 
   // startup, the poll, and `/quota-dispatch refresh` can all race here.
   assert.equal(refreshes, 1, "concurrent readers must share one attempt");
@@ -1078,7 +1078,7 @@ test("an undiverted ping halts: no second attempt, and the note says so", async 
     { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => clock, refreshClaude },
   );
 
-  const first = await d.railState("claude", true);
+  const { latest: first } = await d.railReadings("claude", true);
   assert.equal(first.ok, false);
   assert.ok(first.note?.includes("no further attempt will be made"), first.note);
   assert.equal(refreshes, 1);
@@ -1086,7 +1086,7 @@ test("an undiverted ping halts: no second attempt, and the note says so", async 
   // Far past the cooldown: a halt is not a cooldown that expires. A gate hit
   // never re-arms and never retries.
   clock = NOW + CLAUDE_PING_COOLDOWN_MS * 10;
-  const second = await d.railState("claude", true);
+  const { latest: second } = await d.railReadings("claude", true);
   assert.equal(refreshes, 1, "a spent attempt must never be repeated");
   assert.ok(second.note?.includes("no further attempt will be made"), second.note);
 });
@@ -1110,12 +1110,12 @@ test("a pinged ping that left the token expired halts", async () => {
     { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => clock, refreshClaude },
   );
 
-  const first = await d.railState("claude", true);
+  const { latest: first } = await d.railReadings("claude", true);
   assert.equal(first.ok, false);
   assert.ok(first.note?.includes("no further attempt will be made"), first.note);
 
   clock = NOW + CLAUDE_PING_COOLDOWN_MS * 10;
-  await d.railState("claude", true);
+  await d.railReadings("claude", true);
   assert.equal(refreshes, 1, "a run that did not work will not work next time either");
 });
 
@@ -1139,13 +1139,13 @@ test("a failed ping halts at once in the mode that spends budget", async () => {
     { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => clock, refreshClaude },
   );
 
-  const first = await d.railState("claude", true);
+  const { latest: first } = await d.railReadings("claude", true);
   assert.equal(first.ok, false);
   assert.ok(first.note?.includes("no further attempt will be made"), first.note);
 
   // Past where an offline failure would retry: `ping` mode must not.
   clock = NOW + CLAUDE_PING_COOLDOWN_MS * 10;
-  await d.railState("claude", true);
+  await d.railReadings("claude", true);
   assert.equal(refreshes, 1, "a repeat could only pay again");
 });
 
@@ -1184,7 +1184,7 @@ test("an undiverted ping is reported on the healthy rail and never retried", asy
     { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => clock, refreshClaude },
   );
 
-  const first = await d.railState("claude", true);
+  const { latest: first } = await d.railReadings("claude", true);
   assert.equal(refreshes, 1);
   // The re-read *did* yield a token, so the rail is healthy — but a paid
   // anomaly is not something a usable token can undo.
@@ -1209,7 +1209,7 @@ test("an undiverted ping is reported on the healthy rail and never retried", asy
     "utf8",
   );
   clock = NOW + CLAUDE_PING_COOLDOWN_MS * 10;
-  const later = await d.railState("claude", true);
+  const { latest: later } = await d.railReadings("claude", true);
   assert.equal(refreshes, 1, "a sticky anomaly must never be retried");
   assert.equal(later.ok, false, later.note);
   assert.ok(later.note?.includes("no further attempt will be made"), later.note);
@@ -1265,7 +1265,7 @@ test("a per-episode halt is cleared once the store yields a token again", async 
     { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => clock, refreshClaude },
   );
 
-  const halted = await d.railState("claude", true);
+  const { latest: halted } = await d.railReadings("claude", true);
   assert.equal(halted.ok, false);
   assert.ok(halted.note?.includes("no further attempt will be made"), halted.note);
   assert.equal(refreshes, 1);
@@ -1277,13 +1277,13 @@ test("a per-episode halt is cleared once the store yields a token again", async 
     cred({ accessToken: "fresh", expiresAt: NOW + 3_600_000 }),
     "utf8",
   );
-  const recovered = await d.railState("claude", true);
+  const { latest: recovered } = await d.railReadings("claude", true);
   assert.equal(recovered.ok, true, recovered.note);
 
   // A later expiry is a new episode, and may be met with a ping again.
   await writeFile(fx.claudeCredsPath, cred({ accessToken: "stale-again", expiresAt: clock - 1_000 }), "utf8");
   clock = NOW + CLAUDE_PING_COOLDOWN_MS * 10;
-  await d.railState("claude", true);
+  await d.railReadings("claude", true);
   assert.equal(refreshes, 2, "a recovered episode must be able to ping again");
 });
 

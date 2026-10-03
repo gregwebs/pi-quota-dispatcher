@@ -11,7 +11,7 @@ import {
   type DispatcherConfig,
   type DroppedAlternate,
   type Rail,
-  type RailState,
+  type RailReading,
   type RailWindow,
   type QuotaReadPacing,
   type ThinkingLevel,
@@ -68,7 +68,7 @@ test("parseCodexUsage classifies both windows and surfaces limit_reached", () =>
       primary_window: { used_percent: 0 },
       secondary_window: { used_percent: 64 },
     },
-  });
+  }, { readAt: 0 });
   assert.deepEqual(windows, [
     { label: "5h", used: 0, budget: "session" },
     { label: "7d", used: 64, budget: "weekly" },
@@ -82,15 +82,15 @@ test("parseCodexUsage labels each window from its advertised length", () => {
       primary_window: { used_percent: 9, limit_window_seconds: 18000, reset_after_seconds: 17135 },
       secondary_window: { used_percent: 65, limit_window_seconds: 604800, reset_after_seconds: 408848 },
     },
-  });
+  }, { readAt: 0 });
   assert.deepEqual(windows, [
-    { label: "5h", used: 9, budget: "session", resetsInSeconds: 17135 },
-    { label: "7d", used: 65, budget: "weekly", resetsInSeconds: 408848 },
+    { label: "5h", used: 9, budget: "session", resetsAt: 17_135_000 },
+    { label: "7d", used: 65, budget: "weekly", resetsAt: 408_848_000 },
   ]);
 });
 
 test("parseCodexUsage reports limit_reached=true", () => {
-  const { limited } = parseCodexUsage({ rate_limit: { limit_reached: true } });
+  const { limited } = parseCodexUsage({ rate_limit: { limit_reached: true } }, { readAt: 0 });
   assert.equal(limited, true);
 });
 
@@ -495,20 +495,25 @@ interface Readings {
   note?: string;
 }
 
-function railState(rail: Rail, r: Readings = {}): RailState {
-  if (r.metered) return { rail, ok: true, windows: [], metered: true, note: r.note ?? "metered" };
-  if (r.ok === false) return { rail, ok: false, windows: [], note: r.note };
+function railState(rail: Rail, r: Readings = {}): RailReading {
+  // `deepseek` is the only metered rail, and `MeteredReading.rail` records that:
+  // the assert keeps this branch honest if a caller ever asks for another rail.
+  if (r.metered) {
+    assert.equal(rail, "deepseek", "only deepseek is metered");
+    return { rail: "deepseek", ok: true, windows: [], metered: true, note: r.note ?? "metered" };
+  }
+  if (r.ok === false) return { rail, ok: false, windows: [], readAt: 0, note: r.note ?? "unreadable" };
   const windows: RailWindow[] = [];
   if (r.session !== undefined) windows.push({ label: "5h", used: r.session, budget: "session" });
   if (r.weekly !== undefined) windows.push({ label: "7d", used: r.weekly, budget: "weekly" });
-  return { rail, ok: true, windows, ...(r.note ? { note: r.note } : {}) };
+  return { rail, ok: true, windows, readAt: 0, raw: {}, ...(r.note ? { note: r.note } : {}) };
 }
 
-function railMap(...states: RailState[]): Map<Rail, RailState> {
+function railMap(...states: RailReading[]): Map<Rail, RailReading> {
   return new Map(states.map((s) => [s.rail, s]));
 }
 
-function rails(claude: Readings, codex: Readings): Map<Rail, RailState> {
+function rails(claude: Readings, codex: Readings): Map<Rail, RailReading> {
   return railMap(
     railState("claude", claude),
     railState("codex", codex),
@@ -553,7 +558,7 @@ function plannerDecision(claude: Readings, codex: Readings): Decision {
 }
 
 test("budgetUsed takes the worst window within a budget, not across budgets", () => {
-  const state: RailState = {
+  const state: RailReading = {
     rail: "claude",
     ok: true,
     windows: [
@@ -561,6 +566,8 @@ test("budgetUsed takes the worst window within a budget, not across budgets", ()
       { label: "7d", used: 27, budget: "weekly" },
       { label: "7d Sonnet", used: 91, budget: "weekly" },
     ],
+    readAt: 0,
+    raw: {},
   };
   assert.equal(budgetUsed(state, "session"), 0);
   assert.equal(budgetUsed(state, "weekly"), 91);
@@ -1650,7 +1657,7 @@ test("a definite answer on the retry carries no attempt count", async () => {
   });
 
   const d = readDispatcher(fx, impl, { backoffMs: 1 });
-  const state = await d.railState("codex", true);
+  const { latest: state } = await d.railReadings("codex", true);
 
   assert.equal(codexAttempts, 2);
   assert.equal(state.note, "HTTP 401");
@@ -1674,7 +1681,7 @@ test("a body that is not JSON reads as an unreadable body, not as a shape proble
   });
 
   const d = readDispatcher(fx, impl, { backoffMs: 1 });
-  const state = await d.railState("codex", true);
+  const { latest: state } = await d.railReadings("codex", true);
 
   assert.equal(codexAttempts, 2);
   assert.match(state.note ?? "", /^unreadable body \(.*\) after 2 attempts$/);
@@ -1697,7 +1704,7 @@ test("an unstated timing reads as the shipped one, not as undefined", async () =
 
   const started = Date.now();
   const d = readDispatcher(fx, impl, { backoffMs: undefined });
-  const state = await d.railState("claude", true);
+  const { latest: state } = await d.railReadings("claude", true);
 
   assert.equal(state.note, "HTTP 500 after 2 attempts");
   // ~250ms of shipped backoff, not the no-pause retry an `undefined` would give.
@@ -1717,7 +1724,7 @@ test("a request error does not repeat what it says about the credential", async 
   });
 
   const d = readDispatcher(fx, impl, { backoffMs: 1 });
-  const state = await d.railState("claude", true);
+  const { latest: state } = await d.railReadings("claude", true);
 
   assert.equal(state.note, "request failed after 2 attempts");
   assert.ok(!(state.note ?? "").includes("sk-secret"), "a credential must not reach a note");
@@ -1774,7 +1781,7 @@ test("a stalled endpoint is abandoned by its timeout and retried", async () => {
 
   const d = readDispatcher(fx, impl, { timeoutMs: 20, backoffMs: 5 });
   const started = Date.now();
-  const state = await d.railState("claude", true);
+  const { latest: state } = await d.railReadings("claude", true);
   const elapsed = Date.now() - started;
 
   assert.equal(state.ok, false);
@@ -1793,7 +1800,7 @@ test("a body that stalls mid-stream is abandoned by the same deadline", async ()
   const { impl, calls } = countingFetch(stallingHandler({ body: true }));
 
   const d = readDispatcher(fx, impl, { timeoutMs: 20, backoffMs: 5 });
-  const state = await d.railState("codex", true);
+  const { latest: state } = await d.railReadings("codex", true);
 
   assert.equal(state.ok, false);
   assert.equal(state.note, "no answer within 20ms after 2 attempts");
