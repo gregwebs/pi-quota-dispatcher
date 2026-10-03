@@ -204,11 +204,15 @@ The record of which config layer supplied each effective value, printed by
 provenance block both carry it.
 _Avoid_: config dump, debug output, source block
 
+**Generator input**:
+The JSON document a **configuration generator** is fed on stdin: every rail's **rail reading** from the **dispatcher** — a rail it does not hold being read once first — each capped rail's **last good reading** standing in for a failed latest one beside a `latestFailure` marker, and no **tight** judgment. Versioned (`version: 1`); a capped rail with no successful reading refuses the run rather than being sent empty.
+_Avoid_: stdin payload, usage snapshot, generator config, rail state
+
 **Configuration generator**:
 A command a config file declares, which prints a whole ordinary configuration
 layer as JSON. What it prints replaces that one file's ordinary configuration —
 all-or-nothing, one invalid entry rejecting the whole run — leaving the
 declaration that named it in place. The routes a generator emits are ordinary
 configuration, so reusable routes and model swaps are the generator's business,
-not new dispatcher behaviour.
+not new dispatcher behaviour. It is fed the **generator input** on stdin.
 _Avoid_: route template, generator config, config script, dynamic config

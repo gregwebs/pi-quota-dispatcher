@@ -960,14 +960,239 @@ test("a waiting evaluation is admitted when the fence lowers and reads the boot 
   assert.deepEqual(seen, ["new"], "it must read the boot current at the release, not at the request");
 });
 
-test("a generated table that manages no agent asks no vendor for quota", async () => {
+/** Rewrite the fixture's global config in place, before the extension loads it. */
+async function editGlobal(fx: GenerateFixture, edit: (config: Record<string, any>) => void): Promise<void> {
+  const config = JSON.parse(await readFile(fx.globalPath, "utf8"));
+  edit(config);
+  await writeFile(fx.globalPath, JSON.stringify(config), "utf8");
+}
+
+/**
+ * Generation now always gathers the generator's input, so on an install that
+ * has never read a rail it costs one request per capped rail. What this pins is
+ * the rest: once the readings are held, neither the snapshot — whatever the
+ * readings' age — nor the post-publication evaluation of an empty table asks a
+ * vendor again. A tiny `ttlMs` makes "whatever their age" observable: a
+ * snapshot that honoured the TTL, or that read through a fresh dispatcher, would
+ * fetch both rails.
+ */
+test("a warmed install generates an empty table without reading a quota again", async () => {
   const fx = await generateFixture({}, () => "printf '{}'");
-  let fetches = 0;
-  const base = stubFetch();
-  const counting = (async (...args: Parameters<typeof fetch>) => {
-    fetches++;
-    return base(...args);
-  }) as typeof fetch;
+  await editGlobal(fx, (config) => {
+    config.ttlMs = 1;
+  });
+  const quota = countingStubFetch();
+
+  await withExtension(
+    fx,
+    async ({ run, sessionStart }) => {
+      await sessionStart();
+      assert.equal(quota.count(), 2, "precondition: startup read both capped rails");
+      // Real time past the 1 ms TTL, so the readings are expired by any clock.
+      await new Promise((done) => setTimeout(done, 20));
+      const text = await run("generate");
+      assert.ok(text.startsWith("[generated]"), text);
+    },
+    quota.factory,
+  );
+
+  assert.equal(quota.count(), 2, "a warmed install must cost no further usage request to generate an empty table");
+});
+
+/** A generator that saves what it was fed on stdin beside the layer, then prints the layer. */
+function capturingGenerator(layerPath: string): string {
+  return `cat > '${join(dirname(layerPath), "input.json")}'; cat '${layerPath}'`;
+}
+
+async function capturedInput(fx: GenerateFixture): Promise<any> {
+  return JSON.parse(await readFile(join(dirname(fx.layerPath), "input.json"), "utf8"));
+}
+
+test("a generator reading stdin receives every rail's reading in the documented shape", async () => {
+  const fx = await generateFixture({}, capturingGenerator);
+  const before = Date.now();
+  await withExtension(fx, async ({ run }) => {
+    const text = await run("generate");
+    assert.ok(text.startsWith("[generated]"), text);
+  });
+  const after = Date.now();
+  const input = await capturedInput(fx);
+
+  assert.equal(input.version, 1);
+  assert.deepEqual(Object.keys(input.rails).sort(), ["claude", "codex", "deepseek"]);
+  assert.deepEqual(input.rails.deepseek, { metered: true, windows: [], raw: null });
+
+  // The stub's numbers: claude session 90 with no reset reported, so the window
+  // has no `resetsAt` key at all.
+  const { claude, codex } = input.rails;
+  assert.equal(claude.ok, true);
+  assert.deepEqual(claude.windows, [
+    { label: "5h", used: 90, budget: "session" },
+    { label: "7d", used: 0, budget: "weekly" },
+  ]);
+  assert.deepEqual(claude.raw, { five_hour: { utilization: 90 }, seven_day: { utilization: 0 } });
+  assert.ok(!("latestFailure" in claude));
+
+  // Codex reports resets relative to the response; the document carries them as
+  // ISO instants anchored on the reading's own `readAt`.
+  assert.equal(codex.ok, true);
+  assert.deepEqual(codex.windows.map((w: any) => [w.label, w.used, w.budget]), [
+    ["5h", 10, "session"],
+    ["7d", 0, "weekly"],
+  ]);
+  const readAt = Date.parse(codex.readAt);
+  assert.equal(new Date(readAt).toISOString(), codex.readAt, "readAt must be ISO 8601 UTC");
+  assert.ok(before <= readAt && readAt <= after, `readAt ${codex.readAt} is not the time of this run's read`);
+  assert.equal(Date.parse(codex.windows[0].resetsAt) - readAt, 3_600_000);
+  assert.equal(Date.parse(codex.windows[1].resetsAt) - readAt, 400_000_000);
+  assert.equal(codex.raw.rate_limit.primary_window.used_percent, 10);
+  assert.ok(!("latestFailure" in codex));
+});
+
+test("a never-read install reads each capped rail once to generate, and no more", async () => {
+  const fx = await generateFixture({}, () => "printf '{}'");
+  const quota = countingStubFetch();
+  await withExtension(
+    fx,
+    async ({ run }) => {
+      const text = await run("generate");
+      assert.ok(text.startsWith("[generated]"), text);
+    },
+    quota.factory,
+  );
+  // One per capped rail for the input; the empty generated table's own
+  // evaluation asks nothing.
+  assert.equal(quota.count(), 2);
+});
+
+test("a rail whose newest read failed is fed as its last good reading, marked", async () => {
+  const fx = await generateFixture({}, capturingGenerator);
+  let codexFails = false;
+  const healthy = stubFetch();
+  const flaky = (async (url: string | URL) => {
+    if (codexFails && String(url).includes("chatgpt.com")) {
+      // A definite answer: a 429 is not retried, so no backoff runs here.
+      return { ok: false, status: 429, json: async () => ({}) };
+    }
+    return healthy(url);
+  }) as unknown as typeof fetch;
+
+  await withExtension(
+    fx,
+    async ({ run, sessionStart }) => {
+      await sessionStart();
+      codexFails = true;
+      const refreshed = await run("refresh");
+      assert.ok(refreshed.includes("codex: unavailable"), refreshed);
+      const text = await run("generate");
+      assert.ok(text.startsWith("[generated]"), text);
+    },
+    () => flaky,
+  );
+
+  const { claude, codex } = (await capturedInput(fx)).rails;
+  assert.equal(codex.ok, true);
+  assert.match(codex.latestFailure?.note ?? "", /HTTP 429/);
+  // The startup reading's numbers, and its time: the failure is newer.
+  assert.deepEqual(codex.windows.map((w: any) => w.used), [10, 0]);
+  assert.ok(Date.parse(codex.readAt) <= Date.parse(codex.latestFailure.at), JSON.stringify(codex));
+  assert.ok(!("latestFailure" in claude), "claude's refresh succeeded");
+});
+
+test("a capped rail that was never read successfully refuses the run and changes nothing", async () => {
+  let marker = "";
+  const fx = await generateFixture(GENERATED_LAYER, (layerPath) => {
+    marker = join(dirname(layerPath), "ran");
+    return `touch '${marker}'; cat '${layerPath}'`;
+  });
+  await rm(join(fx.agentDir, "auth.json"));
+  const globalBefore = await readFile(fx.globalPath, "utf8");
+  const plannerBefore = await readFile(fx.plannerFile, "utf8");
+
+  await withExtension(fx, async ({ run, notifications }) => {
+    const text = await run("generate");
+    assert.equal(notifications[0].level, "warning", "a refusal is shown like any other generation failure");
+    assert.ok(text.includes("codex") && text.includes("no pi auth file"), text);
+    assert.ok(text.includes("This run did not change"), text);
+    await assert.rejects(readFile(marker, "utf8"), "the generator must not have run");
+
+    // The active configuration is the one from before the run.
+    const config = await run("config");
+    assert.ok(config.includes("agents.planner.primary.model = claude-bridge/claude-opus-5-5"), config);
+  });
+
+  assert.equal(await readFile(fx.globalPath, "utf8"), globalBefore);
+  assert.equal(await readFile(fx.plannerFile, "utf8"), plannerBefore);
+});
+
+test("a claude rail that was never read successfully refuses the run too", async () => {
+  const fx = await generateFixture(GENERATED_LAYER);
+  // The other capped rail, so the refusal cannot be the codex path by accident.
+  const config = JSON.parse(await readFile(fx.globalPath, "utf8"));
+  await rm(config.claudeCredsPath);
+  const globalBefore = await readFile(fx.globalPath, "utf8");
+
+  await withExtension(fx, async ({ run, notifications }) => {
+    const text = await run("generate");
+    assert.equal(notifications[0].level, "warning", text);
+    assert.ok(text.includes("the claude rail has no valid reading yet"), text);
+    assert.ok(!text.includes("the codex rail has no valid reading"), `codex is readable: ${text}`);
+    assert.ok(text.includes("This run did not change"), text);
+  });
+
+  assert.equal(await readFile(fx.globalPath, "utf8"), globalBefore);
+});
+
+/**
+ * The readings describe the configuration in force *before* the run: a generated
+ * layer that names different credential paths must not change where its own
+ * input was read from. The generated layer points claude at a file that does
+ * not exist, so a run that read through the *new* configuration would refuse
+ * instead of producing the windows the old one yields.
+ */
+test("the readings come from the credential paths active before generation", async () => {
+  const active = await generateFixture(
+    { claudeCredsPath: join(tmpdir(), "pqd-gen-credential-does-not-exist.json"), agents: {} },
+    capturingGenerator,
+  );
+
+  await withExtension(active, async ({ run }) => {
+    const text = await run("generate");
+    assert.ok(text.startsWith("[generated]"), text);
+  });
+
+  const { claude, codex } = (await capturedInput(active)).rails;
+  assert.equal(claude.ok, true, JSON.stringify(claude));
+  assert.deepEqual(claude.windows.map((w: any) => w.used), [90, 0]);
+  assert.equal(codex.ok, true, JSON.stringify(codex));
+});
+
+test("generate project with no project declaration reads no quota", async () => {
+  const fx = await generateFixture({});
+  const quota = countingStubFetch();
+  await withExtension(
+    fx,
+    async ({ run }) => {
+      const text = await run("generate project");
+      assert.ok(text.includes('declares no "generator"'), text);
+    },
+    quota.factory,
+  );
+  assert.equal(quota.count(), 0, "a file with nothing to run must not cost a usage request");
+});
+
+test("a slow quota read does not consume the generator's timeoutMs", async () => {
+  const fx = await generateFixture({});
+  // Less than the reads take: a timer started before the reads would expire
+  // before the command was even spawned.
+  await editGlobal(fx, (config) => {
+    config.generator.timeoutMs = 150;
+  });
+  const healthy = stubFetch();
+  const slow = (async (url: string | URL) => {
+    await new Promise((done) => setTimeout(done, 400));
+    return healthy(url);
+  }) as unknown as typeof fetch;
 
   await withExtension(
     fx,
@@ -975,10 +1200,8 @@ test("a generated table that manages no agent asks no vendor for quota", async (
       const text = await run("generate");
       assert.ok(text.startsWith("[generated]"), text);
     },
-    () => counting,
+    () => slow,
   );
-
-  assert.equal(fetches, 0, "an empty generated table must cost no usage request");
 });
 
 test("a failed generation leaves the write fence usable", async () => {

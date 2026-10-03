@@ -14,13 +14,24 @@ import {
 } from "../src/config.ts";
 import {
   type BashRunInput,
+  GENERATOR_INPUT_VERSION,
   GENERATOR_STDERR_CAP_BYTES,
   GENERATOR_STDERR_LINES,
   GENERATOR_STDOUT_CAP_BYTES,
+  type GeneratorInputOutcome,
   describeStderr,
   generateConfig,
   runBash,
 } from "../src/generator.ts";
+import {
+  generatorInput,
+  parseClaudeUsage,
+  parseCodexUsage,
+  type FailedReading,
+  type GoodReading,
+  type KnownReadings,
+  type MeteredReading,
+} from "../src/index.ts";
 
 // ---------------------------------------------------------------- helpers
 
@@ -167,6 +178,83 @@ test("the README and ADR generator examples are valid configuration", async () =
     delete ordinary.generator;
     const strict = await replaceGlobal(ordinary);
     assert.equal(strict.kind, "accepted", `${label}: ${JSON.stringify(strict)}`);
+  }
+});
+
+/**
+ * The stdin contract is documented by example; a reader copies that example into
+ * a generator, so it must stay the shape the code sends.
+ */
+test("the README's stdin document example is the documented shape", async () => {
+  const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+  const doc = JSON.parse(firstJsonBlockAfter(readme, "#### What the generator reads on stdin"));
+  assert.equal(doc.version, GENERATOR_INPUT_VERSION);
+  assert.deepEqual(Object.keys(doc.rails).sort(), ["claude", "codex", "deepseek"]);
+  assert.deepEqual(doc.rails.deepseek, { metered: true, windows: [], raw: null });
+  for (const rail of ["claude", "codex"] as const) {
+    assert.equal(doc.rails[rail].ok, true, rail);
+    assert.ok(!Number.isNaN(Date.parse(doc.rails[rail].readAt)), `${rail}.readAt must be an ISO instant`);
+  }
+
+  // The readings are built from the example's own `raw` through the real
+  // parsers, so the example's `windows` must be exactly what the code parses
+  // from the body beside them — the test cannot pin a window the parser never
+  // emits. Between them they carry every field the wire shape can emit: a
+  // `note`, a `latestFailure`, and windows with and without the optional
+  // `resetsAt` (the body's `seven_day` has no `resets_at`, so its window has
+  // none).
+  const claudeRaw = doc.rails.claude.raw;
+  const codexRaw = doc.rails.codex.raw;
+  const claudeGood: GoodReading = {
+    rail: "claude",
+    ok: true,
+    readAt: Date.parse(doc.rails.claude.readAt),
+    windows: parseClaudeUsage(claudeRaw),
+    raw: claudeRaw,
+  };
+  const codexParsed = parseCodexUsage(codexRaw, { readAt: Date.parse(doc.rails.codex.readAt) });
+  const codexGood: GoodReading = {
+    rail: "codex",
+    ok: true,
+    readAt: Date.parse(doc.rails.codex.readAt),
+    windows: codexParsed.windows,
+    raw: codexRaw,
+    // The same pairing `fetchCodex` makes: the display-only note travels with a
+    // `limit_reached` read, and its absence with an ordinary one.
+    ...(codexParsed.limited ? { note: "limit_reached=true" } : {}),
+  };
+  const claudeFailure: FailedReading = {
+    rail: "claude",
+    ok: false,
+    windows: [],
+    readAt: Date.parse(doc.rails.claude.readAt) + 60_000,
+    note: "HTTP 500 after 2 attempts",
+  };
+  const metered: MeteredReading = { rail: "deepseek", ok: true, windows: [], metered: true, note: "metered" };
+  const readings: KnownReadings = {
+    claude: { latest: claudeFailure, lastGood: claudeGood },
+    codex: { latest: codexGood, lastGood: codexGood },
+    deepseek: { latest: metered },
+  };
+  const outcome = generatorInput(readings);
+  assert.equal(outcome.kind, "ready");
+  assert.ok(outcome.kind === "ready");
+
+  // Exact sorted key sets, not a subset: the README cannot document a field the
+  // code never emits, nor leave out one it does.
+  const keys = (value: object) => Object.keys(value).sort();
+  for (const rail of ["claude", "codex", "deepseek"] as const) {
+    assert.deepEqual(keys(doc.rails[rail]), keys(outcome.input.rails[rail]), `${rail} entry keys`);
+  }
+  // Per rail, over every window: the same shapes the code emits, whatever their
+  // order, so a window missing `resetsAt` beside one that carries it cannot hide.
+  const windowShapes = (windows: readonly object[]) => windows.map((w) => keys(w).join(",")).sort();
+  for (const rail of ["claude", "codex"] as const) {
+    assert.deepEqual(
+      windowShapes(doc.rails[rail].windows),
+      windowShapes(outcome.input.rails[rail].windows),
+      `${rail} window key sets`,
+    );
   }
 });
 
@@ -379,6 +467,21 @@ function cannedRunner(stdout: string, stderr = "", failure?: string) {
   };
 }
 
+/**
+ * The stdin outcome a run gets when a test is not about the input itself: a
+ * ready document with every rail present and no windows. The document's shape is
+ * pinned where the contract is tested.
+ */
+const READY_INPUT = {
+  version: 1,
+  rails: {
+    claude: { ok: true, readAt: "2024-01-01T00:00:00.000Z", windows: [], raw: {} },
+    codex: { ok: true, readAt: "2024-01-01T00:00:00.000Z", windows: [], raw: {} },
+    deepseek: { metered: true, windows: [], raw: null },
+  },
+} as const;
+const readyInput = async (): Promise<GeneratorInputOutcome> => ({ kind: "ready", input: READY_INPUT });
+
 function declarationText(command: string, timeoutMs?: number): string {
   return JSON.stringify({ generator: { command, ...(timeoutMs !== undefined ? { timeoutMs } : {}) } });
 }
@@ -386,7 +489,13 @@ function declarationText(command: string, timeoutMs?: number): string {
 async function generate(
   sandboxed: Sandbox,
   stdout: string,
-  opts: { stderr?: string; failure?: string; prepare?: (loaded: any) => Promise<any>; scope?: "global" | "project" } = {},
+  opts: {
+    stderr?: string;
+    failure?: string;
+    prepare?: (loaded: any) => Promise<any>;
+    scope?: "global" | "project";
+    input?: () => Promise<GeneratorInputOutcome>;
+  } = {},
 ) {
   const canned = cannedRunner(stdout, opts.stderr ?? "", opts.failure);
   const result = await generateConfig({
@@ -395,6 +504,7 @@ async function generate(
     agentDir: sandboxed.agentDir,
     cwd: sandboxed.projectDir,
     run: canned.run,
+    input: opts.input ?? readyInput,
     prepare: opts.prepare ?? (async (loaded) => ({ tag: "prepared", loaded })),
   });
   return { result, calls: canned.calls };
@@ -488,6 +598,7 @@ test("invalid UTF-8 on stdout is a failure", async () => {
       canned.calls.push(input);
       return { stdout: Buffer.from([0x7b, 0xff, 0x7d]), stderr: Buffer.alloc(0) };
     },
+    input: readyInput,
     prepare: async () => ({}),
   });
   assert.equal(result.kind, "failed");
@@ -527,6 +638,7 @@ test("a target edited while the generator ran is not clobbered", async () => {
       canned.calls.push(input);
       return { stdout: Buffer.from(JSON.stringify({ margin: 42 })), stderr: Buffer.alloc(0) };
     },
+    input: readyInput,
     prepare: async () => ({}),
   });
   assert.equal(result.kind, "failed");
@@ -550,6 +662,7 @@ test("a held lock is a failure, not permission to write", async () => {
       run: canned.run,
       // Wait zero time so the held lock is answered at once rather than slept over.
       coordination: { pacing: { waitMs: 1, pollMs: 1 } },
+      input: readyInput,
       prepare: async () => ({}),
     });
     assert.equal(result.kind, "failed");
@@ -584,6 +697,7 @@ test("a committed change whose lock release failed is reported as a note, not as
     agentDir: box.agentDir,
     cwd: box.projectDir,
     run: async () => ({ stdout: Buffer.from(JSON.stringify({ margin: 5 })), stderr: Buffer.alloc(0) }),
+    input: readyInput,
     // The seam: on the compare-and-swap re-read, turn the lock file into a
     // directory, so the release's `readFile` fails after the rename has landed.
     readFile: async (path: string) => {
@@ -632,10 +746,195 @@ test("only the target layer is written; the other file is untouched", async () =
   assert.equal(JSON.parse(await readFile(other, "utf8")).margin, 1);
 });
 
+// ------------------------------------------------------- generator input
+
+/**
+ * A document unlike `READY_INPUT` in every rail, so a runner fed some default or
+ * a re-encoded copy cannot pass by coincidence.
+ */
+const RICH_INPUT = {
+  version: 1,
+  rails: {
+    claude: {
+      ok: true,
+      readAt: "2025-02-03T09:14:22.431Z",
+      windows: [{ label: "5h", used: 42, budget: "session", resetsAt: "2025-02-03T12:30:00.000Z" }],
+      raw: { five_hour: { utilization: 42 }, quote: 'a "quoted" ✓ value\nover two lines' },
+      latestFailure: { at: "2025-02-03T09:20:07.118Z", note: "HTTP 500 after 2 attempts" },
+    },
+    codex: {
+      ok: true,
+      readAt: "2025-02-03T09:20:07.902Z",
+      windows: [{ label: "7d", used: 100, budget: "weekly" }],
+      raw: { rate_limit: { limit_reached: true } },
+      note: "limit_reached=true",
+    },
+    deepseek: { metered: true, windows: [], raw: null },
+  },
+} as const;
+
+// A stand-in refusal for the run-level tests here, not the wording a real
+// gather prints: this is a literal, so a change to `generatorInput`'s refusal
+// would not move it. The exact real wording — header, rail line and advice, in
+// order — is pinned by "the refusal reason is exactly the header, the failing
+// rail's line and the advice" in test/generator-input.test.ts; these tests only
+// need *a* multi-line reason to exercise the failure path.
+const REFUSAL = [
+  "the generator was not run: a quota-capped rail has no successful reading yet.",
+  "the codex rail has no valid reading yet (no pi auth file).",
+  "Run /quota-dispatch refresh once the rail can be read, then generate again.",
+];
+
+test("the generator's stdin is exactly the gathered document, newline-terminated", async () => {
+  const box = await sandbox(declarationText("true"));
+  const { result, calls } = await generate(box, JSON.stringify({}), {
+    input: async () => ({ kind: "ready", input: RICH_INPUT }),
+  });
+  assert.equal(result.kind, "generated");
+  assert.equal(calls.length, 1);
+  // Parsed once, not twice: a document serialized again on the way in would be a
+  // JSON string here rather than the object.
+  assert.deepEqual(JSON.parse(calls[0].stdin), RICH_INPUT);
+  // One trailing newline, so a line-oriented reader (`read -r`, `jq`) sees a
+  // complete line.
+  assert.ok(calls[0].stdin.endsWith("}\n"), JSON.stringify(calls[0].stdin.slice(-5)));
+});
+
+test("a refused input fails the run before the command, preparation or file are touched", async () => {
+  const text = declarationText("true");
+  const box = await sandbox(text);
+  let prepared = false;
+  const { result, calls } = await generate(box, JSON.stringify({ margin: 3 }), {
+    input: async () => ({ kind: "refused", reason: REFUSAL }),
+    prepare: async () => {
+      prepared = true;
+      return {};
+    },
+  });
+  assert.equal(result.kind, "failed");
+  assert.ok(result.kind === "failed");
+  for (const line of REFUSAL) assert.ok(result.lines.includes(line), `missing reason line ${JSON.stringify(line)}:\n${result.lines.join("\n")}`);
+  assert.ok(result.lines.join("\n").includes("This run did not change"), result.lines.join("\n"));
+  assert.equal(calls.length, 0, "a refused run must not spawn the generator");
+  assert.equal(prepared, false, "a refused run must not prepare a runtime");
+  assert.equal(await readFile(box.target, "utf8"), text);
+});
+
+test("an input that throws is a generation failure, and the command is not run", async () => {
+  const text = declarationText("true");
+  const box = await sandbox(text);
+  const { result, calls } = await generate(box, JSON.stringify({ margin: 3 }), {
+    input: async () => {
+      throw new Error("the boot fell over");
+    },
+  });
+  assert.equal(result.kind, "failed");
+  assert.ok(result.kind === "failed");
+  const rendered = result.lines.join("\n");
+  assert.match(rendered, /could not be gathered/, rendered);
+  assert.ok(rendered.includes("the boot fell over"), rendered);
+  assert.ok(rendered.includes("This run did not change"), rendered);
+  assert.equal(calls.length, 0);
+  assert.equal(await readFile(box.target, "utf8"), text);
+});
+
+test("a target that cannot run a generator costs no input", async () => {
+  // The input is a quota read: a typo in the file, or a file that declares no
+  // generator at all, must be answered before anything asks a vendor.
+  const cases: Array<[string, Sandbox]> = [
+    ["no generator declared", await sandbox(JSON.stringify({ margin: 3 }))],
+    ["an invalid declaration", await sandbox(JSON.stringify({ generator: { command: "  ", timeoutMs: 0 } }))],
+    ["not JSON", await sandbox("{ not json")],
+  ];
+  const missing = await sandbox(declarationText("true"));
+  await rm(missing.target);
+  cases.push(["an unreadable file", missing]);
+
+  for (const [label, box] of cases) {
+    let asked = 0;
+    const { result, calls } = await generate(box, JSON.stringify({}), {
+      input: async () => {
+        asked++;
+        return readyInput();
+      },
+    });
+    assert.equal(result.kind, "failed", label);
+    assert.equal(asked, 0, `${label}: the input must not be gathered`);
+    assert.equal(calls.length, 0, label);
+  }
+});
+
+test("the input is gathered once and settled before the command is spawned", async () => {
+  const box = await sandbox(declarationText("true"));
+  const order: string[] = [];
+  const result = await generateConfig({
+    source: "global",
+    path: box.target,
+    agentDir: box.agentDir,
+    cwd: box.projectDir,
+    run: async () => {
+      order.push("run");
+      return { stdout: Buffer.from("{}"), stderr: Buffer.alloc(0) };
+    },
+    input: async () => {
+      order.push("input:start");
+      // A macrotask, so a runner started without awaiting the input would be
+      // logged in between.
+      await new Promise((done) => setImmediate(done));
+      order.push("input:end");
+      return readyInput();
+    },
+    prepare: async () => ({}),
+  });
+  assert.equal(result.kind, "generated");
+  assert.deepEqual(order, ["input:start", "input:end", "run"]);
+});
+
+test("timeoutMs starts at the spawn: a slow input does not eat the command's time", async () => {
+  // The real runner, so the timer under test is the real one. The input takes
+  // longer than the whole timeout, and the command itself needs a part of it: a
+  // timer armed before the input was awaited would already have fired.
+  const box = await sandbox(declarationText("sleep 0.05; printf '{}'", 300));
+  const result = await generateConfig({
+    source: "global",
+    path: box.target,
+    agentDir: box.agentDir,
+    cwd: box.projectDir,
+    input: async () => {
+      await new Promise((done) => setTimeout(done, 450));
+      return readyInput();
+    },
+    prepare: async () => ({}),
+  });
+  assert.equal(result.kind, "generated", result.kind === "failed" ? result.lines.join("\n") : "");
+});
+
+test("timeoutMs still bounds the command after a slow input", async () => {
+  // The other side of the scope: moving the timer to the spawn must not lose it.
+  const box = await sandbox(declarationText("sleep 30", 200));
+  const started = Date.now();
+  const result = await generateConfig({
+    source: "global",
+    path: box.target,
+    agentDir: box.agentDir,
+    cwd: box.projectDir,
+    input: async () => {
+      await new Promise((done) => setTimeout(done, 100));
+      return readyInput();
+    },
+    prepare: async () => ({}),
+  });
+  assert.equal(result.kind, "failed");
+  assert.ok(result.kind === "failed");
+  assert.ok(result.lines.join("\n").includes("did not finish within"), result.lines.join("\n"));
+  assert.ok(Date.now() - started < 5_000);
+});
+
 // ------------------------------------------------------- runBash process behavior
 
-function runOrFail(input: BashRunInput): Promise<Awaited<ReturnType<typeof runBash>>> {
-  return runBash(input);
+function runOrFail(input: Omit<BashRunInput, "stdin"> & { stdin?: string }): Promise<Awaited<ReturnType<typeof runBash>>> {
+  const { stdin = "", ...rest } = input;
+  return runBash({ ...rest, stdin });
 }
 
 test("real Bash: exact stdout, cwd and EOF stdin", async () => {
@@ -648,6 +947,61 @@ test("real Bash: exact stdout, cwd and EOF stdin", async () => {
   });
   assert.equal(ran.failure, undefined);
   assert.equal(ran.stdout.toString("utf8"), `${cwd}\n{"ok":true}`);
+});
+
+/** A stdin far larger than a pipe buffer, so its write is still pending when a command ignores it. */
+const LARGE_STDIN = `${JSON.stringify({ pad: "x".repeat(2 * 1024 * 1024) })}\n`;
+
+test("real Bash: stdin carries the document, byte for byte", async () => {
+  const stdin = `${JSON.stringify({ version: 1, note: 'a "quoted" ✓\nline', pad: "y".repeat(200_000) })}\n`;
+  const ran = await runOrFail({ command: "cat", cwd: tmpdir(), timeoutMs: 5_000, stdin });
+  assert.equal(ran.failure, undefined);
+  assert.equal(ran.stdout.toString("utf8"), stdin);
+});
+
+test("real Bash: a command that never reads stdin still succeeds", async () => {
+  // The command exits with its stdin unread, so the rest of the write meets a
+  // closed pipe (EPIPE). That is the contract — reading is optional — and an
+  // unhandled stream error would take this whole test process down.
+  const ran = await runOrFail({ command: "printf '{}'", cwd: tmpdir(), timeoutMs: 5_000, stdin: LARGE_STDIN });
+  assert.equal(ran.failure, undefined);
+  assert.equal(ran.stdout.toString("utf8"), "{}");
+});
+
+test("real Bash: a command that closes stdin, or reads only part of it, still succeeds", async () => {
+  for (const command of ["exec 0<&-; printf '{}'", "head -c 10 >/dev/null; printf '{}'"]) {
+    const ran = await runOrFail({ command, cwd: tmpdir(), timeoutMs: 5_000, stdin: LARGE_STDIN });
+    assert.equal(ran.failure, undefined, command);
+    assert.equal(ran.stdout.toString("utf8"), "{}", command);
+  }
+});
+
+test("real Bash: a timed-out run with a large stdin write still reports the timeout", async () => {
+  // Neither reads nor exits: the write cannot finish before the timeout, and the
+  // settle must deliver the timeout verdict rather than wait on it. (The
+  // descendant test below is what pins that a live reader cannot hold a finished
+  // run open; here the kill closes the reader, so this one is about the verdict.)
+  const started = Date.now();
+  const ran = await runOrFail({ command: "sleep 30", cwd: tmpdir(), timeoutMs: 200, stdin: LARGE_STDIN });
+  assert.ok(ran.failure?.includes("did not finish within"), ran.failure);
+  assert.ok(Date.now() - started < 5_000, "the timeout must settle without waiting on the stdin write");
+});
+
+test("real Bash: a descendant holding stdin unread does not hold the run open", async () => {
+  // The shell exits at once with its output closed, but a background sleep keeps
+  // the stdin pipe open without reading it, so the write never completes. The
+  // exit is the verdict; a runner that waited for its write to finish would
+  // hang until the timeout and report a failure.
+  const started = Date.now();
+  const ran = await runOrFail({
+    command: "sleep 3 <&0 >/dev/null 2>&1 & printf '{}'",
+    cwd: tmpdir(),
+    timeoutMs: 2_000,
+    stdin: LARGE_STDIN,
+  });
+  assert.equal(ran.failure, undefined);
+  assert.equal(ran.stdout.toString("utf8"), "{}");
+  assert.ok(Date.now() - started < 1_500, "the run must settle on the exit, not on the stdin write");
 });
 
 test("real Bash: a non-zero exit reports code and stderr", async () => {
