@@ -81,6 +81,7 @@ function base(): DispatcherConfig {
     claudeCredsPath: "/root/.claude/.credentials.json",
     claudeRefresh: "off",
     piAuthPath: "/root/auth.json",
+    readingsPath: "/root/quota-dispatch-readings.json",
     ttlMs: 180000,
     pollMs: 300000,
     sessionSwitchAt: 75,

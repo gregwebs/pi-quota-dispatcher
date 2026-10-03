@@ -129,14 +129,17 @@ already holds is sent **whatever its age** — generation is explicit, so the
 numbers describe the moment the user asked rather than the moment a vendor
 answered — and there is no forced read and no `generate refresh` form. Only a
 rail with no reading at all is read, once and unforced, before the command
-starts. Because the readings live in the dispatcher's memory, whatever replaces
-that dispatcher also empties the cache: a `/reload`, or a generation, whose
-publication swaps in a freshly built dispatcher. A generated table that manages
-agents warms that fresh dispatcher with its activation evaluation, so the next
-generate usually costs nothing. An empty table has no activation to warm it, so
-its fresh dispatcher starts empty and **every** generate on an unconfigured
-install reads both capped rails — the one case where a generate reads without
-anything else having asked for them.
+starts. The readings are no longer the dispatcher's private memory: they live in
+the shared [rail readings file](0016-shared-rail-readings.md) (ADR 0016), so
+whatever replaces a dispatcher — a `/reload`, or a generation whose publication
+swaps in a freshly built one — no longer empties them, and a new dispatcher
+serves a peer's or its predecessor's reading without a request. A generated
+table that manages agents still warms the fresh dispatcher with its activation
+evaluation, so the next generate usually costs nothing, but that is now an
+optimisation rather than the only thing that can. An empty table has no
+activation to warm it, yet its fresh dispatcher still finds whatever the file
+holds, so an unconfigured install re-reads a rail only when the file has no
+entry for it.
 
 When the newest read of a rail failed, its **last good reading** is sent with a
 `latestFailure` marker beside it, naming the newer failure and when it happened.

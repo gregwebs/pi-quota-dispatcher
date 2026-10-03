@@ -519,6 +519,7 @@ interface Fixture {
   agentDir: string;
   claudeCredsPath: string;
   piAuthPath: string;
+  readingsPath: string;
 }
 
 /**
@@ -548,7 +549,7 @@ async function fixture(models: Record<string, string>): Promise<Fixture> {
     "utf8",
   );
 
-  return { agentDir, claudeCredsPath, piAuthPath };
+  return { agentDir, claudeCredsPath, piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
 }
 
 /** Readings the stub endpoints should report, per live rail. */

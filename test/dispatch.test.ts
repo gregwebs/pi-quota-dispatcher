@@ -1217,6 +1217,7 @@ interface Fixture {
   agentDir: string;
   claudeCredsPath: string;
   piAuthPath: string;
+  readingsPath: string;
 }
 
 /**
@@ -1227,7 +1228,9 @@ interface Fixture {
  * fixture that only stubbed `fetch` would silently fall through to the
  * developer's real `~/.claude/.credentials.json` and `~/.pi/agent/auth.json`.
  * That passes on a developer machine and fails on CI, where those files do not
- * exist and the rail is correctly reported unreadable.
+ * exist and the rail is correctly reported unreadable. `readingsPath` is the
+ * same statement about the shared rail cache: unset, a test would read and write
+ * the developer's own readings.
  */
 async function fixture(models: Record<string, string>): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "pqd-"));
@@ -1253,7 +1256,7 @@ async function fixture(models: Record<string, string>): Promise<Fixture> {
     "utf8",
   );
 
-  return { agentDir, claudeCredsPath, piAuthPath };
+  return { agentDir, claudeCredsPath, piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
 }
 
 /** Readings the stub endpoints should report, per rail. */

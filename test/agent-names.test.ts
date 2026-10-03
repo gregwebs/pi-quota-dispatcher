@@ -16,7 +16,8 @@ const route: AgentRoute = { primary: { model: MODEL, rail: "deepseek" }, alterna
 const text = (name?: string, model = "deepseek/old") =>
   `---\n${name === undefined ? "" : `name: ${name}\n`}model: "${model}"\n---\n\nBody.\n`;
 const config = (dir: string, names: string[]): DispatcherConfig => ({
-  ...DEFAULT_CONFIG, agentDir: dir, agents: Object.fromEntries(names.map((n) => [n, route])),
+  ...DEFAULT_CONFIG, agentDir: dir, readingsPath: join(dir, "quota-dispatch-readings.json"),
+  agents: Object.fromEntries(names.map((n) => [n, route])),
 });
 async function fixture(t: TestContext, entries: Record<string, string>) {
   const dir = await mkdtemp(join(tmpdir(), "pqd-names-"));

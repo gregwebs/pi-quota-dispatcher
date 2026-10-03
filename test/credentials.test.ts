@@ -340,6 +340,7 @@ interface Fixture {
   agentDir: string;
   claudeCredsPath: string;
   piAuthPath: string;
+  readingsPath: string;
 }
 
 /**
@@ -361,7 +362,7 @@ async function fixture(models: Record<string, string>): Promise<Fixture> {
     JSON.stringify({ "openai-codex": { access: "test-token", accountId: "acct-test" } }),
     "utf8",
   );
-  return { agentDir, claudeCredsPath, piAuthPath };
+  return { agentDir, claudeCredsPath, piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
 }
 
 interface StubReadings {

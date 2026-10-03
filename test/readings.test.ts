@@ -80,6 +80,7 @@ async function fixture(t: TestContext) {
   }) as unknown as typeof fetch;
   const dispatcher = createDispatcher({
     ...DEFAULT_CONFIG, agentDir, claudeCredsPath, piAuthPath, ttlMs: TTL, claudeRefresh: "off",
+    readingsPath: join(root, "quota-dispatch-readings.json"),
     agents: { planner: { primary: { model: PRIMARY, rail: "claude" }, alternates: [{ model: ALTERNATE, rail: "codex" }] } },
   }, { fetchImpl, now: () => probe.clock, readKeychain: async () => ({ error: "no keychain" }) });
   return { dispatcher, probe, agentFile };
