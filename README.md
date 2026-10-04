@@ -512,8 +512,13 @@ runs would be worse than doing nothing. `agentDir` and `piAuthPath` (defaults
 settable from JSON: they are
 paths pi itself owns, derived from `getAgentDir()`, so a file pointing them
 elsewhere would only make the dispatcher edit files nothing reads. Relocate
-them with `PI_CODING_AGENT_DIR`, and note that naming either in a config file
-warns. Both remain fields on the config object for programmatic use and tests.
+them with `PI_CODING_AGENT_DIR`, and note that naming any of these in a config
+file warns. The shared **rail readings file**
+(`<agent dir>/quota-dispatch-readings.json`, see
+[Where the numbers come from](#where-the-numbers-come-from) and
+[0016](docs/adr/0016-shared-rail-readings.md)) derives from the same agent dir
+and is not settable for the same reason. All three remain fields on the config
+object for programmatic use and tests.
 
 ### Migrating from `routes`
 
@@ -649,9 +654,11 @@ generation also evaluates the new policy once, exactly as `session_start` does
 agent files exactly as `apply` does. It is also the one form that **reads a
 quota before it has a table to decide about**: the input below is gathered
 first, so a rail the active dispatcher does not already hold is read now. A
-generated table that manages agents is activated and reads both capped rails
-again straight away; an empty one has no activation to warm it, so on an
-unconfigured install **every** generate reads both. (A read may be retried once
+generated table that manages agents is activated and evaluated straight away,
+so a rail that has lapsed since it was last read is fetched then; an empty one
+has no activation to warm it, but its fresh dispatcher still serves whatever the
+shared rail readings file holds, so on an unconfigured install a generate
+re-reads a rail only when the file has no entry for it. (A read may be retried once
 — a 5xx or a transport failure, never a 4xx — and can trigger a Claude token
 refresh. See [Where the numbers come from](#where-the-numbers-come-from).)
 
@@ -727,12 +734,12 @@ command runs. Run
 [`/quota-dispatch refresh`](#commands) first when you want fresh numbers. There
 is no `generate refresh` form.
 
-If **`claude` or `codex` has no successful reading** in what the active
-dispatcher holds — nothing since it was built, which is since startup, a
-`/reload` or a previous generate — the command is **not run** and the failure
-says which rail and why. A cached failure is not retried: a rail that has never
-succeeded since the dispatcher was built counts as having no reading, and the
-refusal says so. That is deliberate: a generator cannot choose without the
+If **`claude` or `codex` has no successful reading** in what the shared
+[rail readings file](#where-the-numbers-come-from) holds — nothing this machine
+has recorded for the rail, at any age — the command is **not run** and the
+failure says which rail and why. A recorded failure is not retried: a rail with
+no successful reading in the file counts as having no reading, and the refusal
+says so. That is deliberate: a generator cannot choose without the
 numbers, and a placeholder would be a guess the policy itself refuses to make.
 One consequence: an install with only one of the two quota-capped rails cannot
 generate.
@@ -962,6 +969,17 @@ is not one another request would have changed, and a counted one is a request
 that was still being tried when the read stopped. The timings are deliberately
 not config-file keys: how long to wait for a socket is a fact about this network,
 not a routing preference. See [0006](docs/adr/0006-bounded-quota-reads.md).
+
+Readings are **shared, not private** to a process. What a rail answered is kept
+in the **rail readings file**, `<agent dir>/quota-dispatch-readings.json`, so
+every pi under your user reuses one answer per `ttlMs` rather than making its own
+request. It is created `0600` because a reading carries the vendor's own response
+body, is keyed per rail and credential so a second account never inherits a
+first's numbers, and is skipped rather than fatal when corrupt — the report
+carries the warning and the next successful read repairs it. Writing it is best
+effort: a cache that cannot be written never turns an evaluation into an error.
+See [0016](docs/adr/0016-shared-rail-readings.md), and the **Rail readings
+file** term in [CONTEXT.md](CONTEXT.md).
 
 ### Keeping the Claude token fresh
 

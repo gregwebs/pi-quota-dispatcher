@@ -689,6 +689,7 @@ interface Fixture {
   agentDir: string;
   claudeCredsPath: string;
   piAuthPath: string;
+  readingsPath: string;
 }
 
 /** A self-contained dispatcher fixture, so no test touches the real credential. */
@@ -704,7 +705,7 @@ async function fixture(plannerModel = "claude-bridge/claude-opus-5-5"): Promise<
     JSON.stringify({ "openai-codex": { access: "test-token", accountId: "acct-test" } }),
     "utf8",
   );
-  return { agentDir, claudeCredsPath, piAuthPath };
+  return { agentDir, claudeCredsPath, piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
 }
 
 /** The only network boundary; records the bearer token each call carried. */

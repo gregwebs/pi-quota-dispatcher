@@ -219,6 +219,13 @@ export interface DispatcherConfig {
   claudeCredsPath: string;
   claudeRefresh: ClaudeRefreshMode;
   piAuthPath: string;
+  /**
+   * The file the rail readings are shared through, beside the global config and
+   * pi's to own like `piAuthPath`: a config file pointing it elsewhere could only
+   * make two processes share a reading nothing else reads. Its format is
+   * internal — see `docs/adr/0016-shared-rail-readings.md`.
+   */
+  readingsPath: string;
   /** Quota readings are cached this long. 5h/7d windows move slowly. */
   ttlMs: number;
   /** Re-evaluate on this cadence while a session is open. */
@@ -320,6 +327,15 @@ export const DEFAULT_GENERATOR_TIMEOUT_MS = 5_000;
 
 /** Name of the file, in both the global and the project directory. */
 export const CONFIG_FILE_NAME = "quota-dispatch.json";
+
+/**
+ * Name of the file the shared rail readings live in, beside the global config.
+ *
+ * Declared here rather than in `readings-file.ts` so the path and the name are
+ * one statement: `defaultConfig` composes them, and the readings module reads
+ * the name back for the warning it prints.
+ */
+export const READINGS_FILE_NAME = "quota-dispatch-readings.json";
 
 /** The scalar keys, in the fixed order they are reported by `describeConfig`. */
 const SCALAR_KEYS = [
@@ -690,6 +706,7 @@ function mismatchedRail(model: string, rail: Rail): Rail | undefined {
  *
  *   agentDir         `<agentDir>/agents`
  *   piAuthPath       `<agentDir>/auth.json`
+ *   readingsPath     `<agentDir>/quota-dispatch-readings.json`
  *   claudeCredsPath  `~/.claude/.credentials.json`
  *   claudeRefresh    `off`
  *   ttlMs            180_000
@@ -716,6 +733,7 @@ export function defaultConfig(agentDir: string = getAgentDir()): DispatcherConfi
     claudeCredsPath: join(homedir(), ".claude", ".credentials.json"),
     claudeRefresh: "off",
     piAuthPath: join(agentDir, "auth.json"),
+    readingsPath: join(agentDir, READINGS_FILE_NAME),
     ttlMs: 180_000,
     pollMs: 300_000,
     sessionSwitchAt: 75,

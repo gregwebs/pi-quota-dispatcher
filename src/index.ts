@@ -156,6 +156,31 @@ export {
 } from "./agent-file.ts";
 export type { Coordination, FileWritePacing, LockAttempt, LockHolder } from "./agent-file.ts";
 
+import {
+  DEFAULT_SHARED_READINGS,
+  createSharedReadings,
+  type SharedReadingsPacing,
+  type VendorReading,
+} from "./readings-file.ts";
+
+// The readings module is where the rail cache lives and is shared across
+// processes; re-exported here for the same reason as the config and models
+// modules, so `src/index.ts` is the one import path for the extension's whole
+// surface.
+export {
+  DEFAULT_SHARED_READINGS,
+  READINGS_FILE_VERSION,
+  asReadings,
+  createSharedReadings,
+} from "./readings-file.ts";
+export type {
+  CachedReadings,
+  SharedReadings,
+  SharedReadingsDeps,
+  SharedReadingsPacing,
+  VendorReading,
+} from "./readings-file.ts";
+
 // The models module is where a config's model ids are resolved against the pi
 // that is running; re-exported here for the same reason as the config module.
 export {
@@ -331,8 +356,8 @@ export type RailReading = GoodReading | FailedReading | MeteredReading;
  * rails, though rail literals or a mapped type could correlate them if they did.
  * Nor does it prove a `lastGood` was really recorded before `latest` — object
  * identity and history are the writer's job. Two writers build this shape:
- * `asReadings` projects the cached vendor rails, and the `deepseek` arm of
- * `railReadings` builds the metered reading directly.
+ * `asReadings` projects the shared store's cached vendor rails, and the
+ * `deepseek` arm of `railReadings` builds the metered reading directly.
  *
  * The metered arm's `lastGood?: never` is deliberate. Without it, structural
  * typing lets the other arms' `lastGood` property through to a metered entry,
@@ -368,40 +393,6 @@ export interface KnownReadings {
   readonly claude: VendorRailReadings;
   readonly codex: VendorRailReadings;
   readonly deepseek: MeteredRailReadings;
-}
-
-/** A reading that came from asking: every rail but a metered one, and the only kind the cache holds. */
-type VendorReading = GoodReading | FailedReading;
-
-/**
- * One cached rail: the reading that was stored, and when storing it made it the
- * newest.
- *
- * There are two times because they mean different things. `latest.readAt` is a
- * fact about the response — when the vendor answered, which relative resets are
- * converted against; the TTL must not start before the finished reading is
- * stored, so it counts from `at`, stamped at the one `cache.set` call after
- * parsing. Counting from `readAt` would let parse and continuation time consume
- * the TTL.
- */
-interface CachedReadings {
-  at: number;
-  latest: VendorReading;
-  lastGood?: GoodReading;
-}
-
-/**
- * One cache entry as the seam's shape. The cache's only projection into
- * `RailReadings` (`railReadings`' `deepseek` arm builds the metered entry
- * itself), so the union's invariants hold by construction rather than by each
- * caller's care: a success is paired with itself as its own last good reading,
- * and a failure omits `lastGood` rather than setting it to `undefined`, so a
- * strict deep comparison sees only the keys that exist.
- */
-function asReadings(entry: CachedReadings): VendorRailReadings {
-  const { latest } = entry;
-  if (latest.ok) return { latest, lastGood: latest };
-  return entry.lastGood === undefined ? { latest } : { latest, lastGood: entry.lastGood };
 }
 
 /**
@@ -2940,6 +2931,20 @@ export interface DispatcherDeps {
    * routing preferences, and the numbers only mean anything together.
    */
   fileWrite?: Partial<FileWritePacing>;
+  /**
+   * Timings for the two locks the shared readings file takes, overriding
+   * `DEFAULT_SHARED_READINGS` and the computed fetch bound field by field. A
+   * seam for the same reason `fileWrite` is one: a test that wants to watch a
+   * waiter reach its bound must not wait out the shipped seconds, which depend
+   * on how long a real vendor read may take.
+   */
+  readings?: Partial<SharedReadingsPacing>;
+  /**
+   * How the readings store waits between lock attempts. Injected alongside
+   * `now` so a test that holds a fetch lock can advance the clock instead of
+   * spending real time; the production default is `setTimeout`.
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface Dispatcher {
@@ -2966,16 +2971,15 @@ export interface Dispatcher {
    */
   allReadings(force?: boolean): Promise<Map<Rail, RailReadings>>;
   /**
-   * Every rail's readings, whatever their age: a cached entry is returned
-   * without consulting its TTL, and only a rail with no entry at all is read,
-   * once, unforced. A rail whose newest read failed is returned as it stands —
-   * its `latest` failure beside the last good reading, when one was left behind
-   * — rather than retried. It does not de-duplicate against a read another
-   * caller already has in flight; sharing one fetch between processes is a
-   * separate change.
+   * Every rail's readings, whatever their age: an entry the store already holds
+   * is returned without consulting its TTL, and only a rail with no entry at all
+   * is read, once, unforced. A rail whose newest read failed is returned as it
+   * stands — its `latest` failure beside the last good reading, when one was
+   * left behind — rather than retried. The reading may come from the shared
+   * file, so it is not necessarily one this process took.
    *
    * The one seam a reader outside the policy uses for "what is already known",
-   * so #61 can re-back it with readings shared across processes.
+   * and the seam the generator path reads through.
    */
   knownReadings(): Promise<KnownReadings>;
   evaluate(opts?: { force?: boolean; dry?: boolean }): Promise<Array<{ decision: Decision; outcome: Outcome }>>;
@@ -3002,7 +3006,21 @@ export function createDispatcher(
   // module owns their defaults, and merging them here as well would be a second
   // copy of that rule to keep in step.
   const fileWrite: Coordination = { pacing: deps.fileWrite, now };
-  const cache = new Map<Rail, CachedReadings>();
+  // The longest a single vendor read can honestly take: every attempt timing
+  // out, every backoff between them, and the refresh ping a Claude read may run
+  // inside one of them. A waiter for another process's fetch lock is given this
+  // much before it gives up and fetches for itself, so the bound can never cut
+  // short a read that is still working — and can never hang past one that is
+  // not. A test may state it directly.
+  const fetchWaitMs =
+    deps.readings?.fetchWaitMs ??
+    pacing.attempts * pacing.timeoutMs + (pacing.attempts - 1) * pacing.backoffMs + CLAUDE_PING_TIMEOUT_MS;
+  const readings = createSharedReadings({
+    path: cfg.readingsPath,
+    now,
+    ...(deps.sleep === undefined ? {} : { sleep: deps.sleep }),
+    pacing: { ...DEFAULT_SHARED_READINGS, ...deps.readings, fetchWaitMs },
+  });
   /**
    * A failed read, stamped with the dispatcher's own clock at the moment it
    * gave up. That is `readAt` — when the read gave up — not the TTL origin: the
@@ -3240,26 +3258,41 @@ export function createDispatcher(
     };
   }
 
-  async function vendorRailReadings(rail: VendorRail, force: boolean): Promise<VendorRailReadings> {
-    const hit = cache.get(rail);
-    if (!force && hit && now() - hit.at < cfg.ttlMs) return asReadings(hit);
+  /**
+   * The credential a rail's shared entry is keyed by.
+   *
+   * Resolved, not the raw config string: two configs can name one file through
+   * different spellings, and they must share the entry they both mean. Two
+   * genuinely different credentials — another Claude profile, another pi auth
+   * file — get different keys and therefore never see each other's readings,
+   * which is the one thing a shared cache must not do.
+   */
+  function credentialFor(rail: VendorRail): string {
+    return resolve(rail === "claude" ? cfg.claudeCredsPath : cfg.piAuthPath);
+  }
 
-    let latest: VendorReading;
-    try {
-      latest = rail === "claude" ? await fetchClaude() : await fetchCodex();
-    } catch (err) {
-      latest = unavailable(rail, (err as Error).message);
-    }
-    // Read the entry again after the await rather than reusing `hit`: a
-    // concurrent read of this rail may have landed a newer success meanwhile,
-    // and a failure must not roll the last good reading back past it.
-    const lastGood = latest.ok ? latest : cache.get(rail)?.lastGood;
-    // Stamped now, after the read has been normalized, not with the reading's
-    // `readAt`: the TTL counts from when the finished reading is stored, so
-    // parsing and continuation time cannot eat into it.
-    const entry: CachedReadings = { at: now(), latest, ...(lastGood === undefined ? {} : { lastGood }) };
-    cache.set(rail, entry);
-    return asReadings(entry);
+  /**
+   * One rail's vendor read, as the store asks for it. The store is deliberately
+   * not told which rail it is fetching — it keys on the credential the caller
+   * named — so the throw-to-failure translation stays here, where the note it
+   * builds is the one the report has always printed.
+   */
+  function fetchFor(rail: VendorRail): () => Promise<VendorReading> {
+    return async () => {
+      try {
+        return rail === "claude" ? await fetchClaude() : await fetchCodex();
+      } catch (err) {
+        return unavailable(rail, (err as Error).message);
+      }
+    };
+  }
+
+  async function vendorRailReadings(rail: VendorRail, force: boolean): Promise<VendorRailReadings> {
+    return readings.read(rail, credentialFor(rail), {
+      ttlMs: cfg.ttlMs,
+      force,
+      fetch: fetchFor(rail),
+    });
   }
 
   async function railReadings(rail: Rail, force = false): Promise<RailReadings> {
@@ -3272,19 +3305,20 @@ export function createDispatcher(
 
   async function allReadings(force = false): Promise<Map<Rail, RailReadings>> {
     const rails: Rail[] = ["claude", "codex", "deepseek"];
-    const readings = await Promise.all(rails.map((r) => railReadings(r, force)));
-    return new Map(readings.map((r) => [r.latest.rail, r]));
+    const entries = await Promise.all(rails.map((r) => railReadings(r, force)));
+    return new Map(entries.map((r) => [r.latest.rail, r]));
   }
 
   /**
-   * One capped rail for the generator input: a cached entry is returned whatever
-   * its age, and only the absence of an entry costs a read. Deliberately not
-   * `railReadings(rail)`, whose TTL is the policy's freshness rule for routing —
-   * a reader asking what is already known is not asking what is fresh.
+   * One capped rail for the generator input: an entry the store already holds is
+   * returned whatever its age, and only the absence of one costs a read.
+   * Deliberately not `railReadings(rail)`, whose TTL is the policy's freshness
+   * rule for routing — a reader asking what is already known is not asking what
+   * is fresh. The store answers from the file as well as this process, so a
+   * reading another pi took is "already known" here too.
    */
   async function knownVendorRailReadings(rail: VendorRail): Promise<VendorRailReadings> {
-    const hit = cache.get(rail);
-    return hit === undefined ? vendorRailReadings(rail, false) : asReadings(hit);
+    return (await readings.known(rail, credentialFor(rail))) ?? vendorRailReadings(rail, false);
   }
 
   async function knownReadings(): Promise<KnownReadings> {
@@ -3426,6 +3460,12 @@ export function createDispatcher(
         ...describeAgentFiles(unmanaged),
       );
     }
+    // A warning the store recorded while the rails were read: a corrupt shared
+    // file is not a reason to fail a report, but it is why the numbers above may
+    // come from a vendor rather than from a peer process — and it is the only
+    // place a user learns a file in their agent dir needs attention.
+    const warnings = readings.warnings();
+    if (warnings.length) lines.push("", ...warnings);
     return lines;
   }
 
@@ -3895,9 +3935,10 @@ export default function (pi: ExtensionAPI) {
           // The same evaluation `session_start` runs: skipped when the new table
           // manages nothing (an empty table has no files to decide, and asking
           // two vendors for quota to decide about none is a request the user
-          // never asked for), and unforced so the freshly built dispatcher's own
-          // empty cache is what fetches — not a bypass that would re-fetch a
-          // dispatcher that already held readings.
+          // never asked for), and unforced so it reads through the shared store
+          // rather than forcing a fetch — another process, or this one's
+          // predecessor before the swap, may already have answered the rail, and
+          // activation is not a request for fresh numbers.
           const rows = managesNothing(result.prepared.loaded.config)
             ? []
             : await result.prepared.dispatcher.evaluate();

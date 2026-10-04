@@ -505,18 +505,19 @@ async function stillHolds(lockPath: string, held: Acquisition): Promise<boolean>
  * for — the caller turns it into a hold rather than an error nobody can act on.
  * A file that is not there is its own refusal: `gone` is not a hold and not an
  * error, and the caller reports it as a skip, the same as its missing-file
- * pre-check.
+ * pre-check. That `gone` comes from resolving the target, so it is decided here
+ * rather than in the loop `withLockPath` runs.
+ *
+ * The timings are handed to `withLockPath` as stated, and normalized there: a
+ * caller that builds its own pacing — the shared readings store does — would
+ * otherwise bypass this function's defaults and could pass a `NaN` that leaves
+ * the loop unbounded.
  */
 export async function withFileLock<T>(
   file: string,
   coordination: Coordination,
   body: (target: string) => Promise<T>,
 ): Promise<LockAttempt<T>> {
-  const pacing: FileWritePacing = {
-    staleMs: duration(coordination.pacing?.staleMs, DEFAULT_FILE_WRITE.staleMs),
-    waitMs: duration(coordination.pacing?.waitMs, DEFAULT_FILE_WRITE.waitMs),
-    pollMs: duration(coordination.pacing?.pollMs, DEFAULT_FILE_WRITE.pollMs),
-  };
   const now = coordination.now ?? (() => Date.now());
   const sleep = coordination.sleep ?? ((ms: number) => new Promise((done) => setTimeout(done, ms)));
   // Resolved once, and used for the body's whole lifetime: the lock, the release
@@ -529,8 +530,40 @@ export async function withFileLock<T>(
     if (errnoIs(err, "ENOENT")) return { ok: false, reason: "gone" };
     throw err;
   }
-  const lockPath = lockPathFor(target);
+  return withLockPath(lockPathFor(target), coordination.pacing ?? {}, now, sleep, () => body(target));
+}
 
+/**
+ * Take the lock already named by `lockPath`, run `body`, release it.
+ *
+ * This is `withFileLock`'s loop with the target-resolution lifted out of it, so
+ * that something that is not an agent file can be locked. A lock file is the one
+ * thing here that need not pre-exist and has no second name to resolve, so the
+ * loop never has a `gone` to report: the `gone` arm survives in the return type
+ * because the caller of `withFileLock` sees it, and this function deliberately
+ * cannot produce it. Where the two callers differ is only in where `lockPath`
+ * came from; the acquisition, the recovery and the release are one body of code
+ * so a fix to a race lands for both.
+ *
+ * Every timing is normalized here rather than by each caller, because this is
+ * the one place the attempt count is computed and it is the boundary an
+ * untrusted value reaches. A `pollMs` of zero would make the count an infinity
+ * of attempts rather than a fast poll, and `undefined` or `NaN` from a caller
+ * that assembled its own pacing would make the count `NaN` and leave the loop
+ * with no bound at all. `duration` reads an unusable number as "not stated".
+ */
+export async function withLockPath<T>(
+  lockPath: string,
+  stated: Partial<FileWritePacing>,
+  now: () => number,
+  sleep: (ms: number) => Promise<void>,
+  body: () => Promise<T>,
+): Promise<LockAttempt<T>> {
+  const pacing: FileWritePacing = {
+    staleMs: duration(stated.staleMs, DEFAULT_FILE_WRITE.staleMs),
+    waitMs: duration(stated.waitMs, DEFAULT_FILE_WRITE.waitMs),
+    pollMs: duration(stated.pollMs, DEFAULT_FILE_WRITE.pollMs),
+  };
   // Patience is a count of attempts rather than a deadline, because a test can
   // inject a clock that never advances and a loop waiting for that clock would
   // then never give up. Recovery is counted too, and not to slow it down: a
@@ -559,7 +592,7 @@ export async function withFileLock<T>(
       if (await stillHolds(lockPath, held)) {
         let value: T;
         try {
-          value = await body(target);
+          value = await body();
         } catch (err) {
           // The lock is still released, and a failure to release it must not hide
           // either failure. The body's fault is the one the caller can act on and

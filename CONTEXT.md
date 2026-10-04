@@ -97,6 +97,19 @@ A rail's most recent successful **rail reading**, kept even after later reads of
 that rail fail.
 _Avoid_: cached reading, stale reading, fallback reading
 
+**Rail readings file**:
+The one file a machine's pi processes share their **rail readings** through, so
+two processes polling one credential make one vendor request per TTL between
+them. It sits beside the global config, is created `0600` because a reading
+carries the vendor's own response body, and is keyed per rail and credential, so
+a second account never inherits a first's numbers. Its format is internal and
+versioned, not a public contract: a **rail reading** read back out of it is the
+same shape a process cached itself. A corrupt or unknown-version file is skipped
+rather than fatal — the whole file reads as empty, the **report** carries the
+warning, and the next successful write repairs it. See
+[docs/adr/0016](docs/adr/0016-shared-rail-readings.md).
+_Avoid_: cache file, quota file, shared store, readings cache
+
 **Session budget**:
 A rail's short-window cap — the acute one that blocks work mid-task and clears
 within hours.
