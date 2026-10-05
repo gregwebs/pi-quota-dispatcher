@@ -56,8 +56,15 @@ import type {
   VendorRailReadings,
 } from "./index.ts";
 
-/** The version this module writes and the only one it reads. */
-export const READINGS_FILE_VERSION = 1;
+/**
+ * The version this module writes and the only one it reads.
+ *
+ * 2 added the refresh gates and the sticky halt beside the entries. A 1 document
+ * is an unknown version and faults the whole file, which is what the field is
+ * for: a version this writer does not know is a shape it cannot promise to
+ * preserve, and the entries are a cache that the next write repairs anyway.
+ */
+export const READINGS_FILE_VERSION = 2;
 
 /**
  * Pacing for the two locks a shared reading takes, all of it in milliseconds.
@@ -127,6 +134,36 @@ export function asReadings(entry: CachedReadings): VendorRailReadings {
   return entry.lastGood === undefined ? { latest } : { latest, lastGood: entry.lastGood };
 }
 
+export interface CredentialGates {
+  /** Armed by a `failed` offline ping; honoured for CLAUDE_PING_COOLDOWN_MS from `at`. */
+  cooldown?: { at: number; note: string };
+  /** The per-episode halt: ends when a read yields a usable token. */
+  halt?: string;
+}
+
+/**
+ * The machine-wide sticky halt. An `undiverted` run is a fact about the claude
+ * install, not about one credential. The identity is the install the halt was
+ * armed against; a `null`/`null` pair means the install could not be resolved
+ * when it was armed, so only an explicit clear removes it.
+ */
+export type StickyHalt = { note: string } & (
+  | { claudePath: string; claudeMtimeMs: number }
+  | { claudePath: null; claudeMtimeMs: null }
+);
+
+export interface RefreshGates extends CredentialGates {
+  sticky?: StickyHalt;
+}
+
+/** A locked, field-level read-modify-write of one credential's gates. */
+export interface GatePatch {
+  cooldown?: { at: number; note: string };
+  halt?: string;
+  /** Removes `halt`; takes precedence over `halt` if both are passed. */
+  clearHalt?: boolean;
+}
+
 /**
  * What a shared store answers, in the three forms the dispatcher needs.
  *
@@ -145,6 +182,17 @@ export interface SharedReadings {
   ): Promise<VendorRailReadings>;
   /** Whatever entry the file/process already holds, at any age; no fetch. */
   known(rail: VendorRail, credential: string): Promise<VendorRailReadings | undefined>;
+  /** The gates one credential's next refresh ping is subject to, sticky halt included. */
+  gates(credential: string): Promise<RefreshGates>;
+  /** A locked, field-level read-modify-write of one credential's gates. */
+  setGates(credential: string, patch: GatePatch): Promise<void>;
+  /**
+   * Set the machine-wide sticky halt, or clear it with `undefined`.
+   * A clear with `expected` is conditional: it only clears when the current
+   * sticky halt deep-equals `expected` (so a stale reader cannot erase a halt a
+   * peer just armed). A clear with no `expected` is unconditional (`refresh`).
+   */
+  setStickyHalt(sticky: StickyHalt | undefined, expected?: StickyHalt): Promise<void>;
   /** Warning lines for a corrupt/unknown-version/invalid file, for `report()`. */
   warnings(): readonly string[];
 }
@@ -172,6 +220,18 @@ interface InFlight {
   fetched: boolean;
 }
 
+/**
+ * A sticky-halt write this process has not yet published.
+ *
+ * A clear carries the halt it means to remove when it has one, so that applying
+ * it to a later document hides only that halt rather than whatever a peer armed
+ * in between. The operation is a plain object held by identity, which is what
+ * lets `setStickyHalt` retire exactly the write it made and no newer one.
+ */
+type PendingSticky =
+  | { kind: "set"; sticky: StickyHalt }
+  | { kind: "clear"; expected?: StickyHalt };
+
 /** One entry of the on-disk document, validated into the shape the writer needs. */
 interface FileEntry {
   rail: VendorRail;
@@ -181,8 +241,29 @@ interface FileEntry {
   lastGood?: GoodReading;
 }
 
+/** One credential's stored gates, keyed the way a readings entry is. */
+interface GateEntry extends CredentialGates {
+  credential: string;
+}
+
+/**
+ * The whole on-disk document.
+ *
+ * One object rather than three readers, because the file is one writer's
+ * replacement of all of it: a write that carried only the part it meant to
+ * change would drop the readings, a peer's gates, or the sticky halt. `gates`
+ * is a list rather than a map keyed by credential so that a hand edit cannot
+ * silently collide two credentials' gates, and `stickyHalt` is absent rather
+ * than `null` so a strict comparison sees only the keys that exist.
+ */
+interface FileDocument {
+  entries: FileEntry[];
+  gates: GateEntry[];
+  stickyHalt?: StickyHalt;
+}
+
 /** A decoded document, or the single reason the whole file reads as empty. */
-type Decoded = { entries: FileEntry[] } | { fault: string };
+type Decoded = FileDocument | { fault: string };
 
 /** Distinguishes two writes made by one process, which a pid alone does not. */
 let tempSerial = 0;
@@ -292,6 +373,127 @@ function fileEntry(value: unknown, index: number): { entry: FileEntry } | { faul
 }
 
 /**
+ * The gates one credential's entry holds, as the store's shape.
+ *
+ * A copy, so nothing aliases the decoded document; the *last* entry wins, so a
+ * document with two entries for one credential still answers with one, and the
+ * rewrite that follows a patch collapses them.
+ */
+function gateFrom(document: FileDocument, credential: string): CredentialGates {
+  let found: GateEntry | undefined;
+  for (const gate of document.gates) {
+    if (gate.credential === credential) found = gate;
+  }
+  if (found === undefined) return {};
+  return {
+    ...(found.cooldown === undefined ? {} : { cooldown: found.cooldown }),
+    ...(found.halt === undefined ? {} : { halt: found.halt }),
+  };
+}
+
+/** Whether gates carry anything at all; an empty pair is stored nowhere. */
+function hasGates(gates: CredentialGates): boolean {
+  return gates.cooldown !== undefined || gates.halt !== undefined;
+}
+
+/**
+ * Apply one patch to gates, field by field.
+ *
+ * A patch is a field-level write rather than a replacement because its caller
+ * knows about one field at a time: the dispatcher arms a halt without having
+ * read the cooldown, and clears that halt without knowing what else this
+ * process or a peer holds. `clearHalt` beats `halt` so that a caller which
+ * passes both gets the removal it asked for last.
+ */
+function applyGatePatch(gates: CredentialGates, patch: GatePatch): CredentialGates {
+  const next: CredentialGates = {};
+  if (gates.cooldown !== undefined) next.cooldown = gates.cooldown;
+  if (gates.halt !== undefined) next.halt = gates.halt;
+  if (patch.cooldown !== undefined) next.cooldown = patch.cooldown;
+  if (patch.clearHalt === true) delete next.halt;
+  else if (patch.halt !== undefined) next.halt = patch.halt;
+  return next;
+}
+
+/**
+ * Whether two sticky halts name the same halt.
+ *
+ * A field comparison rather than a deep-equal, because the identity pair is
+ * `string`/`number` or `null`/`null` and nothing else can be a `StickyHalt`: two
+ * halts with the same three fields are the same halt, whatever produced them.
+ */
+function sameSticky(a: StickyHalt | null | undefined, b: StickyHalt | null | undefined): boolean {
+  if (a === null || a === undefined) return a === b;
+  if (b === null || b === undefined) return false;
+  return a.note === b.note && a.claudePath === b.claudePath && a.claudeMtimeMs === b.claudeMtimeMs;
+}
+
+/**
+ * The sticky halt one document field states, or `undefined` when it states one
+ * this version cannot read.
+ *
+ * The identity is either a resolved install or the recorded fact that none could
+ * be resolved, and nothing in between: a path with no mtime, or an mtime with no
+ * path, would be a halt no later reader could compare against the install it was
+ * armed from, which is the one thing the pair is for. Fields are copied rather
+ * than trusted, so an unknown key in a hand edit cannot travel into the store's
+ * answer.
+ */
+function stickyHaltField(value: unknown): StickyHalt | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const s = value as Record<string, unknown>;
+  if (typeof s.note !== "string") return undefined;
+  if (s.claudePath === null && s.claudeMtimeMs === null) {
+    return { note: s.note, claudePath: null, claudeMtimeMs: null };
+  }
+  if (typeof s.claudePath !== "string") return undefined;
+  if (typeof s.claudeMtimeMs !== "number" || !Number.isFinite(s.claudeMtimeMs)) return undefined;
+  return { note: s.note, claudePath: s.claudePath, claudeMtimeMs: s.claudeMtimeMs };
+}
+
+/** The cooldown one gate states, or `undefined` when it states one that is not one. */
+function cooldownField(value: unknown): { at: number; note: string } | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const c = value as Record<string, unknown>;
+  if (typeof c.at !== "number" || !Number.isFinite(c.at)) return undefined;
+  if (typeof c.note !== "string") return undefined;
+  return { at: c.at, note: c.note };
+}
+
+/** The fault one gate fails on, named by the credential it claims when it claims a string. */
+function gateFault(credential: unknown, index: number): string {
+  return typeof credential === "string"
+    ? `gates for ${JSON.stringify(credential)} are invalid`
+    : `gate ${index + 1} is invalid`;
+}
+
+/** One gate of the document, validated, or the fault that makes the whole file unusable. */
+function fileGate(value: unknown, index: number): { gate: GateEntry } | { fault: string } {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return { fault: gateFault(undefined, index) };
+  }
+  const g = value as Record<string, unknown>;
+  if (typeof g.credential !== "string" || g.credential === "") {
+    return { fault: gateFault(g.credential, index) };
+  }
+  if (g.halt !== undefined && typeof g.halt !== "string") {
+    return { fault: gateFault(g.credential, index) };
+  }
+  let cooldown: { at: number; note: string } | undefined;
+  if (g.cooldown !== undefined) {
+    cooldown = cooldownField(g.cooldown);
+    if (cooldown === undefined) return { fault: gateFault(g.credential, index) };
+  }
+  return {
+    gate: {
+      credential: g.credential,
+      ...(cooldown === undefined ? {} : { cooldown }),
+      ...(typeof g.halt === "string" ? { halt: g.halt } : {}),
+    },
+  };
+}
+
+/**
  * Decode the document text, or name the one fault that discards it all.
  *
  * All-or-nothing is deliberate. The file is one writer's replacement of the
@@ -322,12 +524,43 @@ function decode(text: string): Decoded {
     if ("fault" in result) return result;
     entries.push(result.entry);
   }
-  return { entries };
+  const gates: GateEntry[] = [];
+  if (doc.gates !== undefined) {
+    if (!Array.isArray(doc.gates)) return { fault: "its gates are not a list" };
+    for (const [index, raw] of doc.gates.entries()) {
+      const result = fileGate(raw, index);
+      if ("fault" in result) return result;
+      gates.push(result.gate);
+    }
+  }
+  let stickyHalt: StickyHalt | undefined;
+  if (doc.stickyHalt !== undefined) {
+    stickyHalt = stickyHaltField(doc.stickyHalt);
+    if (stickyHalt === undefined) return { fault: "its sticky halt is invalid" };
+  }
+  return { entries, gates, ...(stickyHalt === undefined ? {} : { stickyHalt }) };
 }
 
-/** The document text one set of entries is published as. */
-function encode(entries: FileEntry[]): string {
-  return `${JSON.stringify({ version: READINGS_FILE_VERSION, entries }, null, 2)}\n`;
+/**
+ * The document text one document is published as.
+ *
+ * `gates` and `stickyHalt` are omitted rather than written empty or null: a
+ * file holding nothing but readings is the shape every version-2 writer can
+ * read, and a key that is absent cannot be mistaken for a value a later version
+ * gave a meaning to.
+ */
+function encode(document: FileDocument): string {
+  const { entries, gates, stickyHalt } = document;
+  return `${JSON.stringify(
+    {
+      version: READINGS_FILE_VERSION,
+      entries,
+      ...(gates.length === 0 ? {} : { gates }),
+      ...(stickyHalt === undefined ? {} : { stickyHalt }),
+    },
+    null,
+    2,
+  )}\n`;
 }
 
 /** The process-local cache key: a rail and the credential its entry belongs to, in one string no rail name can contain. */
@@ -487,15 +720,28 @@ async function writeAtomically(path: string, text: string): Promise<void> {
 }
 
 /**
- * The store: one shared file, two process-local maps, and the locks over it.
+ * The store: one shared file, a process-local cache per thing it holds, and the
+ * locks over it.
  *
- * The maps are what make the file an optimisation rather than a dependency.
+ * The caches are what make the file an optimisation rather than a dependency.
  * `overlay` holds every entry this process has read or produced, so a read
  * inside the TTL costs no file I/O at all; `inFlight` joins concurrent reads of
  * one key so this process never queues behind its *own* fetch lock and never
  * makes two requests for one rail. The file is what the overlay cannot express:
  * an entry another process wrote, and the record that survives this process
  * exiting.
+ *
+ * The refresh gates are not overlaid the same way. A gate is what stops this
+ * process paying again, so it must hold even when the file write fails — but a
+ * gate this process *did* publish must not go on hiding the file, or a peer's
+ * later clear or re-arm would be invisible here forever (the defect this
+ * replaces a permanent overlay for). So what is kept is only the operations this
+ * process has not yet published: `pendingGatePatches` and `pendingSticky`,
+ * applied on top of a freshly loaded document by `gates()`. A successful write
+ * retires exactly the operations it applied, by identity, and a failed one
+ * leaves them pending — the process-local fallback. A published op therefore
+ * stops shadowing the file the moment it lands, which is what lets a peer's
+ * clear be seen and keeps a failed write from being lost or resurrected.
  */
 export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
   const { path, pacing } = deps;
@@ -504,6 +750,8 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
 
   const overlay = new Map<string, CachedReadings>();
   const inFlight = new Map<string, InFlight>();
+  const pendingGatePatches = new Map<string, GatePatch[]>();
+  let pendingSticky: PendingSticky | undefined;
   const warningLines: string[] = [];
   const seenWarnings = new Set<string>();
 
@@ -540,30 +788,30 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
   }
 
   /**
-   * The document's entries, or none. Never throws: an absent file is an empty
+   * The document, or an empty one. Never throws: an absent file is an empty
    * store, and any other read failure is treated the same because a cache the
    * process cannot read is a cache it does not have. Only a file that *was* read
    * and could not be decoded warns, because that is the one case where a user
    * can act on what the report tells them.
    */
-  async function loadEntries(): Promise<FileEntry[]> {
+  async function loadDocument(): Promise<FileDocument> {
     let text: string;
     try {
       text = await readFile(path, "utf8");
     } catch {
-      return [];
+      return { entries: [], gates: [] };
     }
     const decoded = decode(text);
     if ("fault" in decoded) {
       warn(decoded.fault);
-      return [];
+      return { entries: [], gates: [] };
     }
-    return decoded.entries;
+    return decoded;
   }
 
   /** The entry the file holds for `key`, at any age, or `undefined`. */
   async function entryFromFile(key: string): Promise<CachedReadings | undefined> {
-    return newestFor(await loadEntries(), key);
+    return newestFor((await loadDocument()).entries, key);
   }
 
   /**
@@ -619,9 +867,9 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
     const key = storeKey(rail, credential);
     try {
       const placed = await withLockPath(fileLock, writePacing, now, sleep, async () => {
-        const loaded = await loadEntries();
-        const merged = mergeEntry(newestFor(loaded, key), entry);
-        const others = loaded.filter((e) => entryKey(e) !== key);
+        const loaded = await loadDocument();
+        const merged = mergeEntry(newestFor(loaded.entries, key), entry);
+        const others = loaded.entries.filter((e) => entryKey(e) !== key);
         others.push({
           rail,
           credential,
@@ -629,7 +877,7 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
           latest: merged.latest,
           ...(merged.lastGood === undefined ? {} : { lastGood: merged.lastGood }),
         });
-        await writeAtomically(path, encode(others));
+        await writeAtomically(path, encode({ ...loaded, entries: others }));
         return merged;
       });
       if (placed.ok) return placed.value;
@@ -801,5 +1049,164 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
     return asReadings(entry);
   }
 
-  return { read, known, warnings: () => warningLines };
+  /**
+   * The gates one credential's next refresh ping obeys.
+   *
+   * The file is the base and the unpublished operations are the delta, so a
+   * peer's write in between is never hidden: the document is freshly loaded and
+   * the queue applied on top of it, one credential at a time. A pending clear's
+   * `expected` is compared against *this* document, which is what makes an
+   * unwritten clear hide only the halt it actually saw rather than whatever a
+   * peer armed meanwhile.
+   */
+  async function gates(credential: string): Promise<RefreshGates> {
+    const document = await loadDocument();
+    let credentialGates = gateFrom(document, credential);
+    for (const patch of pendingGatePatches.get(credential) ?? []) {
+      credentialGates = applyGatePatch(credentialGates, patch);
+    }
+    let sticky: StickyHalt | undefined = document.stickyHalt;
+    if (pendingSticky !== undefined) {
+      if (pendingSticky.kind === "set") sticky = pendingSticky.sticky;
+      else if (pendingSticky.expected === undefined) sticky = undefined;
+      else if (sameSticky(document.stickyHalt, pendingSticky.expected)) sticky = undefined;
+    }
+    return {
+      ...credentialGates,
+      ...(sticky === undefined ? {} : { sticky }),
+    };
+  }
+
+  /**
+   * A field-level write of one credential's gates.
+   *
+   * The patch is queued before the file is touched, so it protects this process
+   * whether or not the write lands, and `gates()` applies it on top of whatever
+   * the file holds. The locked read-modify-write re-applies every operation this
+   * process still owes — not just the new one — to the document as it is *now*,
+   * so a patch that follows a failed write merges rather than replaces it: a
+   * halt armed against an unwritable file survives the next cooldown patch, and
+   * a halt cleared against an unwritable file is not resurrected by one.
+   *
+   * Retiring an operation by identity is what keeps the file authoritative
+   * again after publication: only the operations actually written and applied
+   * leave the queue, so one queued while this write awaited the lock survives,
+   * and the process stops shadowing a gate it no longer has to protect. The
+   * snapshot and the retire both happen *inside* the lock — the snapshot after
+   * the document is loaded, the retire immediately after a successful publish
+   * — because releasing the lock is itself an await, and a peer can clear the
+   * gate before it resolves. Leaving a published operation pending across that
+   * window would let an overlapping write snapshot and resurrect it; an
+   * overlapping call may also have published and retired an earlier operation
+   * before this one acquired the lock, which a pre-lock snapshot would replay.
+   *
+   * A failed write is deliberately silent, like every other write here: the
+   * gates are protection, not state the caller asked for, and a read-only
+   * directory must not turn arming one into an error. The cost is that the
+   * protection stays process-local until a write succeeds.
+   */
+  async function setGates(credential: string, patch: GatePatch): Promise<void> {
+    const queued = pendingGatePatches.get(credential);
+    if (queued === undefined) pendingGatePatches.set(credential, [patch]);
+    else queued.push(patch);
+    try {
+      await withLockPath(fileLock, writePacing, now, sleep, async () => {
+        const loaded = await loadDocument();
+        // The snapshot is taken here, not before the lock: a call that
+        // overlapped this one may have already published and retired an
+        // operation, and replaying it would write back a gate the file no
+        // longer holds. An operation pushed after this point stays queued for
+        // its own flush, because retiring is by identity against this list.
+        const applied = (pendingGatePatches.get(credential) ?? []).slice();
+        if (applied.length === 0) return;
+        let next = gateFrom(loaded, credential);
+        for (const op of applied) next = applyGatePatch(next, op);
+        const gates: GateEntry[] = [];
+        let replaced = false;
+        for (const gate of loaded.gates) {
+          if (gate.credential !== credential) {
+            gates.push(gate);
+            continue;
+          }
+          // A second entry for the same credential is dropped rather than
+          // written back: `gateFrom` reads the last one, so the entries written
+          // here are the only ones that could be current, and leaving the older
+          // one would resurrect values the operations replaced.
+          if (replaced) continue;
+          replaced = true;
+          if (hasGates(next)) gates.push({ credential, ...next });
+        }
+        if (!replaced && hasGates(next)) gates.push({ credential, ...next });
+        await writeAtomically(path, encode({ ...loaded, gates }));
+        // Retire while the lock is still held: only a write that returned
+        // published these operations, and a delayed or failed release must not
+        // leave them pending for an overlapping write to replay.
+        retireGateOps(credential, applied);
+      });
+    } catch {
+      // Silent: the queue already holds the answer, and a cache that could not
+      // be written must not fail the read that is relying on the gate.
+    }
+  }
+
+  /** Drop the operations a successful write applied, by identity, leaving any queued after it. */
+  function retireGateOps(credential: string, applied: readonly GatePatch[]): void {
+    const remaining = (pendingGatePatches.get(credential) ?? []).filter((op) => !applied.includes(op));
+    if (remaining.length === 0) pendingGatePatches.delete(credential);
+    else pendingGatePatches.set(credential, remaining);
+  }
+
+  /**
+   * Set the machine-wide sticky halt, or clear it.
+   *
+   * A conditional clear (`expected`) is the one that matters: a reader that saw
+   * a halt and then found the resolved `claude` unchanged must not erase a halt
+   * a peer armed from a *different* install in between, so it clears only the
+   * halt it saw. That comparison happens inside the lock, against the document
+   * the write will publish — comparing outside it would let a peer's replacement
+   * land in the window and be deleted unconditionally. An unconditional clear is
+   * the user's `/quota-dispatch refresh`, which is a statement about the machine
+   * and needs no comparison.
+   *
+   * The write is best effort for the same reason `setGates`' is, and the pending
+   * operation carries the protection either way: a clear leaves this process
+   * hiding the halt it named, so a failed write cannot resurrect it locally.
+   *
+   * A conditional clear that finds the halt it named already gone writes
+   * nothing at all. It is a no-op, not an empty publish: there is no change to
+   * make, and replacing the file would churn its inode (and, to a peer watching
+   * the path, look like a fresh write).
+   *
+   * The pending operation is retired inside the lock — after a successful write,
+   * or after a no-op decision — and only while it is still the newest, so a
+   * newer operation queued during the await keeps governing `gates()` and a
+   * delayed or failed lock release cannot leave a published one pending.
+   */
+  async function setStickyHalt(sticky: StickyHalt | undefined, expected?: StickyHalt): Promise<void> {
+    const op: PendingSticky = sticky !== undefined
+      ? { kind: "set", sticky }
+      : (expected === undefined ? { kind: "clear" } : { kind: "clear", expected });
+    pendingSticky = op;
+    try {
+      await withLockPath(fileLock, writePacing, now, sleep, async () => {
+        const loaded = await loadDocument();
+        // The expected halt is gone (or replaced), so the clear does not apply:
+        // leave the document and the file exactly as they are, but retire the
+        // operation — it asked for a change that needs no making.
+        if (op.kind === "clear" && op.expected !== undefined && !sameSticky(loaded.stickyHalt, op.expected)) {
+          if (pendingSticky === op) pendingSticky = undefined;
+          return;
+        }
+        const document: FileDocument = { ...loaded };
+        if (op.kind === "set") document.stickyHalt = op.sticky;
+        else delete document.stickyHalt;
+        await writeAtomically(path, encode(document));
+        if (pendingSticky === op) pendingSticky = undefined;
+      });
+    } catch {
+      // Silent: see `setGates`.
+    }
+  }
+
+  return { read, known, gates, setGates, setStickyHalt, warnings: () => warningLines };
 }
