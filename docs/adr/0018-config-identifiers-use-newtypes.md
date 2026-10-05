@@ -9,17 +9,17 @@ genuinely different: an agent name must be a single path segment that does not
 shadow `Object.prototype`, a model id must contain `/`, and a skill name must be
 one an explicit `/skill:` invocation could produce.
 
-[ADR 0017](0017-config-identifiers-stay-plain-strings.md) asked whether those
-validated identifiers should carry distinct types, and declined. The benefit was
-real — `agentKey(modelId)` would fail to compile — but the spike measured the
-cost as 257 compiler diagnostics across twelve test and fixture files, and the
-decision was that the tests would pay for a compile-time-only guarantee every
-time someone read them. It adopted named-argument records and factories instead.
+An earlier exploration asked whether those validated identifiers should carry
+distinct types, and declined. The benefit was real — `agentKey(modelId)` would
+fail to compile — but the measured cost was 257 compiler diagnostics across
+twelve test and fixture files, and the conclusion was that the tests would pay
+for a compile-time-only guarantee every time someone read them. It adopted
+named-argument records and factories instead. That exploration was never merged
+and governed no merged code, so no record of it is kept here.
 
-Issue #74 revisits that trade: it accepts the migration cost deliberately, to
+Issue #74 revisits the trade and accepts the migration cost deliberately, to
 establish the newtype pattern for future code rather than to answer a defect.
-This ADR is the decision in force, and it supersedes 0017. The old spike
-measurements remain in 0017 as the historical record.
+This ADR is the decision.
 
 The two rules from `CODING_STANDARDS.md` that meet here are "after data is
 validated it should be given a new type, even if the underlying type is still
@@ -65,9 +65,7 @@ export type SkillName = Opaque<string, typeof skillNameTag>;
 The tag class's field is `private`, so the opaque type cannot be produced by
 structural construction, and the tags are erased — there is no runtime class,
 symbol or wrapper. This is the idiom from
-[microsoft/TypeScript#4895](https://github.com/microsoft/TypeScript/issues/4895#issuecomment-401067935),
-and it is the same strength as 0017's spike encoding; the spike's shared symbol
-with a per-role literal tag was a marginally weaker spelling of one idea.
+[microsoft/TypeScript#4895](https://github.com/microsoft/TypeScript/issues/4895#issuecomment-401067935).
 
 The encoding, the tags and the raw validation rules live in `src/identifiers.ts`
 and nothing else constructs a brand. Each role has one checked producer:
@@ -166,7 +164,7 @@ plain `Object.entries` and validate each key there.
 
 Recovery is not membership. A branded key does not prove the table holds an
 entry — this repo does not enable `noUncheckedIndexedAccess` — so the
-`Object.hasOwn` guards stay, exactly where 0017 argued they must.
+`Object.hasOwn` guards stay on their own terms.
 
 Prototype-named skills are preserved deliberately. `SkillName` admits
 `__proto__` and `constructor`, because pi may load such a skill and this seam
@@ -190,14 +188,16 @@ holding.
 
 ## Considered options
 
-**Stay plain strings (ADR 0017).** Superseded. The cost it declined is now
-accepted, and the narrow benefit — role separation that survives inside a
-record — is the point of the migration rather than a side effect.
+**Stay plain strings.** The alternative the earlier exploration chose. The cost
+it declined is now accepted, and the narrow benefit — role separation that
+survives inside a record — is the point of the migration rather than a side
+effect.
 
 **Brand only `ModelId`, or brand at the config seam only.** Both were measured
-in 0017's spike (142 and 174 diagnostics) and both were rejected then and now:
-branding one role leaves the others interchangeable, and a seam-only brand is
-exactly what the consumers cannot name, so the churn does not shrink, it moves.
+during the earlier exploration (142 and 174 compiler diagnostics) and both are
+rejected: branding one role leaves the others interchangeable, and a seam-only
+brand is exactly what the consumers cannot name, so the churn does not shrink,
+it moves.
 
 **Re-key the tables as `Map<AgentName, …>`.** A `Map` keeps the key brand
 through iteration and demands one from `get`/`has`; it would remove the
@@ -225,8 +225,8 @@ permissive escape hatch or make the evidence unrepresentable.
 The identifier vocabulary is now half compile-checked and half raw, by design:
 the boundary is "validated configuration" on one side and "untrusted evidence"
 on the other. New same-typed seams should still reach for a record or a factory
-first, as 0017 adopted, and reach for a brand when the value is a validated
-domain identifier that flows across a module boundary.
+first, and reach for a brand when the value is a validated domain identifier
+that flows across a module boundary.
 
 The pattern is established for future code: a new validated identifier is a new
 opaque type plus a checked producer in `identifiers.ts`, and a new validated
