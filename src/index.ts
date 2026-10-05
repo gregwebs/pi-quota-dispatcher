@@ -848,7 +848,7 @@ function budgetSummary(reading: RailReading): string {
  * match it. `dir` is resolved too, so a relative or trailing-slash `agentDir`
  * compares the same way.
  */
-function isInside(dir: string, file: string): boolean {
+function isInside({ dir, file }: { dir: string; file: string }): boolean {
   const root = resolve(dir);
   const target = resolve(file);
   return target === root || target.startsWith(root + sep);
@@ -920,7 +920,7 @@ export function decide(
   droppedAlternates: readonly DroppedAlternate[] = [],
 ): Decision {
   const { agent, file } = definition;
-  if (!isInside(cfg.agentDir, file)) {
+  if (!isInside({ dir: cfg.agentDir, file })) {
     return {
       agent,
       kind: "hold",
@@ -1140,7 +1140,7 @@ function pinnedWhy(droppedAlternates: readonly DroppedAlternate[]): string {
   if (!droppedAlternates.length) return "no alternate configured";
   return withNotes(
     "every alternate was dropped — pinned to the primary",
-    droppedAlternates.map((dropped) => unknownModelNote(dropped.key, dropped.model)),
+    droppedAlternates.map(unknownModelNote),
   );
 }
 
@@ -1168,7 +1168,7 @@ export function heldDecision(held: { agent: string; model: string }): Decision {
     // The primary's own key, so the reader gets the line to edit rather than
     // having to work out which of the agent's candidates this is. The wording is
     // the model check's, shared with the note a dropped alternate earns.
-    why: `${unknownModelNote(`${agentKey(held.agent)}.primary.model`, held.model)}; holding`,
+    why: `${unknownModelNote({ key: `${agentKey(held.agent)}.primary.model`, model: held.model })}; holding`,
   };
 }
 
@@ -1892,7 +1892,7 @@ const UNKNOWN_MODEL_SUMMARY = "quota-dispatcher: a configured model is unknown t
 export function unknownModelsNotice(misses: ModelMiss[], configPaths: string[]): string[] {
   return [
     UNKNOWN_MODEL_SUMMARY,
-    ...misses.map((miss) => unknownModelNote(miss.key, miss.model)),
+    ...misses.map(unknownModelNote),
     // The action last, so the occurrences above it read as the evidence for it
     // rather than as a list trailing off an instruction.
     `Edit ${configPaths.join(" or ")}, then /reload, or upgrade pi.`,
