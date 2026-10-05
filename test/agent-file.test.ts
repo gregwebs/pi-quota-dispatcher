@@ -38,6 +38,7 @@ import {
   replaceFileAtomically,
   withFileLock,
 } from "../src/index.ts";
+import { modelId } from "./helpers/identifiers.ts";
 import {
   FAST,
   assertCleanExit,
@@ -121,7 +122,7 @@ test("a coordinated write lands the model and its level and leaves the rest of t
   await writeFile(file, agentFileText("a/b"), "utf8");
 
   const result = await applyDecision(
-    { file, model: "c/d", thinking: "high", base: "a/b", dry: false },
+    { file, model: modelId("c/d"), thinking: "high", base: "a/b", dry: false },
     { pacing: FAST },
   );
   assert.deepEqual(result, { kind: "written" });
@@ -142,7 +143,7 @@ test("an unrelated edit made after the pass read the file survives the write", a
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
   // The pass has read the file: `base` is what it saw.
-  const write = { file, model: "c/d", base: "a/b", dry: false };
+  const write = { file, model: modelId("c/d"), base: "a/b", dry: false };
   await writeFile(file, `${agentFileText("a/b")}\nA note added by hand.\n`, "utf8");
 
   assert.deepEqual(await applyDecision(write, { pacing: FAST }), { kind: "written" });
@@ -167,7 +168,7 @@ test("an edit another process makes while a pass waits survives that pass's writ
   const { done } = spawnFixture({
     kind: "apply",
     file,
-    model: "c/d",
+    model: modelId("c/d"),
     base: "a/b",
     pacing: FAST,
     readyMarker: ready,
@@ -203,7 +204,7 @@ test("the write reads the file after the lock, so an edit made while it waits su
   let noted = false;
   const note = "\nA note added while the pass waited.\n";
   const pending = applyDecision(
-    { file, model: "c/d", base: "a/b", dry: false },
+    { file, model: modelId("c/d"), base: "a/b", dry: false },
     {
       pacing: { staleMs: 10_000, waitMs: 5_000, pollMs: 2 },
       // The pass sleeps only while a live holder blocks it, which is exactly the
@@ -238,7 +239,7 @@ test("a file another pass already brought to the target is unchanged", async () 
   await writeFile(file, agentFileText("c/d"), "utf8");
 
   assert.deepEqual(
-    await applyDecision({ file, model: "c/d", base: "a/b", dry: false }, { pacing: FAST }),
+    await applyDecision({ file, model: modelId("c/d"), base: "a/b", dry: false }, { pacing: FAST }),
     { kind: "unchanged" },
   );
   assert.equal(await readFile(file, "utf8"), agentFileText("c/d"));
@@ -257,7 +258,7 @@ test("a pass with nothing to write takes no lock", async () => {
     const started = Date.now();
     assert.deepEqual(
       await applyDecision(
-        { file, model: "c/d", base: "c/d", dry: false },
+        { file, model: modelId("c/d"), base: "c/d", dry: false },
         { pacing: { staleMs: 10_000, waitMs: 30, pollMs: 2 } },
       ),
       { kind: "unchanged" },
@@ -279,7 +280,7 @@ test("an agent dir that cannot hold a lock file still reports an unchanged agent
   await chmod(dir, 0o555);
   try {
     assert.deepEqual(
-      await applyDecision({ file, model: "c/d", base: "c/d", dry: false }, { pacing: FAST }),
+      await applyDecision({ file, model: modelId("c/d"), base: "c/d", dry: false }, { pacing: FAST }),
       { kind: "unchanged" },
     );
   } finally {
@@ -294,12 +295,27 @@ test("a conflicting assignment is held, and the reason names both models", async
   // The pass read `a/b`; another process assigned `x/y` before this write.
   await writeFile(file, agentFileText("x/y"), "utf8");
 
-  const result = await applyDecision({ file, model: "c/d", base: "a/b", dry: false }, { pacing: FAST });
+  const result = await applyDecision({ file, model: modelId("c/d"), base: "a/b", dry: false }, { pacing: FAST });
   if (result.kind !== "held") assert.fail(`expected a hold, got ${JSON.stringify(result)}`);
   assert.match(result.why, /another pi process/);
   assert.match(result.why, /"x\/y"/, "the reason must name the assignment it refused to overwrite");
   assert.match(result.why, /"c\/d"/, "the reason must name the model this pass wanted");
   assert.equal(await readFile(file, "utf8"), agentFileText("x/y"), "a held write must leave the file alone");
+});
+
+// The model a conflicting file carries is evidence, not a validated value, so a
+// malformed spelling survives the refusal and is named as it stands rather than
+// being rejected on the way into the reason.
+test("a malformed raw model on disk survives conflict detection and is named verbatim", async () => {
+  const dir = await agentDir("raw-conflict");
+  const file = join(dir, "agent.md");
+  await writeFile(file, agentFileText("a/b"), "utf8");
+  await writeFile(file, agentFileText("nomodel"), "utf8");
+
+  const result = await applyDecision({ file, model: modelId("c/d"), base: "a/b", dry: false }, { pacing: FAST });
+  if (result.kind !== "held") assert.fail(`expected a hold, got ${JSON.stringify(result)}`);
+  assert.match(result.why, /"nomodel"/, "the raw spelling must be reported as it stands");
+  assert.equal(await readFile(file, "utf8"), agentFileText("nomodel"));
 });
 
 // `undefined` is not a model, and a reason that named it would send the reader
@@ -311,7 +327,7 @@ test("a file whose model line vanished mid-pass is held in words that name no mo
   const after = `---\nname: agent\ntools: read\n---\n\nBody.\n`;
   await writeFile(file, after, "utf8");
 
-  const result = await applyDecision({ file, model: "c/d", base: "a/b", dry: false }, { pacing: FAST });
+  const result = await applyDecision({ file, model: modelId("c/d"), base: "a/b", dry: false }, { pacing: FAST });
   if (result.kind !== "held") assert.fail(`expected a hold, got ${JSON.stringify(result)}`);
   assert.match(result.why, /another pi process removed the model line from this file mid-pass/);
   assert.doesNotMatch(result.why, /undefined/);
@@ -323,14 +339,14 @@ test("a missing file, and a file with no usable frontmatter, are skipped rather 
   const dir = await agentDir("skip");
   const absent = join(dir, "absent.md");
   assert.deepEqual(
-    await applyDecision({ file: absent, model: "c/d", base: undefined, dry: false }, { pacing: FAST }),
+    await applyDecision({ file: absent, model: modelId("c/d"), base: undefined, dry: false }, { pacing: FAST }),
     { kind: "skipped (no file)" },
   );
 
   const bare = join(dir, "bare.md");
   await writeFile(bare, "no frontmatter here\n", "utf8");
   assert.deepEqual(
-    await applyDecision({ file: bare, model: "c/d", base: undefined, dry: false }, { pacing: FAST }),
+    await applyDecision({ file: bare, model: modelId("c/d"), base: undefined, dry: false }, { pacing: FAST }),
     { kind: "skipped (no frontmatter)" },
   );
   assert.equal(await readFile(bare, "utf8"), "no frontmatter here\n");
@@ -342,7 +358,7 @@ test("a dry pass reports what a write would do and touches nothing", async () =>
   await writeFile(file, agentFileText("a/b"), "utf8");
 
   assert.deepEqual(
-    await applyDecision({ file, model: "c/d", base: "a/b", dry: true }, { pacing: FAST }),
+    await applyDecision({ file, model: modelId("c/d"), base: "a/b", dry: true }, { pacing: FAST }),
     { kind: "would-write" },
   );
   assert.equal(await readFile(file, "utf8"), agentFileText("a/b"));
@@ -364,7 +380,7 @@ test("a dry pass answers even while another process holds the lock", async () =>
     const started = Date.now();
     assert.deepEqual(
       await applyDecision(
-        { file, model: "c/d", base: "a/b", dry: true },
+        { file, model: modelId("c/d"), base: "a/b", dry: true },
         { pacing: { staleMs: 10_000, waitMs: 30, pollMs: 2 } },
       ),
       { kind: "would-write" },
@@ -383,7 +399,7 @@ test("a dry pass reports a conflicting assignment it can see", async () => {
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("x/y"), "utf8");
 
-  const result = await applyDecision({ file, model: "c/d", base: "a/b", dry: true }, { pacing: FAST });
+  const result = await applyDecision({ file, model: modelId("c/d"), base: "a/b", dry: true }, { pacing: FAST });
   if (result.kind !== "held") assert.fail(`expected a hold, got ${JSON.stringify(result)}`);
   assert.match(result.why, /"x\/y"/);
 });
@@ -447,7 +463,7 @@ test("the file's permission bits survive the replacement", async () => {
   await writeFile(file, agentFileText("a/b"), { mode: 0o600 });
 
   assert.deepEqual(
-    await applyDecision({ file, model: "c/d", base: "a/b", dry: false }, { pacing: FAST }),
+    await applyDecision({ file, model: modelId("c/d"), base: "a/b", dry: false }, { pacing: FAST }),
     { kind: "written" },
   );
   assert.equal((await stat(file)).mode & 0o777, 0o600, "the replacement changed the file's mode");
@@ -481,7 +497,7 @@ test("a reader never sees a partial file while it is being rewritten", async () 
   for (let round = 0; round < 50; round += 1) {
     const next = round % 2 === 0 ? "c/1" : "c/2";
     assert.deepEqual(
-      await applyDecision({ file, model: next, base: current, dry: false }, { pacing: FAST }),
+      await applyDecision({ file, model: modelId(next), base: current, dry: false }, { pacing: FAST }),
       { kind: "written" },
     );
     current = next;
@@ -504,7 +520,7 @@ test("a symlinked agent file is written through, not replaced by a regular file"
   await symlink(target, link);
 
   assert.deepEqual(
-    await applyDecision({ file: link, model: "c/d", base: "a/b", dry: false }, { pacing: FAST }),
+    await applyDecision({ file: link, model: modelId("c/d"), base: "a/b", dry: false }, { pacing: FAST }),
     { kind: "written" },
   );
   assert.equal((await lstat(link)).isSymbolicLink(), true, "the user's symlink was replaced");
@@ -527,7 +543,7 @@ test("a write through a symlink waits behind the target's own lock", async () =>
   const holder = await startHolder(target);
   try {
     const refused = await applyDecision(
-      { file: link, model: "c/d", base: "a/b", dry: false },
+      { file: link, model: modelId("c/d"), base: "a/b", dry: false },
       { pacing: { staleMs: 10_000, waitMs: 30, pollMs: 2 } },
     );
     if (refused.kind !== "held") assert.fail(`expected a hold, got ${JSON.stringify(refused)}`);
@@ -564,7 +580,7 @@ test("a retarget must not redirect a publication into another locked file", asyn
   let retargeted = false;
   try {
     const result = await applyDecision(
-      { file: a, model: "c/d", base: "a/b", dry: false },
+      { file: a, model: modelId("c/d"), base: "a/b", dry: false },
       {
         pacing: { staleMs: 10_000, waitMs: 2_000, pollMs: 2 },
         // The wait on A's lock is the only window a pass gives up, so the
@@ -856,7 +872,7 @@ test("a lock record with an unusable timestamp ages out on the lock's mtime", as
   await writeFile(lock, `{"pid": ${process.pid}, "host": "elsewhere", "at": 1e400}\n`, "utf8");
 
   const held = await applyDecision(
-    { file, model: "c/d", base: "a/b", dry: false },
+    { file, model: modelId("c/d"), base: "a/b", dry: false },
     { pacing: { staleMs: 10_000, waitMs: 20, pollMs: 2 } },
   );
   assert.equal(held.kind, "held", `a fresh unconfirmable lock should not be evicted: ${JSON.stringify(held)}`);
@@ -865,7 +881,7 @@ test("a lock record with an unusable timestamp ages out on the lock's mtime", as
   await utimes(lock, old, old);
   assert.deepEqual(
     await applyDecision(
-      { file, model: "c/d", base: "a/b", dry: false },
+      { file, model: modelId("c/d"), base: "a/b", dry: false },
       { pacing: { staleMs: 10_000, waitMs: 200, pollMs: 2 } },
     ),
     { kind: "written" },
@@ -887,7 +903,7 @@ test("a record whose timestamp is in the future ages out on the lock's mtime", a
   await writeFile(lock, `{"pid": ${process.pid}, "host": "elsewhere", "at": ${future}}\n`, "utf8");
 
   const held = await applyDecision(
-    { file, model: "c/d", base: "a/b", dry: false },
+    { file, model: modelId("c/d"), base: "a/b", dry: false },
     { pacing: { staleMs: 10_000, waitMs: 20, pollMs: 2 } },
   );
   assert.equal(held.kind, "held", `a fresh future-stamped lock should not be evicted: ${JSON.stringify(held)}`);
@@ -896,7 +912,7 @@ test("a record whose timestamp is in the future ages out on the lock's mtime", a
   await utimes(lock, old, old);
   assert.deepEqual(
     await applyDecision(
-      { file, model: "c/d", base: "a/b", dry: false },
+      { file, model: modelId("c/d"), base: "a/b", dry: false },
       { pacing: { staleMs: 10_000, waitMs: 200, pollMs: 2 } },
     ),
     { kind: "written" },
@@ -917,7 +933,7 @@ test("a record with no host is read as this host, so its live pid is not aged ou
   await writeFile(lock, `{"pid": ${process.pid}, "at": ${Date.now() - 60_000}}\n`, "utf8");
 
   const result = await applyDecision(
-    { file, model: "c/d", base: "a/b", dry: false },
+    { file, model: modelId("c/d"), base: "a/b", dry: false },
     { pacing: { staleMs: 10_000, waitMs: 20, pollMs: 2 } },
   );
   assert.equal(result.kind, "held", `a hostless live record was aged out: ${JSON.stringify(result)}`);
@@ -932,7 +948,7 @@ test("a write refuses while another process holds the lock, and lands once it le
 
   const holder = await startHolder(file);
   const refused = await applyDecision(
-    { file, model: "c/d", base: "a/b", dry: false },
+    { file, model: modelId("c/d"), base: "a/b", dry: false },
     { pacing: { staleMs: 10_000, waitMs: 30, pollMs: 2 } },
   );
   if (refused.kind !== "held") assert.fail(`expected a hold, got ${JSON.stringify(refused)}`);
@@ -944,7 +960,7 @@ test("a write refuses while another process holds the lock, and lands once it le
   assert.equal(exited.signal, null, `the holder was killed: ${exited.stderr}`);
 
   assert.deepEqual(
-    await applyDecision({ file, model: "c/d", base: "a/b", dry: false }, { pacing: FAST }),
+    await applyDecision({ file, model: modelId("c/d"), base: "a/b", dry: false }, { pacing: FAST }),
     { kind: "written" },
   );
   assert.equal(await modelIn(file), "c/d");
@@ -973,7 +989,7 @@ test("a lock left by a killed process is taken over at once", async () => {
   const started = Date.now();
   assert.deepEqual(
     await applyDecision(
-      { file, model: "c/d", base: "a/b", dry: false },
+      { file, model: modelId("c/d"), base: "a/b", dry: false },
       { pacing: { staleMs: 30_000, waitMs: 200, pollMs: 5 } },
     ),
     { kind: "written" },
@@ -995,7 +1011,7 @@ test("children assigning the same model converge on one complete file", async ()
 
   const results = await runTogether<WriteResult>(
     dir,
-    Array.from({ length: 5 }, () => ({ kind: "apply", file, model: "c/d", base: "a/b", pacing: FAST })),
+    Array.from({ length: 5 }, () => ({ kind: "apply", file, model: modelId("c/d"), base: "a/b", pacing: FAST })),
   );
 
   assert.equal(

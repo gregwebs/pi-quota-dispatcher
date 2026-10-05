@@ -11,13 +11,15 @@ import {
 } from "../src/index.ts";
 import { agentNameRejection, configFilesFor, describeConfig, globalConfigPath, loadConfig, mergeConfig } from "../src/config.ts";
 
-const MODEL = "deepseek/deepseek-flash";
+import { agentName, agentTable, modelId } from "./helpers/identifiers.ts";
+
+const MODEL = modelId("deepseek/deepseek-flash");
 const route: AgentRoute = { primary: { model: MODEL, rail: "deepseek" }, alternates: [] };
 const text = (name?: string, model = "deepseek/old") =>
   `---\n${name === undefined ? "" : `name: ${name}\n`}model: "${model}"\n---\n\nBody.\n`;
 const config = (dir: string, names: string[]): DispatcherConfig => ({
   ...DEFAULT_CONFIG, agentDir: dir, readingsPath: join(dir, "quota-dispatch-readings.json"),
-  agents: Object.fromEntries(names.map((n) => [n, route])),
+  agents: agentTable(Object.fromEntries(names.map((n) => [n, route]))),
 });
 async function fixture(t: TestContext, entries: Record<string, string>) {
   const dir = await mkdtemp(join(tmpdir(), "pqd-names-"));
@@ -55,7 +57,7 @@ for (const declared of ["Architect", '"  Architect  "', "' Architect '", "Archit
   test(`a declared name ${declared} writes its defining file, not the path /agents would create`, async (t) => {
     const dir = await fixture(t, { "plan-work.md": text(declared) });
     const cfg = config(dir, ["Architect"]);
-    assert.deepEqual(resolveAgent(await readAgentDirectory(dir), "Architect"), { kind: "defined", definition: { agent: "Architect", file: join(dir, "plan-work.md") } });
+    assert.deepEqual(resolveAgent(await readAgentDirectory(dir), agentName("Architect")), { kind: "defined", definition: { agent: "Architect", file: join(dir, "plan-work.md") } });
     assert.deepEqual(checkAgentFiles(cfg, await readAgentDirectory(dir), () => {}), []);
     const [result] = await createDispatcher(cfg).evaluate({ dry: false });
     assert.equal(result.outcome, "written");
@@ -70,7 +72,7 @@ test("an occupied route path is missing, never clobbered, and warns about its re
   const dir = await fixture(t, { "plan-work.md": before });
   const cfg = config(dir, ["plan-work"]);
   const d = await readAgentDirectory(dir);
-  const resolution = resolveAgent(d, "plan-work");
+  const resolution = resolveAgent(d, agentName("plan-work"));
   assert.equal(resolution.kind, "missing");
   assert.equal(resolution.kind === "missing" ? resolution.occupant : undefined, d.files[0]);
   const [warning] = checkAgentFiles(cfg, d, () => {});
@@ -87,7 +89,7 @@ test("resolution is exact-case and recomputed after a name changes between passe
   const dir = await fixture(t, { "work.md": text("Plan") });
   const cfg = config(dir, ["Plan", "plan"]);
   const dispatcher = createDispatcher(cfg);
-  assert.equal(resolveAgent(await readAgentDirectory(dir), "plan").kind, "missing");
+  assert.equal(resolveAgent(await readAgentDirectory(dir), agentName("plan")).kind, "missing");
   const first = await dispatcher.evaluate({ dry: false });
   assert.deepEqual(first.map((r) => [r.decision.agent, r.outcome]), [["Plan", "written"], ["plan", "skipped (no file)"]]);
   await writeFile(join(dir, "work.md"), text("plan"));
@@ -101,7 +103,7 @@ for (const order of [["z.md", "A.md"], ["A.md", "z.md"]]) {
     const dir = await fixture(t, Object.fromEntries(order.map((f) => [f, before])));
     const cfg = config(dir, ["reviewer"]);
     const d = await readAgentDirectory(dir);
-    const resolution = resolveAgent(d, "reviewer");
+    const resolution = resolveAgent(d, agentName("reviewer"));
     assert.equal(resolution.kind, "contested");
     if (resolution.kind !== "contested") assert.fail("expected contest");
     assert.deepEqual(resolution.files.map((f) => basename(f.file)), ["A.md", "z.md"]);
@@ -138,7 +140,7 @@ test("discovery sorts filenames, decodes names, falls back on empty, and disting
   const proposed = JSON.parse(agentTableSnippet(files).join("\n")).agents;
   assert.deepEqual(Object.keys(proposed).sort(), ["Alpha", "Zulu", "a:b", "bare", "empty", "none"]);
   assert.equal(proposed.Zulu.primary.model, MODEL);
-  assert.equal(resolveAgent({ dir, files }, "acme:scout").kind, "missing");
+  assert.equal(resolveAgent({ dir, files }, agentName("acme:scout")).kind, "missing");
 });
 
 test("snippet proposes the declared identity, omits every contestant even if only one has a usable model", async (t) => {
@@ -165,7 +167,7 @@ test("an unreadable file defines and contests nothing; its route skips without r
   const d = await readAgentDirectory(dir);
   const unreadable = d.files.find((f) => f.kind === "agent" && f.name === "secret");
   assert.deepEqual(unreadable, { kind: "agent", name: "secret", file: secret, unreadable: true });
-  const resolution = resolveAgent(d, "secret");
+  const resolution = resolveAgent(d, agentName("secret"));
   assert.equal(resolution.kind, "missing");
   assert.equal(resolution.kind === "missing" ? resolution.occupant : undefined, unreadable);
   const cfg = config(dir, ["secret", "ok"]);
@@ -178,7 +180,7 @@ test("an unreadable file defines and contests nothing; its route skips without r
   assert.equal(results.find((r) => r.decision.agent === "secret")?.outcome, "skipped (no file)");
   assert.equal(results.find((r) => r.decision.agent === "ok")?.outcome, "written");
   const withReadable = { dir, files: [...d.files, { kind: "agent" as const, name: "secret", file: join(dir, "readable.md"), model: MODEL }] };
-  assert.equal(resolveAgent(withReadable, "secret").kind, "defined");
+  assert.equal(resolveAgent(withReadable, agentName("secret")).kind, "defined");
 });
 
 test("boot check warns once per unresolved route in name order and survives a throwing sink", async (t) => {
@@ -192,7 +194,7 @@ test("boot check warns once per unresolved route in name order and survives a th
   assert.ok(warnings[0].includes('configured agent "aMissing" has no file'));
   assert.ok(warnings[0].startsWith(join(dir, "aMissing.md") + ":"));
   assert.ok(warnings[0].includes("run the /agents command to create a new agent"));
-  assert.equal(resolveAgent(d, "aMissing").kind, "missing");
+  assert.equal(resolveAgent(d, agentName("aMissing")).kind, "missing");
   assert.ok(warnings[1].includes('configured agent "dup" is contested'));
   assert.ok(warnings[2].includes('configured agent "zMissing" has no file'));
   assert.deepEqual(checkAgentFiles(cfg, d, () => { throw new Error("sink"); }), warnings);
@@ -200,17 +202,17 @@ test("boot check warns once per unresolved route in name order and survives a th
 
 test("decide preserves a resolved definition verbatim and containment depends on file, not agent", () => {
   const cfg = config("/tmp/agents", ["Plan"]);
-  const definition = { agent: "Plan", file: "/tmp/agents/plan-work.md" };
+  const definition = { agent: agentName("Plan"), file: "/tmp/agents/plan-work.md" };
   const d = decide(definition, route, new Map(), cfg);
   assert.equal(d.kind, "assign");
   assert.equal(d.kind === "assign" ? d.file : undefined, definition.file);
-  const outside = decide({ agent: "Plan", file: "/tmp/agents-evil/Plan.md" }, route, new Map(), cfg);
+  const outside = decide({ agent: agentName("Plan"), file: "/tmp/agents-evil/Plan.md" }, route, new Map(), cfg);
   assert.equal("file" in outside, false);
   assert.deepEqual(outside, { agent: "Plan", kind: "hold", why: '"Plan" resolves outside the agents directory (/tmp/agents-evil/Plan.md) — holding' });
 });
 
 test("agent keys quote punctuation without conflating adjacent agents or disabled markers", () => {
-  for (const [name, key] of [["planner", "agents.planner"], ["Plan", "agents.Plan"], ["9lives", "agents.9lives"], ["snake_case", "agents.snake_case"], ["v1.2", 'agents["v1.2"]'], ["Code Reviewer", 'agents["Code Reviewer"]'], ["a:b", 'agents["a:b"]'], ['a"b', 'agents["a\\"b"]']]) assert.equal(agentKey(name), key);
+  for (const [name, key] of [["planner", "agents.planner"], ["Plan", "agents.Plan"], ["9lives", "agents.9lives"], ["snake_case", "agents.snake_case"], ["v1.2", 'agents["v1.2"]'], ["Code Reviewer", 'agents["Code Reviewer"]'], ["a:b", 'agents["a:b"]'], ['a"b', 'agents["a\\"b"]']]) assert.equal(agentKey(agentName(name)), key);
   const merged = mergeConfig(config("/tmp/agents", []), [
     { source: "global", data: { agents: { a: route, "a.b": route, Plan: route, "v1.2": route } } },
     { source: "project", data: { agents: { a: { disable: true }, Plan: { disable: true }, "v1.2": { disable: true } } } },
@@ -231,10 +233,10 @@ test("quoted model misses and dropped alternates retain config-file provenance",
   } } }]);
   const checked = checkModels(merged.config, () => false, () => {});
   assert.deepEqual(checked.misses.map((m) => m.key), ['agents["v1.2"].primary.model', 'agents["v1.2"].alternates[0].model']);
-  assert.equal(checked.droppedAlternates["v1.2"][0].key, 'agents["v1.2"].alternates[0].model');
+  assert.equal(checked.droppedAlternates[agentName("v1.2")][0].key, 'agents["v1.2"].alternates[0].model');
   const loaded = { ...merged, files: [{ source: "global" as const, path: "/tmp/global.json", state: { kind: "applied" as const } }] };
   assert.deepEqual(configFilesFor(loaded, checked.misses.map((m) => m.key)), ["/tmp/global.json"]);
-  const hold = heldDecision({ agent: "v1.2", model: "deepseek/missing" });
+  const hold = heldDecision({ agent: agentName("v1.2"), model: "deepseek/missing" });
   assert.deepEqual(hold, { agent: "v1.2", kind: "hold", why: 'agents["v1.2"].primary.model: this pi does not know model deepseek/missing — a newer pi may; holding' });
 });
 
@@ -262,8 +264,8 @@ test("disabled markers round-trip JSON-escaped accepted names without disappeari
   } }]);
   const lines = describeConfig({ ...merged, files: [] });
   for (const name of names) {
-    assert.equal(merged.sources[agentKey(name)], "project");
-    assert.ok(lines.includes(`  ${agentKey(name)} = disabled  [project]`), lines.join("\n"));
+    assert.equal(merged.sources[agentKey(agentName(name))], "project");
+    assert.ok(lines.includes(`  ${agentKey(agentName(name))} = disabled  [project]`), lines.join("\n"));
   }
 });
 
@@ -287,10 +289,10 @@ test("a scoped file stays visible as a non-agent occupant and a stem route canno
   assert.deepEqual(d, { dir, files: [scoped] });
   assert.deepEqual(describeAgentFiles([...d.files]), ['  scoped.md — not an agent: its declared name "acme:scout" is scoped']);
   assert.deepEqual(JSON.parse(agentTableSnippet([...d.files]).join("\n")).agents, {});
-  const resolution = resolveAgent(d, "scoped");
+  const resolution = resolveAgent(d, agentName("scoped"));
   assert.equal(resolution.kind, "missing");
   assert.deepEqual(resolution.kind === "missing" ? resolution.occupant : undefined, scoped);
-  assert.equal(resolveAgent(d, "acme:scout").kind, "missing");
+  assert.equal(resolveAgent(d, agentName("acme:scout")).kind, "missing");
   const cfg = config(dir, ["scoped"]);
   const warnings = checkAgentFiles(cfg, d, () => {});
   assert.equal(warnings.length, 1);
@@ -312,7 +314,7 @@ test("scoped declarations neither define nor contest a colon-named stem agent", 
   });
   const d = await readAgentDirectory(dir);
   assert.deepEqual(d.files.map((f) => f.kind), ["agent", "scoped", "scoped"]);
-  assert.deepEqual(resolveAgent(d, "a:b"), { kind: "defined", definition: { agent: "a:b", file: join(dir, "a:b.md") } });
+  assert.deepEqual(resolveAgent(d, agentName("a:b")), { kind: "defined", definition: { agent: "a:b", file: join(dir, "a:b.md") } });
   assert.deepEqual(checkAgentFiles(config(dir, ["a:b"]), d, () => {}), []);
   assert.deepEqual(JSON.parse(agentTableSnippet([...d.files]).join("\n")).agents, { "a:b": { primary: { model: MODEL } } });
 });
@@ -324,7 +326,7 @@ for (const separator of ["\u2028", "\u2029"]) {
       { source: "project", data: { agents: { [name]: { disable: true } } } },
     ]);
     const key = `agents["${name}"]`;
-    assert.equal(agentKey(name), key, "the separator is raw, not a JSON newline escape");
+    assert.equal(agentKey(agentName(name)), key, "the separator is raw, not a JSON newline escape");
     assert.equal(merged.sources[key], "project");
     assert.ok(describeConfig({ ...merged, files: [] }).includes(`  ${key} = disabled  [project]`));
   });

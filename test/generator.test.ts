@@ -33,6 +33,8 @@ import {
   type MeteredReading,
 } from "../src/index.ts";
 
+import { agentName, routeOf } from "./helpers/identifiers.ts";
+
 // ---------------------------------------------------------------- helpers
 
 const AGENT_DIR = "/x/agent";
@@ -50,10 +52,10 @@ function fakeRead(files: Record<string, string>): (path: string) => Promise<stri
 }
 
 /** One route that is valid whatever layer it sits in. */
-const VALID_ROUTE = {
+const VALID_ROUTE = routeOf({
   primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
   alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
-};
+});
 
 async function replaceGlobal(
   layer: Record<string, unknown>,
@@ -172,7 +174,7 @@ test("the README and ADR generator examples are valid configuration", async () =
     // As a config file it must load without a warning and route the planner.
     const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fakeRead({ [GLOBAL_PATH]: block }) });
     assert.deepEqual(loaded.warnings, [], label);
-    assert.equal(loaded.config.agents.planner?.primary.model, "claude-bridge/claude-opus-5-5", label);
+    assert.equal(loaded.config.agents[agentName("planner")]?.primary.model, "claude-bridge/claude-opus-5-5", label);
     // As generated output its ordinary part must pass the strict check.
     const ordinary: Record<string, unknown> = { ...JSON.parse(block) };
     delete ordinary.generator;
@@ -262,7 +264,7 @@ test("a plain valid replacement is accepted with no warnings", async () => {
   const result = await replaceGlobal({ agents: { planner: VALID_ROUTE } });
   assert.equal(result.kind, "accepted");
   if (result.kind !== "accepted") return;
-  assert.equal(result.loaded.config.agents.planner.primary.model, "claude-bridge/claude-opus-5-5");
+  assert.equal(result.loaded.config.agents[agentName("planner")].primary.model, "claude-bridge/claude-opus-5-5");
   assert.equal(result.loaded.sources["agents.planner.primary.model"], "global");
   assert.deepEqual(result.loaded.warnings, []);
 });
@@ -352,7 +354,7 @@ test("a partial project primary override may inherit the lower global primary", 
   });
   assert.equal(result.kind, "accepted");
   if (result.kind === "accepted") {
-    const primary = result.loaded.config.agents.planner.primary;
+    const primary = result.loaded.config.agents[agentName("planner")].primary;
     assert.equal(primary.model, "claude-bridge/claude-opus-5-5");
     assert.equal(primary.thinking, "high");
     assert.equal(result.loaded.sources["agents.planner.primary.thinking"], "project");
@@ -371,7 +373,7 @@ test("a model rail registered in either layer completes a candidate", async () =
   );
   assert.equal(result.kind, "accepted");
   if (result.kind === "accepted") {
-    assert.equal(result.loaded.config.agents.planner.primary.rail, "codex");
+    assert.equal(result.loaded.config.agents[agentName("planner")].primary.rail, "codex");
     assert.equal(result.loaded.sources["agents.planner.primary.rail"], "project");
   }
 });

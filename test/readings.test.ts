@@ -15,6 +15,8 @@ import {
   type RailReadings,
 } from "../src/index.ts";
 
+import { agentTable, routeOf } from "./helpers/identifiers.ts";
+
 const NOW = 1_730_123_456_789;
 const TTL = 10_000;
 const PRIMARY = "claude-bridge/claude-opus-5-5";
@@ -81,7 +83,7 @@ async function fixture(t: TestContext) {
   const dispatcher = createDispatcher({
     ...DEFAULT_CONFIG, agentDir, claudeCredsPath, piAuthPath, ttlMs: TTL, claudeRefresh: "off",
     readingsPath: join(root, "quota-dispatch-readings.json"),
-    agents: { planner: { primary: { model: PRIMARY, rail: "claude" }, alternates: [{ model: ALTERNATE, rail: "codex" }] } },
+    agents: agentTable({ planner: routeOf({ primary: { model: PRIMARY, rail: "claude" }, alternates: [{ model: ALTERNATE, rail: "codex" }] }) }),
   }, { fetchImpl, now: () => probe.clock, readKeychain: async () => ({ error: "no keychain" }) });
   return { dispatcher, probe, agentFile };
 }

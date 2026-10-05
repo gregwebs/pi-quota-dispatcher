@@ -19,6 +19,20 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+  parseAgentName,
+  parseModelId,
+  parseSkillName,
+  type AgentName,
+  type ModelId,
+  type SkillName,
+} from "./identifiers.ts";
+import { validatedEntries, validatedKeys } from "./validated-keys.ts";
+
+// The identifier rules live in `identifiers.ts`; these two names are the
+// compatibility surface other modules and the startup snippet already import,
+// so they are re-exported rather than renamed.
+export { agentNameRejection, modelIdRejection } from "./identifiers.ts";
 
 // ---------------------------------------------------------------- shape
 
@@ -60,21 +74,8 @@ export function isThinkingLevel(value: unknown): value is ThinkingLevel {
   return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
 }
 
-/**
- * Why `id` cannot key the `models` table, or `undefined` when it can.
- *
- * A model is named here the way pi names it and the way a candidate names it —
- * `provider/modelId` — because that is what the entry is looked up by. An id
- * with no slash can never match a candidate, so it would be a default that
- * silently applies to nothing.
- */
-export function modelIdRejection(id: string): string | undefined {
-  if (id.includes("/")) return undefined;
-  return `model "${id}" is not a provider/model id (needs "/")`;
-}
-
 export interface Candidate {
-  model: string;
+  model: ModelId;
   rail: Rail;
   /**
    * The level this candidate asks for itself, which outranks both the route's
@@ -269,7 +270,7 @@ export interface DispatcherConfig {
    * both outrank it. The table ships empty, because a default for a model this
    * user does not use says nothing.
    */
-  models: Record<string, ModelDefault>;
+  models: Record<ModelId, ModelDefault>;
   /**
    * Skill bindings, keyed by skill name: the agent route whose file supplies the
    * model and thinking level an explicit `/skill:<name>` invocation selects for
@@ -277,7 +278,7 @@ export interface DispatcherConfig {
    * binding means and why the route's file answers is in
    * docs/adr/0014-skill-bindings-read-the-agent-file.md.
    */
-  skills: Record<string, string>;
+  skills: Record<SkillName, AgentName>;
   /**
    * The agents this extension manages, keyed by agent name — the name pi spawns
    * the agent under (the file's `name:`, else its filename stem), which a route
@@ -290,8 +291,28 @@ export interface DispatcherConfig {
    * managed only once the user has listed it here. An agent absent from this
    * table is never touched.
    */
-  agents: Record<string, AgentRoute>;
+  agents: Record<AgentName, AgentRoute>;
 }
+
+/**
+ * The programmatic base `mergeConfig` folds layers over, before validation.
+ *
+ * An effective `DispatcherConfig` carries validated identifiers in its tables
+ * and candidate fields. A base a caller builds by hand is a different contract:
+ * `mergeConfig` validates its table *keys* through the checked producers, then
+ * clones its candidates without re-checking the `model` spelling, exactly as it
+ * trusts a config layer's values after validating them. Spelling the base's
+ * tables as `Record<string, …>` makes that asymmetry visible in the type — a
+ * raw key and a brand are both accepted — rather than pretending the base is
+ * already validated. The candidates themselves stay `Candidate`, because a
+ * base is not a raw JSON layer and re-parsing every field would change the
+ * contract beyond this migration.
+ */
+export type ConfigBase = Omit<DispatcherConfig, "agents" | "models" | "skills"> & {
+  agents: Record<string, AgentRoute>;
+  models: Record<string, ModelDefault>;
+  skills: Record<string, string>;
+};
 
 /**
  * A command a configuration file may declare to print a whole configuration
@@ -411,44 +432,6 @@ const ENUM_SCALARS: ReadonlyMap<
   { is: (value: unknown) => value is string; list: string }
 > = new Map([["claudeRefresh", { is: isClaudeRefreshMode, list: CLAUDE_REFRESH_MODE_LIST }]]);
 
-/**
- * Why `name` cannot be a route key, or `undefined` when it can.
- *
- * A route is keyed by the name pi spawns an agent under, and a name is a file:
- * the path for a route the agent dir does not define — the one `/agents` would
- * create — is `<agentDir>/<name>.md`. So the only guarantee the seam owes is
- * that a name is a single path segment. The charset and the case are pi's, not
- * ours, and a name pi can spawn is a name a route may key — `Plan`, `Explore`,
- * `9lives`, `v1.2`, `snake_case`, `Code Reviewer`, `a:b`.
- *
- * The name must also be usable as an object key, so one of `Object.prototype`'s
- * own names is refused: `constructor` is a valid filename, but a route table
- * keyed by it reads back a phantom value under any unguarded lookup, so it is
- * refused at the seam rather than each read having to remember `Object.hasOwn`.
- *
- * Two keys that differ only by case are distinct here and may name one file on
- * a case-insensitive filesystem. That is the OS's business, and the seam stays
- * filesystem-agnostic: resolution matches pi-visible names exactly, so such a
- * filesystem never sees a route written through a case-folded path.
- *
- * The rejection is a whole sentence so the layer loop and the base clone can
- * report the same thing; the caller supplies the prefix (`built-in:` for the
- * base).
- *
- * Exported because the startup snippet proposes agent names, and a name it
- * proposes has to be one the loader would accept — otherwise the "paste-ready"
- * table warns the moment it is pasted.
- */
-export function agentNameRejection(name: string): string | undefined {
-  if (name === "" || name === "." || name === ".." || /[/\\\0]/.test(name)) {
-    return `agent ${JSON.stringify(name)} is not a valid agent name (a name is also a filename, so it must be a single path segment: not empty, not "." or "..", and with no "/", "\\" or NUL character)`;
-  }
-  if (name in Object.prototype) {
-    return `agent "${name}" shadows Object.prototype and is not manageable`;
-  }
-  return undefined;
-}
-
 /** The characters a name — an agent's or a skill's — may be spelled with
  * inside a `sources` key unquoted. */
 const PLAIN_NAME_CHARS = "[A-Za-z0-9_-]+";
@@ -481,7 +464,7 @@ const PLAIN_DISABLED_MARKER = new RegExp(`^agents\\.(${PLAIN_NAME_CHARS})$`);
  * `${agentKey(a)}.alternates[0].rail`, `${agentKey(a)}.thinking`. The bare key
  * is the disabled marker.
  */
-export function agentKey(agent: string): string {
+export function agentKey(agent: AgentName): string {
   return PLAIN_NAME.test(agent) ? `agents.${agent}` : `agents[${JSON.stringify(agent)}]`;
 }
 
@@ -493,7 +476,7 @@ export function agentKey(agent: string): string {
  *   skillKey("code-review") === "skills.code-review"
  *   skillKey("v1.2")        === 'skills["v1.2"]'
  */
-export function skillKey(skill: string): string {
+export function skillKey(skill: SkillName): string {
   return PLAIN_NAME.test(skill) ? `skills.${skill}` : `skills[${JSON.stringify(skill)}]`;
 }
 
@@ -507,9 +490,12 @@ export function skillKey(skill: string): string {
  * alternative — a second `disabled` record on `LoadedConfig` — would keep two
  * records of one fact, or break the documented `sources` marker contract.
  */
-function disabledAgentOf(key: string): string | undefined {
+function disabledAgentOf(key: string): AgentName | undefined {
   const plain = PLAIN_DISABLED_MARKER.exec(key);
-  if (plain) return plain[1];
+  if (plain) {
+    const name = parseAgentName(plain[1]);
+    return "value" in name ? name.value : undefined;
+  }
   // The `s` flag matters: `JSON.stringify` leaves a raw U+2028 or U+2029 line
   // separator in the string rather than escaping it, and without `s` a `.` does
   // not match either one — so a name carrying one is a JSON string this pattern
@@ -522,7 +508,9 @@ function disabledAgentOf(key: string): string | undefined {
   } catch {
     return undefined;
   }
-  return typeof agent === "string" && agentKey(agent) === key ? agent : undefined;
+  if (typeof agent !== "string") return undefined;
+  const parsed = parseAgentName(agent);
+  return "value" in parsed && agentKey(parsed.value) === key ? parsed.value : undefined;
 }
 
 /** JSON objects only; arrays, `null` and primitives are not layers or routes. */
@@ -582,8 +570,8 @@ export function parseGeneratorDeclaration(
 
 /** A skill name and the agent route its explicit `/skill:<name>` invocation selects from. */
 export interface SkillBinding {
-  skill: string;
-  route: string;
+  skill: SkillName;
+  route: AgentName;
 }
 
 /**
@@ -602,19 +590,24 @@ export interface SkillBinding {
  * it cost.
  */
 function parseSkillBinding(skill: string, route: unknown): { binding: SkillBinding } | { rejection: string } {
-  if (skill === "" || skill.includes(" ")) {
+  const parsedSkill = parseSkillName(skill);
+  if ("rejection" in parsedSkill) {
+    // The wording is this seam's own, naming the `skills` entry rather than the
+    // bare skill: it is the sentence a user sees against the file they wrote.
     return {
       rejection: `"skills" entry ${JSON.stringify(skill)} names no skill (an explicit invocation names a skill up to the first space)`,
     };
   }
   if (typeof route !== "string" || route === "") {
-    return { rejection: `"${skillKey(skill)}" must be a string naming an agent route` };
+    return { rejection: `"${skillKey(parsedSkill.value)}" must be a string naming an agent route` };
   }
-  const rejection = agentNameRejection(route);
-  if (rejection !== undefined) {
-    return { rejection: `"${skillKey(skill)}" must name an agent route: ${rejection}` };
+  const parsedRoute = parseAgentName(route);
+  if ("rejection" in parsedRoute) {
+    return {
+      rejection: `"${skillKey(parsedSkill.value)}" must name an agent route: ${parsedRoute.rejection}`,
+    };
   }
-  return { binding: { skill, route } };
+  return { binding: { skill: parsedSkill.value, route: parsedRoute.value } };
 }
 
 /**
@@ -627,7 +620,7 @@ function parseSkillBinding(skill: string, route: unknown): { binding: SkillBindi
  * and the refusal costs nothing; a skill name is pi's, and this seam refuses no
  * name pi can invoke (see `parseSkillBinding`).
  */
-function bindSkill(skills: Record<string, string>, binding: SkillBinding): void {
+function bindSkill(skills: Record<SkillName, AgentName>, binding: SkillBinding): void {
   Object.defineProperty(skills, binding.skill, {
     value: binding.route,
     enumerable: true,
@@ -1399,7 +1392,7 @@ function parseCandidate(
   current: Candidate | undefined,
   source: ConfigSource,
   warn: (message: string) => void,
-  registeredRail: (model: string) => { rail: Rail; source: ConfigSource } | undefined,
+  registeredRail: (model: ModelId) => { rail: Rail; source: ConfigSource } | undefined,
   inheritedRail: WeakSet<Candidate>,
   strict: boolean,
 ): { candidate: Candidate; sources: Map<string, ConfigSource> } | undefined {
@@ -1421,11 +1414,15 @@ function parseCandidate(
   let statedRail = false;
   for (const [key, fieldValue] of Object.entries(value)) {
     if (key === "model") {
-      if (typeof fieldValue === "string" && fieldValue.includes("/")) {
-        candidate.model = fieldValue;
+      const parsedModel = typeof fieldValue === "string" ? parseModelId(fieldValue) : undefined;
+      if (parsedModel !== undefined && "value" in parsedModel) {
+        candidate.model = parsedModel.value;
         statedModel = true;
         sources.set(`${dotted}.model`, source);
       } else {
+        // The wording is this seam's own: a candidate's model is reported
+        // differently from a `models` table key, even though both rules are the
+        // one checked producer.
         warn(`"${dotted}.model" must be a string containing "/"`);
       }
     } else if (key === "rail") {
@@ -1556,7 +1553,7 @@ function labelOf(layer: MergeLayer): string {
 }
 
 export function mergeConfig(
-  base: DispatcherConfig,
+  base: ConfigBase,
   layers: MergeLayer[],
   options: MergeOptions = {},
 ): MergeResult {
@@ -1568,19 +1565,19 @@ export function mergeConfig(
     warnings.push(text);
     diagnostics.push({ text, sources });
   };
-  const agents: Record<string, AgentRoute> = {};
+  const agents: Record<AgentName, AgentRoute> = {};
   for (const [agent, route] of Object.entries(base.agents)) {
     // Normally the base is `defaultConfig()`, which ships no agents at all, so
     // this only fires for a config a caller built programmatically. A bad key is
     // the same defect class as a bad layer key — it names a file — so it gets
     // the same warning and is dropped rather than cloned into the effective
     // config.
-    const rejection = agentNameRejection(agent);
-    if (rejection) {
-      note(`built-in: ${rejection}`, ["built-in"]);
+    const parsedAgent = parseAgentName(agent);
+    if ("rejection" in parsedAgent) {
+      note(`built-in: ${parsedAgent.rejection}`, ["built-in"]);
       continue;
     }
-    agents[agent] = {
+    agents[parsedAgent.value] = {
       ...(route.thinking !== undefined ? { thinking: route.thinking } : {}),
       primary: { ...route.primary },
       alternates: route.alternates.map((candidate) => ({ ...candidate })),
@@ -1592,11 +1589,11 @@ export function mergeConfig(
   // on a layer would get. A key with a `/` in it can never be `__proto__` or
   // `constructor`, which is what keeps an unguarded write onto `models` from
   // reaching an inherited value.
-  const models: Record<string, ModelDefault> = {};
+  const models: Record<ModelId, ModelDefault> = {};
   for (const [id, entry] of Object.entries(base.models)) {
-    const rejection = modelIdRejection(id);
-    if (rejection) {
-      note(`built-in: ${rejection}`, ["built-in"]);
+    const parsedId = parseModelId(id);
+    if ("rejection" in parsedId) {
+      note(`built-in: ${parsedId.rejection}`, ["built-in"]);
       continue;
     }
     if (entry.rail !== undefined) {
@@ -1608,11 +1605,11 @@ export function mergeConfig(
         );
       }
     }
-    models[id] = { ...entry };
+    models[parsedId.value] = { ...entry };
   }
   // Cloned for the same reason `models` is, and validated with the same rule a
   // layer gets: a bad base entry is dropped with the warning a layer would get.
-  const skills: Record<string, string> = {};
+  const skills: Record<SkillName, AgentName> = {};
   foldSkillEntries(
     Object.entries(base.skills),
     (reason) => note(`built-in: ${reason}`, ["built-in"]),
@@ -1644,12 +1641,12 @@ export function mergeConfig(
       scalarLabels.set(key, "built-in");
     }
   }
-  for (const [id, entry] of Object.entries(config.models)) {
+  for (const [id, entry] of validatedEntries(config.models)) {
     if (entry.rail !== undefined) setSource(`models.${id}.rail`, "built-in");
     if (entry.thinking !== undefined) setSource(`models.${id}.thinking`, "built-in");
   }
-  for (const skill of Object.keys(config.skills)) setSource(skillKey(skill), "built-in");
-  for (const [agent, route] of Object.entries(config.agents)) {
+  for (const skill of validatedKeys(config.skills)) setSource(skillKey(skill), "built-in");
+  for (const [agent, route] of validatedEntries(config.agents)) {
     const key = agentKey(agent);
     setSource(`${key}.primary.model`, "built-in");
     setSource(`${key}.primary.rail`, "built-in");
@@ -1677,7 +1674,7 @@ export function mergeConfig(
    * `/` (the seam rejects the rest), which already rules out the
    * `Object.prototype` names.
    */
-  const registeredRail = (model: string): { rail: Rail; source: ConfigSource } | undefined => {
+  const registeredRail = (model: ModelId): { rail: Rail; source: ConfigSource } | undefined => {
     if (!Object.hasOwn(config.models, model)) return undefined;
     const rail = config.models[model].rail;
     if (rail === undefined) return undefined;
@@ -1698,7 +1695,7 @@ export function mergeConfig(
   const inheritedRail = new WeakSet<Candidate>();
 
   /** Forget every value `agent` contributed, including every list index. */
-  const clearAgentSources = (agent: string): void => {
+  const clearAgentSources = (agent: AgentName): void => {
     const own = agentKey(agent);
     for (const key of Object.keys(sources)) {
       // A plain name carries no `.`, and a quoted key starts with `agents[`, so
@@ -1714,7 +1711,7 @@ export function mergeConfig(
    * how `/quota-dispatch` answers "why is this agent not managed?". A disable
    * that had nothing to remove records nothing, because nothing changed.
    */
-  const disableAgent = (agent: string, source: ConfigSource): void => {
+  const disableAgent = (agent: AgentName, source: ConfigSource): void => {
     // Own property only: a key like `constructor` would otherwise reach an
     // inherited value that is not an agent at all.
     if (!Object.hasOwn(config.agents, agent)) return;
@@ -1724,7 +1721,7 @@ export function mergeConfig(
   };
 
   const applyAgent = (
-    agent: string,
+    agent: AgentName,
     data: Record<string, unknown>,
     source: ConfigSource,
     warn: (message: string) => void,
@@ -1982,11 +1979,12 @@ export function mergeConfig(
     // entry: an entry is a default several routes may inherit, so a typo in one
     // model must not take the rest of the table down with it.
     for (const [id, entryValue] of Object.entries(modelsValue)) {
-      const rejection = modelIdRejection(id);
-      if (rejection) {
-        warn(rejection);
+      const parsedId = parseModelId(id);
+      if ("rejection" in parsedId) {
+        warn(parsedId.rejection);
         continue;
       }
+      const modelKey = parsedId.value;
       if (!isPlainObject(entryValue)) {
         warn(`model "${id}" must be an object`);
         continue;
@@ -1997,7 +1995,7 @@ export function mergeConfig(
             warn(`"models.${id}.rail" must be one of "claude", "codex", "deepseek"`);
             continue;
           }
-          config.models[id] = { ...config.models[id], rail: fieldValue };
+          config.models[modelKey] = { ...config.models[modelKey], rail: fieldValue };
           setSource(`models.${id}.rail`, source);
           // A rail that reads like a different account's model is the same
           // partial-override mistake a candidate-level rail can make, so it
@@ -2016,7 +2014,7 @@ export function mergeConfig(
           warn(`"models.${id}.thinking" must be one of ${THINKING_LEVEL_LIST}`);
           continue;
         }
-        config.models[id] = { ...config.models[id], thinking: fieldValue };
+        config.models[modelKey] = { ...config.models[modelKey], thinking: fieldValue };
         setSource(`models.${id}.thinking`, source);
       }
     }
@@ -2042,9 +2040,9 @@ export function mergeConfig(
           continue;
         }
         for (const [agent, agentValue] of Object.entries(value)) {
-          const rejection = agentNameRejection(agent);
-          if (rejection) {
-            warn(rejection);
+          const parsedAgent = parseAgentName(agent);
+          if ("rejection" in parsedAgent) {
+            warn(parsedAgent.rejection);
             continue;
           }
           if (agentValue === null) {
@@ -2055,7 +2053,7 @@ export function mergeConfig(
           } else if (!isPlainObject(agentValue)) {
             warn(`agent "${agent}" must be an object`);
           } else {
-            applyAgent(agent, agentValue, source, warn, strict);
+            applyAgent(parsedAgent.value, agentValue, source, warn, strict);
           }
         }
         continue;
@@ -2272,7 +2270,7 @@ export function describeConfig(loaded: LoadedConfig): string[] {
   // The `models` table is the user's own, and an entry no route names is inert
   // rather than wrong, so every stated default is listed — including one
   // nothing currently reads.
-  for (const id of Object.keys(loaded.config.models).sort()) {
+  for (const id of validatedKeys(loaded.config.models).sort()) {
     const entry = loaded.config.models[id];
     // The rail first: it is what makes the model a destination at all, and the
     // level beside it is a property of the work that draws on the account.
@@ -2288,7 +2286,7 @@ export function describeConfig(loaded: LoadedConfig): string[] {
   // then which route each skill takes its selection from, then the routes. A
   // binding to a route the table does not configure is listed all the same: it
   // is in the effective config, and the invocation is where it warns.
-  for (const skill of Object.keys(loaded.config.skills).sort()) {
+  for (const skill of validatedKeys(loaded.config.skills).sort()) {
     const key = skillKey(skill);
     lines.push(`  ${key} = ${loaded.config.skills[skill]}  [${sourceOf(key)}]`);
   }
@@ -2298,12 +2296,12 @@ export function describeConfig(loaded: LoadedConfig): string[] {
   // that, the one agent you most want to ask about — the one that is not
   // managed — would not appear at all. The bare `agentKey(name)` key is the
   // marker; a value key always has a `.primary` or `.alternates[...]` suffix.
-  const disabled = new Map<string, ConfigSource>();
+  const disabled = new Map<AgentName, ConfigSource>();
   for (const [key, source] of Object.entries(loaded.sources)) {
     const removed = disabledAgentOf(key);
     if (removed !== undefined) disabled.set(removed, source);
   }
-  const names = new Set<string>([...Object.keys(loaded.config.agents), ...disabled.keys()]);
+  const names = new Set<AgentName>([...validatedKeys(loaded.config.agents), ...disabled.keys()]);
 
   for (const agent of [...names].sort()) {
     const route = loaded.config.agents[agent];
