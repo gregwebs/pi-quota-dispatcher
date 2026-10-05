@@ -23,6 +23,8 @@
  * registry, a session or a terminal.
  */
 import { agentKey, type AgentRoute, type Candidate, type DispatcherConfig } from "./config.ts";
+import type { AgentName } from "./identifiers.ts";
+import { validatedKeys } from "./validated-keys.ts";
 
 /**
  * The one thing this extension needs from the running pi's model registry:
@@ -46,8 +48,10 @@ export interface ModelRegistryLike {
 export type ModelLookup = (provider: string, modelId: string) => boolean;
 
 /**
- * One configured candidate this pi cannot spawn, with the config key the warning
- * named it by.
+ * One configured candidate occurrence, with the config key the warning names it
+ * by and the model id it carries. `checkModels` builds one for every candidate it
+ * checks, before the lookup decides whether it resolves; it is a *miss* only once
+ * the lookup fails.
  *
  * The pair is the whole of a miss: the id that has to resolve somewhere else,
  * and the line the reader has to go and edit. `ModelCheckResult` keeps every one
@@ -83,8 +87,8 @@ export type DroppedAlternate = ModelMiss;
  * instruction rather than a diagnosis. The clause is `unknownModelClause`, which
  * a skill binding's warning shares.
  */
-export function unknownModelNote(key: string, model: string): string {
-  return `${key}: ${unknownModelClause(model)}`;
+export function unknownModelNote(miss: ModelMiss): string {
+  return `${miss.key}: ${unknownModelClause(miss.model)}`;
 }
 
 /** The clause itself, for a sentence that names the model's place its own way. */
@@ -126,7 +130,7 @@ export interface ModelCheckResult {
    * free to ignore it, and "what did boot drop from this route?" is a question
    * only this step can answer.
    */
-  droppedAlternates: Record<string, DroppedAlternate[]>;
+  droppedAlternates: Record<AgentName, DroppedAlternate[]>;
   /**
    * The agents to hold, by agent name, each carrying the primary model id this
    * pi does not know.
@@ -136,7 +140,7 @@ export interface ModelCheckResult {
    * file must stay as the user left it. An agent absent from this record is
    * decided the ordinary way.
    */
-  held: Record<string, string>;
+  held: Record<AgentName, string>;
   /**
    * Every candidate this pi cannot spawn, one per occurrence, never deduped by
    * model id, because the reader has to fix every place the id is written. In a
@@ -223,42 +227,43 @@ export function checkModels(
 ): ModelCheckResult {
   if (!lookup) return { config, held: {}, droppedAlternates: {}, misses: [], warnings: [] };
 
-  const held: Record<string, string> = {};
-  const droppedAlternates: Record<string, DroppedAlternate[]> = {};
+  const held: Record<AgentName, string> = {};
+  const droppedAlternates: Record<AgentName, DroppedAlternate[]> = {};
   const misses: ModelMiss[] = [];
 
   /**
-   * Whether `model` resolves, warning once and recording the miss when it does
-   * not. A model with no `/` cannot name a pi model at all, so it is a miss
-   * without being put to the lookup; the config seam already rejects those, so
-   * this is the belt-and-braces path rather than a second wording.
+   * Whether this configured occurrence resolves, warning once — with a
+   * `ModelMiss` — and recording the miss when it does not. A model with no `/`
+   * cannot name a pi model at all, so it is a miss without being put to the
+   * lookup; the config seam already rejects those, so this is the
+   * belt-and-braces path rather than a second wording.
    */
-  const resolves = (dotted: string, model: string): boolean => {
-    const split = splitModelId(model);
+  const resolves = (occurrence: ModelMiss): boolean => {
+    const split = splitModelId(occurrence.model);
     if (split !== undefined && lookup(split.provider, split.modelId)) return true;
 
-    const line = unknownModelNote(dotted, model);
+    const line = unknownModelNote(occurrence);
     try {
       warn(line);
     } catch {
       // Warning sinks are callers' code; a throwing one must not sink the
       // check. The line is still returned for `/quota-dispatch` to print.
     }
-    misses.push({ key: dotted, model });
+    misses.push(occurrence);
     return false;
   };
 
   // Agents by name, so the warnings and the rebuilt table share one fixed
   // order. Every configured candidate is checked, including the alternates of
   // an agent whose primary is unknown — the user has to fix every occurrence.
-  const agents: Record<string, AgentRoute> = {};
-  for (const agent of Object.keys(config.agents).sort()) {
+  const agents: Record<AgentName, AgentRoute> = {};
+  for (const agent of validatedKeys(config.agents).sort()) {
     const route = config.agents[agent];
     // The key spells the name the way every other surface does, so a name
     // outside `[A-Za-z0-9_-]` is quoted here too and `configFilesFor` can still
     // find the file the miss came from.
     const prefix = agentKey(agent);
-    if (!resolves(`${prefix}.primary.model`, route.primary.model)) {
+    if (!resolves({ key: `${prefix}.primary.model`, model: route.primary.model })) {
       held[agent] = route.primary.model;
     }
     // The alternates after a dropped one keep their order; the index in the
@@ -268,7 +273,7 @@ export function checkModels(
     const dropped: DroppedAlternate[] = [];
     for (const [index, candidate] of route.alternates.entries()) {
       const key = `${prefix}.alternates[${index}].model`;
-      if (resolves(key, candidate.model)) alternates.push({ ...candidate });
+      if (resolves({ key, model: candidate.model })) alternates.push({ ...candidate });
       else dropped.push({ key, model: candidate.model });
     }
     if (dropped.length) droppedAlternates[agent] = dropped;
@@ -288,6 +293,6 @@ export function checkModels(
     held,
     droppedAlternates,
     misses,
-    warnings: misses.map((miss) => unknownModelNote(miss.key, miss.model)),
+    warnings: misses.map(unknownModelNote),
   };
 }

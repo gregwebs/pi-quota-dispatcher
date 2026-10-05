@@ -1121,6 +1121,12 @@ npm ci && npm test    # install the dev dependency, then run the suite
 npm run typecheck
 ```
 
+Validated configuration identifiers — agent names, model ids and skill names —
+are opaque newtypes produced only by checked parsers, so a wrong-role value does
+not compile. The pattern, what a brand does and does not prove, and the reasons
+`AgentDir` and a `Map` representation were declined are in
+[ADR 0018](docs/adr/0018-config-identifiers-use-newtypes.md).
+
 ## License
 
 Apache-2.0

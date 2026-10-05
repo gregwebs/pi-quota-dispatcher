@@ -8,6 +8,7 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import type { ThinkingLevel } from "../src/config.ts";
+import { agentTable, candidateOf } from "./helpers/identifiers.ts";
 import extension, {
   checkAgentFiles,
   DEFAULT_CONFIG,
@@ -2115,7 +2116,7 @@ for (const occupant of ["none", "agent", "scoped", "unreadable"] as const) {
       t.skip("root can read a mode-000 file");
       return;
     }
-    const primary = { model: "deepseek/deepseek-flash", rail: "deepseek" as const };
+    const primary = candidateOf({ model: "deepseek/deepseek-flash", rail: "deepseek" });
     const fx = await fixture(2_147_483_647, { New: { primary } });
     const dir = join(fx.agentDir, "agents");
     const file = join(dir, "New.md");
@@ -2139,7 +2140,7 @@ for (const occupant of ["none", "agent", "scoped", "unreadable"] as const) {
       unreadable: " (the file there could not be read)",
     };
     const warnings = checkAgentFiles(
-      { ...DEFAULT_CONFIG, agentDir: dir, agents: { New: { primary, alternates: [] } } },
+      { ...DEFAULT_CONFIG, agentDir: dir, agents: agentTable({ New: { primary, alternates: [] } }) },
       await readAgentDirectory(dir),
       () => {},
     );
@@ -2375,6 +2376,25 @@ test("a bound skill selects the file's model, then its stated level, and leaves 
   assert.equal(session.model, "claude-bridge/claude-opus-5-5");
   assert.equal(session.thinking, "high");
   assert.equal(await readFile(fx.plannerFile, "utf8"), before, "invocation must not write the agent file");
+});
+
+// A skill name that shadows `Object.prototype` is admitted by the seam, so the
+// invocation path has to look it up as an own key rather than reading the
+// inherited value and finding a phantom binding.
+test("a skill bound under __proto__ is invoked like any other binding", async () => {
+  // An object literal `__proto__:` would set the prototype, so the own key is
+  // built the way JSON does it.
+  const skills = JSON.parse('{"__proto__":"planner"}') as Record<string, unknown>;
+  const fx = await skillFixture(skills);
+  const session = fakeSession();
+
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    assert.equal(await input("/skill:__proto__"), undefined);
+    assert.deepEqual(session.calls, selectionCalls("claude-bridge/claude-opus-5-5", "high"));
+    assert.deepEqual(notifications, [
+      { text: "Skill __proto__ → planner: claude-bridge/claude-opus-5-5, thinking high", level: "info" },
+    ]);
+  });
 });
 
 test("the bound agent is found by its declared name when the filename differs", async () => {

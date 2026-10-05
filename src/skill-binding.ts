@@ -22,6 +22,8 @@ import {
   errorText,
   isThinkingLevel,
 } from "./config.ts";
+import type { AgentName, ModelId, SkillName } from "./identifiers.ts";
+import { parseModelId, parseSkillName } from "./identifiers.ts";
 import { splitModelId, unknownModelClause } from "./models.ts";
 
 /** pi's own prefix for an explicit skill command (`AgentSession._expandSkillCommand`). */
@@ -35,11 +37,15 @@ const SKILL_COMMAND = "/skill:";
  * precisely the skill pi is about to run. A prompt that only mentions a skill,
  * and a skill the model loads by itself, never arrive here as one.
  */
-export function explicitSkill(text: string): string | undefined {
+export function explicitSkill(text: string): SkillName | undefined {
   if (!text.startsWith(SKILL_COMMAND)) return undefined;
   const space = text.indexOf(" ");
   const skill = space === -1 ? text.slice(SKILL_COMMAND.length) : text.slice(SKILL_COMMAND.length, space);
-  return skill === "" ? undefined : skill;
+  // Everything up to the first space is the name, so the only rejection left is
+  // the empty name — a bare `/skill:`. The parse brands it as the checked
+  // producer for the table lookup that follows.
+  const parsed = parseSkillName(skill);
+  return "value" in parsed ? parsed.value : undefined;
 }
 
 /** What the bound agent's file currently selects, or why it could not be read. */
@@ -73,7 +79,7 @@ export interface SessionSelection<Model> {
 export interface SkillBindingDeps<Model> {
   config: DispatcherConfig;
   /** Reads the bound agent's definition file as it stands right now. */
-  readSelection: (agent: string) => Promise<AgentFileSelection>;
+  readSelection: (agent: AgentName) => Promise<AgentFileSelection>;
   selection: SessionSelection<Model>;
   notify: (message: string, type: "info" | "warning") => void;
 }
@@ -93,7 +99,7 @@ type ThinkingResult =
 
 /** What one bound invocation came to: the facts each message is rendered from. */
 type SelectionOutcome =
-  | { kind: "selected"; model: string; thinking: ThinkingResult }
+  | { kind: "selected"; model: ModelId; thinking: ThinkingResult }
   | { kind: "unconfigured" }
   | { kind: "unavailable"; why: string }
   | { kind: "no-model" }
@@ -142,7 +148,7 @@ export async function applySkillBinding<Model>(deps: SkillBindingDeps<Model>, te
   }
 }
 
-async function selectFromFile<Model>(deps: SkillBindingDeps<Model>, route: string): Promise<SelectionOutcome> {
+async function selectFromFile<Model>(deps: SkillBindingDeps<Model>, route: AgentName): Promise<SelectionOutcome> {
   if (!Object.hasOwn(deps.config.agents, route)) return { kind: "unconfigured" };
 
   const read = await deps.readSelection(route);
@@ -157,7 +163,12 @@ async function selectFromFile<Model>(deps: SkillBindingDeps<Model>, route: strin
     if (!isThinkingLevel(read.thinking)) return { kind: "malformed-thinking", stated: read.thinking };
     stated = read.thinking;
   }
-  const model = findModel(deps.selection, read.model);
+  // The file's spelling is raw frontmatter; brand it before the registry lookup
+  // so a malformed id is the same unknown-model outcome the old split produced,
+  // still reported with the raw text the file holds.
+  const parsedModel = parseModelId(read.model);
+  if ("rejection" in parsedModel) return { kind: "unknown-model", model: read.model };
+  const model = findModel(deps.selection, parsedModel.value);
   if (model === undefined) return { kind: "unknown-model", model: read.model };
 
   // Read before the switch, for two reasons. pi's `setModel` re-derives the
@@ -215,7 +226,7 @@ async function selectFromFile<Model>(deps: SkillBindingDeps<Model>, route: strin
     stated === undefined
       ? { kind: "retained", previous: previousLevel, effective }
       : { kind: "stated", asked: stated, effective };
-  return { kind: "selected", model: read.model, thinking };
+  return { kind: "selected", model: parsedModel.value, thinking };
 }
 
 /**
@@ -281,7 +292,7 @@ function thinkingText(thinking: ThinkingResult): string {
  * `provider/modelId` through the registry. Split the way `checkModels` splits a
  * configured id (`splitModelId`); an id with no `/` names no pi model.
  */
-function findModel<Model>(selection: SessionSelection<Model>, model: string): Model | undefined {
+function findModel<Model>(selection: SessionSelection<Model>, model: ModelId): Model | undefined {
   const split = splitModelId(model);
   return split === undefined ? undefined : selection.findModel(split.provider, split.modelId);
 }

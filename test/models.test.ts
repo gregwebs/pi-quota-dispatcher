@@ -21,7 +21,10 @@ import {
   modelLookup,
 } from "../src/index.ts";
 
-const definitionOf = (agent: string, cfg: DispatcherConfig): AgentDefinition => ({ agent, file: join(cfg.agentDir, `${agent}.md`) });
+import type { ModelId } from "../src/identifiers.ts";
+import { agentName, agentTable, modelId, modelTable } from "./helpers/identifiers.ts";
+
+const definitionOf = (agent: string, cfg: DispatcherConfig): AgentDefinition => ({ agent: agentName(agent), file: join(cfg.agentDir, `${agent}.md`) });
 
 // ---------------------------------------------------------------- helpers
 
@@ -31,12 +34,12 @@ const DASH = "\u2014";
 
 /** One model on one rail, as a route's candidate. */
 function candidate(model: string, rail: Rail): Candidate {
-  return { model, rail };
+  return { model: modelId(model), rail };
 }
 
 /** A config rooted at a fake agent dir, so nothing here reads a real one. */
 function config(agents: Record<string, AgentRoute>, extra: Partial<DispatcherConfig> = {}): DispatcherConfig {
-  return { ...DEFAULT_CONFIG, agentDir: "/agents", agents, ...extra };
+  return { ...DEFAULT_CONFIG, agentDir: "/agents", agents: agentTable(agents), ...extra };
 }
 
 /** A lookup that answers `true` exactly for the model ids passed in. */
@@ -156,8 +159,10 @@ test("a model with no / is unknown without being put to the lookup", () => {
     throw new Error("the lookup must not be called for a model with no provider");
   };
   const { lines, warn } = warnRecorder();
+  // invariant bypass: this test deliberately violates Candidate.model
+  const malformed: ModelId = "nomodel" as ModelId;
   const cfg = config({
-    planner: { primary: candidate("nomodel", "claude"), alternates: [] },
+    planner: { primary: { model: malformed, rail: "claude" }, alternates: [] },
   });
 
   const result = checkModels(cfg, lookup, warn);
@@ -181,9 +186,9 @@ test("an unknown primary holds its agent in the table and names it with the mode
   const result = checkModels(cfg, lookupFor("openai-codex/gpt-6-sol"), warn);
 
   assert.deepEqual(result.held, { planner: "claude-bridge/claude-sol-9" });
-  assert.ok(result.config.agents.planner, "a held agent stays in the table");
-  assert.deepEqual(result.config.agents.planner.primary, candidate("claude-bridge/claude-sol-9", "claude"));
-  assert.deepEqual(result.config.agents.planner.alternates, [candidate("openai-codex/gpt-6-sol", "codex")]);
+  assert.ok(result.config.agents[agentName("planner")], "a held agent stays in the table");
+  assert.deepEqual(result.config.agents[agentName("planner")].primary, candidate("claude-bridge/claude-sol-9", "claude"));
+  assert.deepEqual(result.config.agents[agentName("planner")].alternates, [candidate("openai-codex/gpt-6-sol", "codex")]);
   assert.deepEqual(result.warnings, [
     unknownLine("agents.planner.primary.model", "claude-bridge/claude-sol-9"),
   ]);
@@ -211,7 +216,7 @@ test("an unknown alternate is removed and the alternates after it keep their ord
   );
 
   assert.deepEqual(
-    result.config.agents.planner.alternates.map((c) => c.model),
+    result.config.agents[agentName("planner")].alternates.map((c) => c.model),
     ["openai-codex/gpt-6-sol", "deepseek/deepseek-flash"],
     "the unknown alternate is gone; the rest keep priority order",
   );
@@ -249,7 +254,7 @@ test("checkModels records each dropped alternate under the key its warning named
   );
 
   assert.deepEqual(result.droppedAlternates, {
-    planner: [
+    [agentName("planner")]: [
       { key: "agents.planner.alternates[0].model", model: "openai-codex/gpt-sol-6" },
       { key: "agents.planner.alternates[2].model", model: "openai-codex/gpt-astra-6" },
     ],
@@ -259,7 +264,7 @@ test("checkModels records each dropped alternate under the key its warning named
   // second wording for one fact.
   assert.deepEqual(
     lines,
-    result.droppedAlternates.planner.map((dropped) => unknownLine(dropped.key, dropped.model)),
+    result.droppedAlternates[agentName("planner")].map((dropped) => unknownLine(dropped.key, dropped.model)),
   );
 });
 
@@ -346,14 +351,14 @@ test("checkModels carries a route's level and the models table through the rebui
       { ...candidate("openai-codex/gpt-6-sol", "codex"), thinking: "low" }, // known
     ],
   };
-  const cfg = config({ planner: route }, { models: { "openai-codex/gpt-6-sol": { thinking: "minimal" } } });
+  const cfg = config({ planner: route }, { models: modelTable({ "openai-codex/gpt-6-sol": { thinking: "minimal" } }) });
 
   const result = checkModels(cfg, lookupFor("claude-bridge/claude-opus-5-5", "openai-codex/gpt-6-sol"));
 
-  assert.equal(result.config.agents.planner.thinking, "medium");
-  assert.equal(result.config.agents.planner.primary.thinking, "xhigh");
-  assert.equal(result.config.agents.planner.alternates.length, 1);
-  assert.equal(result.config.agents.planner.alternates[0].thinking, "low");
+  assert.equal(result.config.agents[agentName("planner")].thinking, "medium");
+  assert.equal(result.config.agents[agentName("planner")].primary.thinking, "xhigh");
+  assert.equal(result.config.agents[agentName("planner")].alternates.length, 1);
+  assert.equal(result.config.agents[agentName("planner")].alternates[0].thinking, "low");
   assert.deepEqual(result.config.models, { "openai-codex/gpt-6-sol": { thinking: "minimal" } });
 });
 
@@ -369,7 +374,7 @@ test("checkModels does not mutate the config it is handed", () => {
   };
   const cfg = config({ planner: route });
   const snapshot = structuredClone(cfg);
-  const callerAlternates = cfg.agents.planner.alternates;
+  const callerAlternates = cfg.agents[agentName("planner")].alternates;
 
   const result = checkModels(cfg, lookupFor("claude-bridge/claude-opus-5-5", "openai-codex/gpt-6-sol"));
 
@@ -378,12 +383,12 @@ test("checkModels does not mutate the config it is handed", () => {
   assert.equal(callerAlternates[0].model, "openai-codex/gpt-sol-6", "its elements are untouched");
   assert.notEqual(result.config, cfg, "the result is a new config, not the caller's object");
   assert.notEqual(
-    result.config.agents.planner.alternates,
+    result.config.agents[agentName("planner")].alternates,
     callerAlternates,
     "the returned route gets a fresh list, not the caller's array",
   );
   assert.deepEqual(
-    result.config.agents.planner.alternates.map((c) => c.model),
+    result.config.agents[agentName("planner")].alternates.map((c) => c.model),
     ["openai-codex/gpt-6-sol"],
   );
 });
@@ -490,14 +495,14 @@ test("the transposed gpt-sol-6 / gpt-astra-6 ids are both reported", () => {
   ]);
   assert.deepEqual(lines, result.warnings);
   assert.deepEqual(result.held, { reviewer: "openai-codex/gpt-sol-6" });
-  assert.deepEqual(result.config.agents.reviewer.alternates, [], "the unknown alternate is skipped");
+  assert.deepEqual(result.config.agents[agentName("reviewer")].alternates, [], "the unknown alternate is skipped");
 });
 
 // ---------------------------------------------------------------- heldDecision
 
 test("heldDecision is a hold that names the unknown model and leaves no model to write", () => {
   const cfg = config({});
-  const d = heldDecision({ agent: "planner", model: "claude-bridge/claude-sol-9" });
+  const d = heldDecision({ agent: agentName("planner"), model: "claude-bridge/claude-sol-9" });
 
   assert.equal(d.kind, "hold");
   assert.equal("file" in d, false, "a hold has no file to write");
@@ -601,12 +606,12 @@ test("a held unknown primary leaves the agent's file byte-for-byte alone even wh
   const cfg: DispatcherConfig = {
     ...DEFAULT_CONFIG,
     ...fx,
-    agents: {
+    agents: agentTable({
       planner: {
         primary: candidate("claude-bridge/claude-sol-9", "claude"),
         alternates: [candidate("openai-codex/gpt-6-sol", "codex")],
       },
-    },
+    }),
   };
 
   const checked = checkModels(cfg, lookupFor("openai-codex/gpt-6-sol"));
@@ -647,14 +652,14 @@ test("a skipped unknown alternate does not hold: the next alternate is assigned"
 
   const checked = checkModels(cfg, lookupFor("claude-bridge/claude-opus-5-5", "openai-codex/gpt-6-sol"));
   assert.deepEqual(
-    checked.config.agents.planner.alternates.map((c) => c.model),
+    checked.config.agents[agentName("planner")].alternates.map((c) => c.model),
     ["openai-codex/gpt-6-sol"],
   );
   assert.deepEqual(checked.held, {}, "a skipped alternate must not hold the agent");
 
   const d = decide(
     definitionOf("planner", checked.config),
-    checked.config.agents.planner,
+    checked.config.agents[agentName("planner")],
     railMap(railState("claude", { session: 90, weekly: 0 }), railState("codex", { session: 10, weekly: 0 })),
     checked.config,
   );
@@ -684,13 +689,13 @@ test("a model-id miss is dropped while an unreadable rail holds — the asymmetr
   // bad: dropped, so the second alternate wins.
   const checkedA = checkModels(cfg, lookupFor("claude-bridge/claude-opus-5-5", "deepseek/deepseek-flash"));
   assert.deepEqual(
-    checkedA.config.agents.planner.alternates.map((c) => c.model),
+    checkedA.config.agents[agentName("planner")].alternates.map((c) => c.model),
     ["deepseek/deepseek-flash"],
     "the unknown model is dropped from the route",
   );
   const a = decide(
     definitionOf("planner", checkedA.config),
-    checkedA.config.agents.planner,
+    checkedA.config.agents[agentName("planner")],
     railMap(tightPrimary, railState("codex", { session: 10, weekly: 0 }), healthyDeepseek),
     checkedA.config,
   );
@@ -704,14 +709,14 @@ test("a model-id miss is dropped while an unreadable rail holds — the asymmetr
     lookupFor("claude-bridge/claude-opus-5-5", "openai-codex/gpt-sol-6", "deepseek/deepseek-flash"),
   );
   assert.deepEqual(
-    checkedB.config.agents.planner.alternates.map((c) => c.model),
+    checkedB.config.agents[agentName("planner")].alternates.map((c) => c.model),
     ["openai-codex/gpt-sol-6", "deepseek/deepseek-flash"],
     "a known model is not dropped",
   );
   const unreadableCodex: RailReading = { rail: "codex", ok: false, windows: [], readAt: 0, note: "HTTP 500" };
   const b = decide(
     definitionOf("planner", checkedB.config),
-    checkedB.config.agents.planner,
+    checkedB.config.agents[agentName("planner")],
     railMap(tightPrimary, unreadableCodex, healthyDeepseek),
     checkedB.config,
   );

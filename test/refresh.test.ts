@@ -5,11 +5,11 @@ import { access, chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/prom
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { agentTable, routeOf } from "./helpers/identifiers.ts";
 
 // Types are erased, so this import does not evaluate `src/index.ts`; the value
 // import below is dynamic and deliberately happens after `HOME` is redirected.
 import type {
-  AgentRoute,
   ClaudeRefresh,
   CommandRunner,
   KeychainRead,
@@ -678,12 +678,12 @@ const TEMPLATE = (name: string, model: string) =>
   `---\nname: ${name}\ndescription: x\nmodel: "${model}"\nthinking: high\n---\n\nBody.\n`;
 
 /** `planner` is claude-primary, so an unreadable claude rail must hold it. */
-const AGENT_ROUTES: Record<string, AgentRoute> = {
-  planner: {
+const AGENT_ROUTES = agentTable({
+  planner: routeOf({
     primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
     alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
-  },
-};
+  }),
+});
 
 interface Fixture {
   agentDir: string;

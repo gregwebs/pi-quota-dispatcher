@@ -55,7 +55,6 @@ import {
   type Rail,
   type ThinkingLevel,
   agentKey,
-  agentNameRejection,
   configFilesFor,
   describeConfig,
   describeConfigLayers,
@@ -131,6 +130,15 @@ export type {
   SkillBinding,
   ThinkingLevel,
 } from "./config.ts";
+
+// The identifier newtypes and their checked producers are re-exported here for
+// the same reason the config module is: this is the extension's one import
+// surface, and a consumer of the config types needs the brands those types name.
+import type { AgentName, ModelId } from "./identifiers.ts";
+import { parseAgentName, parseModelId } from "./identifiers.ts";
+import { validatedEntries, validatedKeys } from "./validated-keys.ts";
+export { parseAgentName, parseModelId, parseSkillName } from "./identifiers.ts";
+export type { AgentName, ModelId, SkillName } from "./identifiers.ts";
 
 import { checkModels, modelLookup, type DroppedAlternate, type ModelMiss, unknownModelNote } from "./models.ts";
 import {
@@ -592,11 +600,11 @@ export type Outcome =
 export type Decision =
   | (AgentDefinition & {
       kind: "assign";
-      model: string;
+      model: ModelId;
       thinking?: ThinkingLevel;
       why: string;
     })
-  | { agent: string; kind: "hold"; why: string };
+  | { agent: AgentName; kind: "hold"; why: string };
 
 // ---------------------------------------------------------------- parsing
 
@@ -848,7 +856,7 @@ function budgetSummary(reading: RailReading): string {
  * match it. `dir` is resolved too, so a relative or trailing-slash `agentDir`
  * compares the same way.
  */
-function isInside(dir: string, file: string): boolean {
+function isInside({ dir, file }: { dir: string; file: string }): boolean {
   const root = resolve(dir);
   const target = resolve(file);
   return target === root || target.startsWith(root + sep);
@@ -920,7 +928,7 @@ export function decide(
   droppedAlternates: readonly DroppedAlternate[] = [],
 ): Decision {
   const { agent, file } = definition;
-  if (!isInside(cfg.agentDir, file)) {
+  if (!isInside({ dir: cfg.agentDir, file })) {
     return {
       agent,
       kind: "hold",
@@ -1140,7 +1148,7 @@ function pinnedWhy(droppedAlternates: readonly DroppedAlternate[]): string {
   if (!droppedAlternates.length) return "no alternate configured";
   return withNotes(
     "every alternate was dropped — pinned to the primary",
-    droppedAlternates.map((dropped) => unknownModelNote(dropped.key, dropped.model)),
+    droppedAlternates.map(unknownModelNote),
   );
 }
 
@@ -1158,17 +1166,19 @@ function pinnedWhy(droppedAlternates: readonly DroppedAlternate[]): string {
  * render it without a special case: `agent -> (left as is)  [held]  (...)`.
  *
  * The pair travels as a record because two bare strings in a row — an agent and
- * a model — are the same type in the same position, so a swapped call site
- * compiles and reports a model by an agent's name.
+ * a model — read poorly at the call site, and naming the fields says which is
+ * which. The brands now catch the swap too: an `AgentName` and a model string are
+ * no longer interchangeable, so a swapped pair is a compile error rather than a
+ * report that names a model by an agent's name.
  */
-export function heldDecision(held: { agent: string; model: string }): Decision {
+export function heldDecision(held: { agent: AgentName; model: string }): Decision {
   return {
     agent: held.agent,
     kind: "hold",
     // The primary's own key, so the reader gets the line to edit rather than
     // having to work out which of the agent's candidates this is. The wording is
     // the model check's, shared with the note a dropped alternate earns.
-    why: `${unknownModelNote(`${agentKey(held.agent)}.primary.model`, held.model)}; holding`,
+    why: `${unknownModelNote({ key: `${agentKey(held.agent)}.primary.model`, model: held.model })}; holding`,
   };
 }
 
@@ -1278,7 +1288,7 @@ function activeModel(head: string): string | undefined {
  * value, so `model: X`, `model: "X"` and `model: X  # note` are all the same
  * model; an undecodable line is rewritten rather than assumed equal.
  */
-export function upsertModel(src: string, model: string): string | null {
+export function upsertModel(src: string, model: ModelId): string | null {
   const head = frontmatter(src);
   if (head === undefined) return null;
   const tail = src.slice(head.length);
@@ -1516,7 +1526,7 @@ export async function readAgentFiles(agentDir: string): Promise<AgentFile[]> {
 /** An agent as pi spawns it: its name, and the file a write for it lands in. */
 export interface AgentDefinition {
   /** The pi-visible name, which is also the route key. */
-  agent: string;
+  agent: AgentName;
   /**
    * The `.md` file a write for this agent lands in — for a `missing`
    * resolution, the path `/agents` would create, which is never written.
@@ -1540,7 +1550,7 @@ export async function readAgentDirectory(dir: string): Promise<AgentDirectory> {
 /** More than one readable file claims the same name. */
 export interface ContestedAgent {
   kind: "contested";
-  agent: string;
+  agent: AgentName;
   /** Every readable file whose `name` is `agent`, in filename order; always ≥ 2. */
   files: readonly AgentFile[];
 }
@@ -1568,7 +1578,7 @@ export type AgentResolution =
  * Matching is exact and case-sensitive: the name is the one pi spawns, and pi
  * does not fold case for us.
  */
-export function resolveAgent(directory: AgentDirectory, agent: string): AgentResolution {
+export function resolveAgent(directory: AgentDirectory, agent: AgentName): AgentResolution {
   const claimants = directory.files.filter(
     (file): file is NamedAgentFile =>
       file.kind === "agent" && !file.unreadable && file.name === agent,
@@ -1658,7 +1668,7 @@ export function checkAgentFiles(
   warn: (message: string) => void = console.error,
 ): string[] {
   const warnings: string[] = [];
-  for (const agent of Object.keys(config.agents).sort()) {
+  for (const agent of validatedKeys(config.agents).sort()) {
     const resolution = resolveAgent(directory, agent);
     let line: string;
     if (resolution.kind === "contested") {
@@ -1696,7 +1706,7 @@ export function checkAgentFiles(
  * the reader meets it. An empty `model:` or `thinking:` states nothing, the way
  * an empty `name:` declares nothing, so it comes back absent.
  */
-export function agentSelectionReader(agentDir: string): (agent: string) => Promise<AgentFileSelection> {
+export function agentSelectionReader(agentDir: string): (agent: AgentName) => Promise<AgentFileSelection> {
   return async (agent) => {
     const directory = await readAgentDirectory(agentDir);
     const resolution = resolveAgent(directory, agent);
@@ -1731,22 +1741,25 @@ export function agentSelectionReader(agentDir: string): (agent: string) => Promi
  * would reject its name. Every one of those would produce a table that warns the
  * moment it was pasted: a contested name would be held, not dispatched.
  */
-function derivableCandidates(files: AgentFile[]): Array<[string, Candidate]> {
+function derivableCandidates(files: AgentFile[]): Array<[AgentName, Candidate]> {
   const claims = new Map<string, number>();
   for (const file of files) {
     if (file.kind !== "agent" || file.unreadable) continue;
     claims.set(file.name, (claims.get(file.name) ?? 0) + 1);
   }
 
-  const candidates: Array<[string, Candidate]> = [];
+  const candidates: Array<[AgentName, Candidate]> = [];
   for (const file of files) {
     if (file.kind !== "agent") continue;
     if (file.model === undefined) continue;
     if ((claims.get(file.name) ?? 0) > 1) continue;
-    if (agentNameRejection(file.name) !== undefined) continue;
+    const name = parseAgentName(file.name);
+    if ("rejection" in name) continue;
     const rail = railFromModel(file.model);
     if (rail === undefined) continue;
-    candidates.push([file.name, { model: file.model, rail }]);
+    const model = parseModelId(file.model);
+    if ("rejection" in model) continue;
+    candidates.push([name.value, { model: model.value, rail }]);
   }
   return candidates;
 }
@@ -1892,7 +1905,7 @@ const UNKNOWN_MODEL_SUMMARY = "quota-dispatcher: a configured model is unknown t
 export function unknownModelsNotice(misses: ModelMiss[], configPaths: string[]): string[] {
   return [
     UNKNOWN_MODEL_SUMMARY,
-    ...misses.map((miss) => unknownModelNote(miss.key, miss.model)),
+    ...misses.map(unknownModelNote),
     // The action last, so the occurrences above it read as the evidence for it
     // rather than as a list trailing off an instruction.
     `Edit ${configPaths.join(" or ")}, then /reload, or upgrade pi.`,
@@ -1913,7 +1926,7 @@ export function unknownModelsNotice(misses: ModelMiss[], configPaths: string[]):
  */
 export interface AgentWrite {
   file: string;
-  model: string;
+  model: ModelId;
   /** The level the pass resolved; absent when nothing stated one. */
   thinking?: ThinkingLevel;
   /** The model the pass read out of `file`; `undefined` when it read none. */
@@ -2519,7 +2532,7 @@ export interface DispatcherDeps {
    * left exactly as the user left it. Absent or empty, every configured agent is
    * decided the ordinary way.
    */
-  held?: Readonly<Record<string, string>>;
+  held?: Readonly<Record<AgentName, string>>;
   /**
    * The alternates `checkModels` dropped, by agent name — the
    * `droppedAlternates` record of the same result.
@@ -2528,7 +2541,7 @@ export interface DispatcherDeps {
    * a route with no alternates started that way or lost them. Absent or empty,
    * an empty `alternates` list reads as the user's own `[]`.
    */
-  droppedAlternates?: Readonly<Record<string, readonly DroppedAlternate[]>>;
+  droppedAlternates?: Readonly<Record<AgentName, readonly DroppedAlternate[]>>;
   /**
    * Fallback credential store for the Claude rail. Left unset, production takes
    * whichever one this platform has; tests inject a fake so that they never
@@ -3053,7 +3066,7 @@ export function createDispatcher(
     // created with `/agents` after the boot warning is picked up on the next
     // pass, and so is a `name:` edited mid-session.
     return Promise.all(
-      Object.entries(cfg.agents).map(async ([agent, route]) => {
+      validatedEntries(cfg.agents).map(async ([agent, route]) => {
         const resolution = resolveAgent(directory, agent);
         // A contested name has no single file to write, and no reading could
         // change which file that is, so it is answered before the model check.

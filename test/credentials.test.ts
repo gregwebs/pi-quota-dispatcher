@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
-  type AgentRoute,
   type CommandRunner,
   type KeychainRead,
   CLAUDE_KEYCHAIN_SERVICE,
@@ -16,6 +15,7 @@ import {
   parseClaudeToken,
   readClaudeToken,
 } from "../src/index.ts";
+import { agentTable, routeOf } from "./helpers/identifiers.ts";
 
 // This file pins the credential-store contract: the macOS login keychain is the
 // live home of the Claude subscription credential, the on-disk file is a legacy
@@ -325,16 +325,16 @@ const TEMPLATE = (name: string, model: string) =>
   `---\nname: ${name}\ndescription: x\nmodel: "${model}"\nthinking: high\n---\n\nBody.\n`;
 
 /** `planner` is claude-primary, so an unusable claude rail holds it. */
-const AGENT_ROUTES: Record<string, AgentRoute> = {
-  planner: {
+const AGENT_ROUTES = agentTable({
+  planner: routeOf({
     primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
     alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
-  },
-  reviewer: {
+  }),
+  reviewer: routeOf({
     primary: { model: "openai-codex/gpt-6-astra", rail: "codex" },
     alternates: [{ model: "claude-bridge/claude-opus-5-5", rail: "claude" }],
-  },
-};
+  }),
+});
 
 interface Fixture {
   agentDir: string;

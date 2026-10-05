@@ -30,6 +30,7 @@ import {
   type ThinkingLevel,
   type WriteResult,
   applyDecision,
+  parseModelId,
   withFileLock,
 } from "../../src/index.ts";
 
@@ -200,12 +201,21 @@ async function runJob(job: Job): Promise<void> {
 
   switch (job.kind) {
     case "apply": {
+      // The job arrives as decoded JSON, so its model is a raw string again.
+      // Validate it before touching a file: a job that names an id this seam
+      // would never accept is refused here rather than handed to a write.
+      const model = parseModelId(job.model);
+      if ("rejection" in model) {
+        const result: WriteResult = { kind: "held", why: model.rejection };
+        process.stdout.write(`${JSON.stringify(result)}\n`);
+        break;
+      }
       if (job.readyMarker !== undefined) await writeFile(job.readyMarker, "ready", "utf8");
       if (job.awaitFile !== undefined) await waitForFile(job.awaitFile);
       const result = await applyDecision(
         {
           file: job.file,
-          model: job.model,
+          model: model.value,
           ...(job.thinking === undefined ? {} : { thinking: job.thinking }),
           base: job.base,
           dry: job.dry ?? false,
