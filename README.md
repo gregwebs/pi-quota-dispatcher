@@ -920,16 +920,6 @@ after ten minutes even though its process lives. A pass with nothing to write
 takes no lock at all. See ADR
 [0013](docs/adr/0013-agent-file-writes-are-coordinated.md).
 
-**Config identifiers stay plain strings.** An agent name, a model id and a skill
-name are validated at the config seam and then carried as `string`, not branded
-newtypes. A brand's compile-time check is real, but the tables are enumerated
-with `Object.keys`/`entries`, which return untyped keys, so threading it through
-the seam and its consumers means a full-suite migration and a conversion at
-every key traversal. Where two same-typed arguments sat in a row, the remedy was
-a named record or a factory — `ModelMiss`, `isInside({ dir, file })` — before it
-was a brand. See
-[0017](docs/adr/0017-config-identifiers-stay-plain-strings.md).
-
 ## Where the numbers come from
 
 Two endpoints that the vendors' own clients use. Neither is a documented public
