@@ -16,9 +16,22 @@ Claude profile or a second pi auth file never inherits another account's
 numbers. The metered rail is never stored: it has no endpoint to ask and nothing
 that could go stale.
 
-The format is internal and versioned (`version: 1`), and it is not a public
-contract. Nothing outside `src/readings-file.ts` names a key of it, and the only
-thing a caller sees is the same `RailReadings` the in-memory cache produced.
+The same file also holds the refresh ping's gates — a per-credential cooldown
+and per-episode halt, and one machine-wide sticky halt (ADR 0007) — so a ping
+one process makes is not repeated by the next, and a gate it arms is honoured by
+all of them. The gates are written under the same lock and read atomically with
+the same `0600` atomic replace, and a gate this process armed is kept in memory
+as well, so a write that cannot be made still protects the process that made the
+attempt. What is kept in memory is only the operations this process has not yet
+published, applied on top of a freshly loaded document; an operation retires
+once it lands, so a peer's later clear or re-arm is never hidden behind a stale
+local copy.
+
+Version 2 of the format adds the `gates` list and the `stickyHalt` record. The
+format is internal, not a public contract. Nothing outside `src/readings-file.ts`
+names a key of it, and the only thing a caller sees is the same `RailReadings`
+the in-memory cache produced plus the `RefreshGates` the dispatcher asks for by
+credential.
 
 ## One file, not one per rail
 
@@ -86,8 +99,15 @@ The wait is **bounded**, and that bound is the whole reason this is safe. It is
 computed from the quota read's own limits:
 `attempts × timeoutMs + (attempts - 1) × backoffMs + CLAUDE_PING_TIMEOUT_MS` —
 every attempt timing out, every backoff between them, and the one refresh ping a
-Claude read may run inside an attempt. A waiter that reaches that bound fetches
-for itself. The alternative — waiting however long the holder takes — would let
+Claude read may run inside an attempt. That sum covers the vendor-side work only:
+it does **not** include the holder's keychain read or its gate writes, so a
+perfectly healthy holder can in principle exceed the bound and hand a waiter a
+duplicate fetch. That is the same bounded-wait duplicate the considered options
+below already accept, and it is deliberate — the bound is the longest a *vendor*
+read can honestly take, not the longest a read of any kind could, because padding
+it for the local work would make a genuinely stuck holder cost more than the
+redundant request it avoids. A waiter that reaches that bound fetches for
+itself. The alternative — waiting however long the holder takes — would let
 one process with a stuck or paused holder stall an evaluation that another
 process is waiting on, which is exactly the failure ADR 0006 exists to refuse.
 The bounded wait trades a rare duplicate request for the guarantee that a holder
@@ -131,8 +151,9 @@ user even mid-write.
 ## A corrupt file is reported, not fatal
 
 The document is decoded all-or-nothing. Not JSON, not an object, an unknown
-version, or any single entry that fails the reading schema makes the whole file
-read as empty and raises one warning line, which the report prints. The file is
+version, any single entry that fails the reading schema, or any gate or sticky
+record that fails its own makes the whole file read as empty and raises one
+warning line, which the report prints. The file is
 skipped, never repaired in place, and the next successful write replaces it with
 a valid document — so a file a future version wrote, or one a hand edit broke, is
 a message and a re-fetch, not a broken dispatcher. The warning is in the report
@@ -174,10 +195,12 @@ paths are part of the cache's identity; changing `claudeCredsPath` starts readin
 a different account's entry rather than serving the old one, which is why the
 resolution happens at the key, not at the config.
 
-The file is not authoritative over the process: a read that cannot write still
-answers, so two processes can both fetch a rail when the file is unwritable. That
-is the deliberate direction of the trade — a duplicated request, never a refused
-evaluation.
+The store is still fundamentally a cache: a read that cannot write still answers,
+and a gate that cannot be written is still kept in the process that armed it.
+Two processes can therefore both fetch a rail, or both ping, when the file is
+unwritable or the fetch lock's bounded wait runs out. That is the deliberate
+direction of the trade — a duplicated request at worst, never a refused
+evaluation or an un-gated retry.
 
 `knownReadings()` now reads through this store, which is the seam ADR 0015 named
 for the generator path. It stays age-blind: it returns an entry whatever its

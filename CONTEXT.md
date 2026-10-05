@@ -102,11 +102,12 @@ The one file a machine's pi processes share their **rail readings** through, so
 two processes polling one credential make one vendor request per TTL between
 them. It sits beside the global config, is created `0600` because a reading
 carries the vendor's own response body, and is keyed per rail and credential, so
-a second account never inherits a first's numbers. Its format is internal and
-versioned, not a public contract: a **rail reading** read back out of it is the
-same shape a process cached itself. A corrupt or unknown-version file is skipped
-rather than fatal — the whole file reads as empty, the **report** carries the
-warning, and the next successful write repairs it. See
+a second account never inherits a first's numbers. It also holds the **refresh
+gates**, so a ping one process makes is not repeated by the next. Its format is
+internal and versioned, not a public contract: a **rail reading** read back out
+of it is the same shape a process cached itself. A corrupt or unknown-version
+file is skipped rather than fatal — the whole file reads as empty, the **report**
+carries the warning, and the next successful write repairs it. See
 [docs/adr/0016](docs/adr/0016-shared-rail-readings.md).
 _Avoid_: cache file, quota file, shared store, readings cache
 
@@ -203,6 +204,20 @@ a token to read. What the extension delegates is the refresh, not the credential
 it never posts a refresh token and never writes the store, because that token
 rotates and a second writer is a way to end the user's session.
 _Avoid_: token refresh, credential refresh, re-login, keepalive
+
+**Refresh gate**:
+The state that decides whether an expired credential may be pinged again, held
+in the **rail readings file** so every pi process on the machine obeys it. A
+**cooldown** is a 15-minute wait after a ping that appears to have done nothing;
+a **halt** is the refusal that follows one that could have spent money or ran
+without effect. A cooldown and a halt are keyed to the credential, so another
+account is unaffected. The **sticky halt** is the exception: an **undiverted**
+ping is a fact about the Claude Code install, so its halt is one record for the
+machine, keyed to the resolved `claude` path and mtime at the moment it was
+armed. A changed path or mtime clears it; `/quota-dispatch refresh` clears it
+explicitly. A gate hit is never re-armed. See
+[docs/adr/0007](docs/adr/0007-refresh-pings.md).
+_Avoid_: rate limit, backoff, retry window, ping lock
 
 **Report**:
 The answer to "what is my state?": the rail readings, one decision line per

@@ -44,7 +44,7 @@ import { existsSync, type Stats } from "node:fs";
 import { open, readFile, readdir, stat } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { userInfo } from "node:os";
-import { basename, join, resolve, sep } from "node:path";
+import { basename, delimiter, join, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_CONFIG,
@@ -160,6 +160,7 @@ import {
   DEFAULT_SHARED_READINGS,
   createSharedReadings,
   type SharedReadingsPacing,
+  type StickyHalt,
   type VendorReading,
 } from "./readings-file.ts";
 
@@ -175,9 +176,13 @@ export {
 } from "./readings-file.ts";
 export type {
   CachedReadings,
+  CredentialGates,
+  GatePatch,
+  RefreshGates,
   SharedReadings,
   SharedReadingsDeps,
   SharedReadingsPacing,
+  StickyHalt,
   VendorReading,
 } from "./readings-file.ts";
 
@@ -2849,11 +2854,17 @@ const HALT_SUFFIX = "no further attempt will be made";
 
 /**
  * The suffix the sticky halt carries. It is the one difference from the
- * per-episode halt: the per-episode one ends with the expiry, the sticky one
- * with the pi process, and the rail has to say so or the user will read the
- * still-off feature as a bug.
+ * per-episode halt — that one ends with the expiry, this one outlives it — so
+ * the rail has to name what does end it.
+ *
+ * The two things that end it are both outside this process, and neither is
+ * obvious from the rail line alone; without them the still-off feature reads as
+ * a bug. A process that dies does *not* end it: the halt is a fact about the
+ * machine's claude install, which is why it outlives a token and why another pi
+ * process on this host inherits it.
  */
-const STICKY_HALT_SUFFIX = "no further attempt will be made this session";
+const STICKY_HALT_SUFFIX =
+  "no further attempt will be made until the resolved claude changes or /quota-dispatch refresh";
 
 function haltNote(note: string): string {
   return `${note}; ${HALT_SUFFIX}`;
@@ -2874,9 +2885,72 @@ function describePing(result: ClaudePing): string {
   return `refresh ping ${result.outcome}: ${result.note}`;
 }
 
+export interface ClaudeIdentity {
+  path: string;
+  mtimeMs: number;
+}
+
+/**
+ * The `claude` executable name, and the extensions a Windows PATH lookup tries
+ * beside it when `PATHEXT` says nothing.
+ */
+const CLAUDE_EXE = "claude";
+const DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD";
+
+/**
+ * Resolve the `claude` this machine's ping would run, by PATH scan (never
+ * spawning it), and its mtime. Skips directories and non-executable files.
+ * Returns undefined when nothing resolves.
+ *
+ * A scan rather than a spawn because this runs on the path that decides whether
+ * a ping may run at all: asking by running would be the very request the gates
+ * exist to bound. `stat` follows a symlink on purpose — the mtime that moves
+ * when an install is upgraded is the target's — while `realpath` is deliberately
+ * not applied, so the identity is the name this PATH would select.
+ *
+ * Executability is part of the identity because it is part of the lookup: the
+ * shell and `execvp` skip a `claude` they cannot run and take the next name on
+ * PATH, so accepting a non-executable file here would key a halt to a file no
+ * ping would ever reach.
+ *
+ * The scan mirrors the lookup the ping's own runner performs, `execvp`'s: an
+ * empty segment is the working directory and a relative one is relative to it,
+ * so both are resolved against the cwd and the answer is always absolute.
+ */
+export async function claudeInstall(env: NodeJS.ProcessEnv = process.env): Promise<ClaudeIdentity | undefined> {
+  const extensions =
+    process.platform === "win32"
+      ? ["", ...(env.PATHEXT ?? DEFAULT_PATHEXT).split(";").filter((ext) => ext !== "")]
+      : [""];
+  for (const segment of (env.PATH ?? "").split(delimiter)) {
+    // An empty segment means the working directory to `execvp` (and so to the
+    // ping's `execFile`), resolved here against this process's cwd; skipping it
+    // would key the halt to a different binary than the ping runs.
+    const base = segment === "" ? "." : segment;
+    for (const extension of extensions) {
+      const candidate = resolve(base, `${CLAUDE_EXE}${extension}`);
+      let found: Stats;
+      try {
+        found = await stat(candidate);
+      } catch {
+        continue;
+      }
+      if (!found.isFile()) continue;
+      if (process.platform !== "win32" && (found.mode & 0o111) === 0) continue;
+      return { path: candidate, mtimeMs: found.mtimeMs };
+    }
+  }
+  return undefined;
+}
+
 export interface DispatcherDeps {
   fetchImpl?: typeof fetch;
   now?: () => number;
+  /**
+   * Seam: the claude install the sticky halt is keyed to. Defaults to
+   * claudeInstall().
+   */
+  claudeIdentity?: () => Promise<ClaudeIdentity | undefined>;
   /**
    * Agents whose primary this pi cannot spawn, by agent name, each carrying the
    * model id it did not recognise — the `held` record `checkModels` returns.
@@ -2984,6 +3058,8 @@ export interface Dispatcher {
   knownReadings(): Promise<KnownReadings>;
   evaluate(opts?: { force?: boolean; dry?: boolean }): Promise<Array<{ decision: Decision; outcome: Outcome }>>;
   report(opts?: { force?: boolean }): Promise<string[]>;
+  /** Clear the machine-wide sticky halt; `/quota-dispatch refresh` calls this. */
+  clearStickyHalt(): Promise<void>;
 }
 
 export function createDispatcher(
@@ -3042,20 +3118,18 @@ export function createDispatcher(
 
   // One ping in flight at a time, however many callers race `railReadings`.
   let inFlight: Promise<ClaudePing> | undefined;
-  // The gates over the next attempt. `cooldown` is a time gate armed by a
-  // `failed` attempt only. `halted` is armed by anything that could have spent
-  // money or ran without effect, and is cleared only by a read that yields a
-  // usable token — the end of the expiry episode. `stickyHalt` is the one
-  // exception: an `undiverted` run is a statement about the environment, not
-  // about that expiry, so the next expiry would pay again; it survives a usable
-  // token and only a new pi process clears it.
+  // The gates over the next attempt live in the shared readings store, not in
+  // this closure: they are facts about the credential and the machine's claude
+  // install, so every pi process under this OS user must obey the same ones.
+  // A gate hit never re-arms: `pollMs` ships at five minutes and the cooldown at
+  // fifteen, so a hit that re-armed would push the retry out forever and the
+  // ping would never be tried again after a transient failure.
   //
-  // A gate hit never re-arms any of them: `pollMs` ships at five minutes and the
-  // cooldown at fifteen, so a hit that re-armed would push the retry out forever
-  // and the ping would never be tried again after a transient failure.
-  let cooldown: { at: number; note: string } | undefined;
-  let halted: string | undefined;
-  let stickyHalt: string | undefined;
+  // The install the sticky halt is keyed to. Resolved at most once per read, and
+  // only when there is a halt to validate or a ping is about to run — the latter
+  // so an `undiverted` verdict can be recorded against the install that actually
+  // ran. Not tied to expiry: a usable-token read validates an existing halt too.
+  const claudeIdentity = deps.claudeIdentity ?? (() => claudeInstall());
 
   /**
    * A vendor's usage document, read under a timeout and retried while the
@@ -3133,24 +3207,42 @@ export function createDispatcher(
    * can only be repeated by paying again or by running again without effect, so
    * both halt — but the two halts differ in lifespan. `undiverted` is sticky: a
    * usable token does not clear it, because the next expiry would fail to divert
-   * the same way and pay again. The spending mode's halt is per-episode, like
-   * the `pinged`-without-a-token halt set below. A `deferred` attempt is
-   * reported but arms nothing: another process is doing the work, so the next
-   * read may try again.
+   * the same way and pay again, so it is keyed to the install it was armed from
+   * and shared machine-wide. The spending mode's halt is per-episode, like the
+   * `pinged`-without-a-token halt set below. A `deferred` attempt is reported but
+   * arms nothing: another process is doing the work, so the next read may try
+   * again.
+   *
+   * `identity` is the install resolved before the ping ran, so the sticky halt
+   * an `undiverted` verdict arms names the executable that actually ran rather
+   * than one resolved after it finished and perhaps changed underneath it. A
+   * machine where nothing resolves records `null`/`null` rather than a guess —
+   * the halt still stands, and only an explicit clear removes it.
    */
-  function recordVerdict(verdict: ClaudePing, spends: boolean): string | undefined {
+  async function recordVerdict(
+    credential: string,
+    verdict: ClaudePing,
+    spends: boolean,
+    identity: ClaudeIdentity | undefined,
+  ): Promise<string | undefined> {
     if (verdict.outcome === "pinged") return undefined;
     const note = describePing(verdict);
     if (verdict.outcome === "deferred") return note;
     if (verdict.outcome === "undiverted") {
-      stickyHalt = stickyHaltNote(note);
-      return stickyHalt;
+      const sticky = stickyHaltNote(note);
+      await readings.setStickyHalt(
+        identity === undefined
+          ? { note: sticky, claudePath: null, claudeMtimeMs: null }
+          : { note: sticky, claudePath: identity.path, claudeMtimeMs: identity.mtimeMs },
+      );
+      return sticky;
     }
     if (spends) {
-      halted = haltNote(note);
+      const halted = haltNote(note);
+      await readings.setGates(credential, { halt: halted });
       return halted;
     }
-    cooldown = { at: now(), note };
+    await readings.setGates(credential, { cooldown: { at: now(), note } });
     return note;
   }
 
@@ -3174,13 +3266,63 @@ export function createDispatcher(
    * reason the halt exists.
    */
   async function claudeToken(): Promise<{ token: string; note?: string } | { note: string }> {
+    // The resolved credential path, which is also the shared store's key for
+    // this rail: two configs that name one file through different spellings read
+    // and arm one set of gates.
+    const credential = credentialFor("claude");
+    // Read before the credential, because the answer decides whether an attempt
+    // may be made at all.
+    const gates = await readings.gates(credential);
+
+    // Resolved at most once per read, and only by the two callers that need it.
+    let resolved: ClaudeIdentity | undefined;
+    let resolvedOnce = false;
+    const install = async (): Promise<ClaudeIdentity | undefined> => {
+      if (!resolvedOnce) {
+        resolvedOnce = true;
+        resolved = await claudeIdentity();
+      }
+      return resolved;
+    };
+
+    // The sticky halt that still names this machine's install, or `undefined`.
+    // The identity is what gives the halt its lifespan: an install that changed
+    // is an install the halt says nothing about, so the halt goes — cleared
+    // conditionally, so a peer's halt armed from some other install meanwhile is
+    // not erased. A halt armed with no resolved install (`null`/`null`) is kept:
+    // an unresolvable install is not evidence that the executable changed.
+    //
+    // The conditional clear is only conditionally effective: if a peer publishes
+    // a different halt while the clear waits for the lock, the store keeps that
+    // replacement, and this dispatcher must judge the survivor rather than ping
+    // past it. So after each clear the survivor is re-read and re-judged, up to
+    // a small bound — each turn only continues while peers keep arming halts
+    // this install does not match. Past the bound the survivor is returned and
+    // honoured, never discarded, because pinging past a live halt is the costlier
+    // error.
+    const liveSticky = async (sticky: StickyHalt | undefined): Promise<StickyHalt | undefined> => {
+      let current = sticky;
+      for (let turn = 0; turn < 3; turn++) {
+        if (current === undefined || current.claudePath === null) return current;
+        const found = await install();
+        if (found === undefined) return current;
+        if (found.path === current.claudePath && found.mtimeMs === current.claudeMtimeMs) return current;
+        await readings.setStickyHalt(undefined, current);
+        const survivor = (await readings.gates(credential)).sticky;
+        if (survivor === undefined) return undefined;
+        current = survivor;
+      }
+      return current;
+    };
+
     const first = await readClaudeToken(cfg.claudeCredsPath, { keychain, now: now() });
     if ("token" in first) {
       // A usable token is the end of the expiry episode, so the per-episode halt
       // it armed is cleared here and nowhere else. The sticky one is not: it is
       // a property of the environment, not of this expiry.
-      halted = undefined;
-      return stickyHalt === undefined ? { token: first.token } : { token: first.token, note: stickyHalt };
+      if (gates.halt !== undefined) await readings.setGates(credential, { clearHalt: true });
+      const sticky = await liveSticky(gates.sticky);
+      return sticky === undefined ? { token: first.token } : { token: first.token, note: sticky.note };
     }
     if (first.reason !== "expired") return { note: first.error };
     if ("skip" in plan) return { note: expiredNote(first.error, skippedNote(plan.skip)) };
@@ -3188,24 +3330,34 @@ export function createDispatcher(
     // A gate hit returns the note its attempt earned, without re-arming. The
     // sticky halt outranks the per-episode one: once the environment has failed
     // to divert, no attempt is worth making whatever else is armed.
-    const gate = stickyHalt ?? halted;
-    if (gate !== undefined) return { note: expiredNote(first.error, gate) };
-    if (cooldown && now() - cooldown.at < CLAUDE_PING_COOLDOWN_MS) {
-      return { note: expiredNote(first.error, cooldown.note) };
+    const sticky = await liveSticky(gates.sticky);
+    if (sticky !== undefined) return { note: expiredNote(first.error, sticky.note) };
+    if (gates.halt !== undefined) return { note: expiredNote(first.error, gates.halt) };
+    if (gates.cooldown !== undefined && now() - gates.cooldown.at < CLAUDE_PING_COOLDOWN_MS) {
+      return { note: expiredNote(first.error, gates.cooldown.note) };
     }
 
+    // Resolved before the ping runs, not after, so an `undiverted` verdict is
+    // keyed to the install that actually ran; an install that changes while the
+    // ping runs must not be the one a halt is armed against.
+    const identity = await install();
     const verdict = await (inFlight ??= plan.ping().finally(() => { inFlight = undefined; }));
-    const decision = recordVerdict(verdict, plan.spends);
+    const decision = await recordVerdict(credential, verdict, plan.spends, identity);
 
     const reread = await readClaudeToken(cfg.claudeCredsPath, { keychain, now: now() });
     if ("token" in reread) {
-      halted = undefined;
-      return stickyHalt === undefined ? { token: reread.token } : { token: reread.token, note: stickyHalt };
+      // The halt goes with the episode, including one this very attempt armed: a
+      // spending-mode `failed` halts only until the store yields a token again.
+      const after = await readings.gates(credential);
+      if (after.halt !== undefined) await readings.setGates(credential, { clearHalt: true });
+      const live = await liveSticky(after.sticky);
+      return live === undefined ? { token: reread.token } : { token: reread.token, note: live.note };
     }
     // `pinged` but still nothing usable: the run dispatched a request and the
     // store gained nothing, so another one would not either.
     if (decision === undefined) {
-      halted = haltNote(describePing(verdict));
+      const halted = haltNote(describePing(verdict));
+      await readings.setGates(credential, { halt: halted });
       return { note: expiredNote(reread.error, halted) };
     }
     return { note: expiredNote(reread.error, decision) };
@@ -3469,7 +3621,19 @@ export function createDispatcher(
     return lines;
   }
 
-  return { railReadings, allReadings, knownReadings, evaluate, report };
+  /**
+   * Clear the machine-wide sticky halt.
+   *
+   * Unconditional, unlike the clear the expired-credential path makes: this is
+   * the user's own lever (`/quota-dispatch refresh`), a deliberate statement
+   * about the machine rather than a reader's stale observation, so there is
+   * nothing to compare against.
+   */
+  async function clearStickyHalt(): Promise<void> {
+    await readings.setStickyHalt(undefined);
+  }
+
+  return { railReadings, allReadings, knownReadings, evaluate, report, clearStickyHalt };
 }
 
 // ---------------------------------------------------------------- extension
@@ -4010,6 +4174,12 @@ export default function (pi: ExtensionAPI) {
       } else if (invocation.form === "config") {
         lines = describeConfig(loaded);
       } else {
+        // `refresh` is the user's one lever on the machine-wide sticky halt: the
+        // halt outlives a token and a process, so without this a machine whose
+        // diversion had failed once would have no way back short of editing the
+        // shared file. Cleared before the report, so the forced read the report
+        // makes is one that may actually ping.
+        if (invocation.force) await dispatcher.clearStickyHalt();
         // The report carries the install's shape and its warnings, not where
         // each value came from: provenance is a question asked deliberately,
         // and `config` is the form that answers it. The warnings stay because a

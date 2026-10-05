@@ -76,7 +76,8 @@ which is the one outcome that would defeat the exercise. The list is a denylist
 rather than an allowlist because it must not omit anything the child needs —
 being wrong there turns a working refresh into a silent failure — and the
 residual it leaves is bounded: a selection variable it does not know about
-surfaces as an `undiverted` run, which halts for the session.
+surfaces as an `undiverted` run, which halts the feature until the resolved
+`claude` changes or `/quota-dispatch refresh` is run.
 
 ## A listener, not a dead port
 
@@ -96,11 +97,12 @@ silently failed to apply would be reported as a failed refresh while the request
 it really sent cost a real answer's worth of tokens — around 31k of them in the
 measurement. No request arriving is an anomaly to report, never something to
 retry: a clean exit that reached no request is its own verdict (`undiverted` in
-the code), and it halts the feature for the session, because a clean exit means
-the model call was answered *somewhere* and the diversion may have failed at the
-cost of a real request. That halt is the one that outlives a usable token — see
-*The bounds* for why — and the rail says so, because "the feature is off until
-you restart" otherwise reads as a bug.
+the code), and it halts the feature until the resolved `claude` changes or
+`/quota-dispatch refresh` is run, because a clean exit means the model call was
+answered *somewhere* and the diversion may have failed at the cost of a real
+request. That halt is the one that outlives a usable token — see *The bounds* for
+why — and the rail says so, because "the feature is off until you update Claude
+Code or run refresh" otherwise reads as a bug.
 
 Arrival is proof only that a connection reached this socket, not of who made it:
 a stray loopback connection during the run counts. That is accepted rather than
@@ -153,9 +155,13 @@ a bounded kill; and a do-not-kill race that lets a slow run finish once it has
 signalled it is refreshing, which needs a signal the child does not provide. A
 future reader with a reason to revisit this should start here.
 
-Single-flight covers the callers that race: `railReadings` is reached from the
-startup path, the poll, and `/quota-dispatch refresh`, and there is only ever one
-Claude Code process being used as a token refresher here.
+Single-flight covers the callers that race *inside one process*: `railReadings`
+is reached from the startup path, the poll, and `/quota-dispatch refresh`, and
+only one of those runs a `claude` at a time. Across processes the ping is
+covered by the per-credential fetch lock the shared readings file already takes
+(ADR 0016): the ping runs inside the read the lock serialises, so two pi
+processes on one credential make one ping between them, and the loser is handed
+the winner's reading.
 
 Two gates sit over the *next* attempt, and they are deliberately different. A
 **cooldown** — 15 minutes — follows a `failed` attempt: nothing appears to have
@@ -167,17 +173,47 @@ A **halt** follows anything that could have spent money or that ran without
 effect — a `failed` attempt in `ping` mode, or a `pinged` run whose re-read
 still finds no token. Those halts are **per-episode**: a credential read that
 yields a usable token ends one, and a later expiry is a new episode that may
-ping again. The `undiverted` halt is the exception and **sticks for the
-session**: a clean exit that reached no request is a property of the
+ping again. The `undiverted` halt is the exception and is **keyed to the Claude
+Code install**: a clean exit that reached no request is a property of the
 *environment*, not of that one expiry, so the next expiry would fail to divert
 the same way and pay again. It therefore survives the usable token that ends the
-episode, and nothing but a new pi process clears it. Neither gate is re-armed by
-a hit: a read inside the cooldown does not push its own window out, however many
-5-minute polls land in it.
+episode. It is cleared when the resolved `claude` path or mtime changes — an
+update to Claude Code is what could change "this build ignores the diversion" —
+or explicitly by `/quota-dispatch refresh`. Neither gate is re-armed by a hit: a
+read inside the cooldown does not push its own window out, however many 5-minute
+polls land in it.
 
 These numbers are constants rather than config-file keys, for the reason the
 quota-read timings are: how long to wait for a subprocess is a fact about this
 machine, not a routing preference.
+
+## The gates are shared through the readings file
+
+All three gates live in the shared readings file beside the readings (ADR 0016),
+keyed by the resolved credential path, so a cooldown or halt armed by one pi
+process is honoured by every other. A gate hit still writes nothing, so honouring
+a peer's gate never pushes its window out.
+
+The sticky halt is one record for the machine rather than one per credential: an
+install that ignores the loopback diversion does so for every profile. It stores
+the resolved `claude` path and mtime it was armed against. A later read whose
+resolved install does not match ends the halt and lets the attempt be made
+again; a read that cannot resolve the install keeps the halt rather than reading
+"I could not find the binary" as "the binary changed". A halt armed when no
+install could be resolved stores no path and is therefore only cleared by
+`/quota-dispatch refresh`.
+
+The write is best effort, exactly as a reading write is: a gate is also kept in
+the process that armed it, so a file that cannot be written never turns the
+gate that protects this process into an un-gated retry. The residual of the
+shared design is the residual of ADR 0016's bounded fetch-lock wait: a process
+that reaches the bound fetches — and so pings — for itself rather than waiting
+out a holder it cannot see the end of. That bound is computed from the quota
+read's own limits and does not include the holder's keychain read or the gate
+writes this ADR added, so even a healthy holder can exceed it and a duplicate
+ping is possible. The one-ping guarantee is therefore for the ordinary case
+where the holder answers within the longest a *vendor* read can take, not an
+absolute one.
 
 ## What is not known
 

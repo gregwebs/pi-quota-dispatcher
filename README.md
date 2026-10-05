@@ -973,11 +973,14 @@ not a routing preference. See [0006](docs/adr/0006-bounded-quota-reads.md).
 Readings are **shared, not private** to a process. What a rail answered is kept
 in the **rail readings file**, `<agent dir>/quota-dispatch-readings.json`, so
 every pi under your user reuses one answer per `ttlMs` rather than making its own
-request. It is created `0600` because a reading carries the vendor's own response
-body, is keyed per rail and credential so a second account never inherits a
-first's numbers, and is skipped rather than fatal when corrupt — the report
-carries the warning and the next successful read repairs it. Writing it is best
-effort: a cache that cannot be written never turns an evaluation into an error.
+request. The refresh ping's gates live there too, so one process's cooldown or
+halt keeps the next process from repeating an attempt. It is created `0600`
+because a reading carries the vendor's own response body, is keyed per rail and
+credential so a second account never inherits a first's numbers, and is skipped
+rather than fatal when corrupt — the report carries the warning and the next
+successful read repairs it. Writing it is best effort: a cache that cannot be
+written never turns an evaluation into an error, and a gate that cannot be
+written is still kept in the process that armed it.
 See [0016](docs/adr/0016-shared-rail-readings.md), and the **Rail readings
 file** term in [CONTEXT.md](CONTEXT.md).
 
@@ -1015,16 +1018,18 @@ make it refresh — or spend — a different credential from the one the dispatc
 read, and a provider switch such as `CLAUDE_CODE_USE_BEDROCK` cannot move the
 request off the listener to bill another provider.
 
-An attempt costs a subprocess, so there is at most one at a time. After an
+An attempt costs a subprocess, so there is at most one at a time, and the gates
+over it are shared through the [readings file](#where-the-numbers-come-from), so
+two pi processes on one credential make one attempt between them. After an
 attempt that merely failed — the binary missing, a stall before any request — the
 dispatcher backs off for a while and then retries once. After one that could have
 spent a real request, or that ran and did not work, it stops making attempts: a
 repeat can only pay again. That stop lasts until a credential read finds a usable
 token — the end of the expiry — except for a run that never diverted at all,
-which keeps the feature off for the rest of the session, because the next expiry
-would pay again; only a new pi process clears that one. A run that collides with
-Claude Code's own refresh lock is neither — it is reported as a deferral, because
-the other process is doing the work, so the next read may try again.
+which keeps the feature off until the Claude Code install it was keyed to changes
+or you run `/quota-dispatch refresh`. A run that collides with Claude Code's own
+refresh lock is neither — it is reported as a deferral, because the other process
+is doing the work, so the next read may try again.
 See [0007](docs/adr/0007-refresh-pings.md) for the measurements, the bounds, and
 the alternatives that were rejected.
 
