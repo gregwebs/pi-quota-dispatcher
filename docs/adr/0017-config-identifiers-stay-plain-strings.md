@@ -48,12 +48,27 @@ where a value flows through a typed field or a typed table value: a
 model id is expected. `agentKey(modelId)` would not compile. That benefit is
 genuine, and it is the benefit issue #57 asked about.
 
+The spike encoded the brands as opaque types — `declare const brand: unique
+symbol` with `type Brand<T, B extends string> = T & { readonly [brand]: B }` —
+the standard TypeScript nominal-typing idiom, not a weaker `{ __brand:
+"AgentName" }` property hack. Tagging each role with its own `unique symbol` on a
+`private` field is a marginally stricter spelling of the same idea, and the spike
+used one shared symbol with a per-role literal tag; the choice does not move any
+measurement below, since every variant is erased at run time and escaped by the
+same `as` assertion.
+
 The cost is concentrated where these values are *keys* and where they arrive
 *raw*. `Object.keys` and `Object.entries` — how the `agents`, `models` and
 `skills` tables are folded — return `string` keys, so the merge loop and the
 provenance loop each need a predicate or an assertion to recover the key brand;
 the spike left `TS7053` on every `Record<AgentName, …>` indexed by a `string`
-and `TS2339` on `config.agents.planner`. Raw input is the cheap direction:
+and `TS2339` on `config.agents.planner`. The recovery is actually paid in the
+loops that fold an *already-validated* table — the programmatic `base`, the
+provenance map, and the summary and listing readers — where the tables are typed
+but `Object.keys` has thrown the key brand away; re-keying those tables as a
+`Map` would brand keys once at the parse boundary and keep the brand for free
+thereafter (see Considered options). That key half of the cost is a property of
+the object representation, not of branding. Raw input is the cheap direction:
 `JSON.parse` yields `any` and the frontmatter reader yields `string`, and
 validation would *produce* a brand through a type predicate rather than assert
 one. The awkward case is the tables themselves: a table key cannot be branded
@@ -127,6 +142,19 @@ they already are, and the other two roles interchangeable.
 32 deletions in `src/config.ts` alone, and 174 diagnostics across twelve files —
 170 of them in tests. Rejected because the seam-only brand is exactly what the
 consumers then cannot name, so the churn does not shrink; it moves.
+
+**Re-key the tables as `Map<AgentName, …>` instead of `Record<string, …>`
+(reasoned, not spiked).** A `Map` keeps the key brand — iteration yields
+`AgentName`, and `get`/`has` demand one (confirmed in a probe) — and because JSON
+is object-shaped, the single unavoidable assertion falls at the parse boundary
+where validation already lives: the merge loop never recovers a key brand, and
+the tables' `Object.hasOwn` prototype guard becomes unnecessary (a `Map` has no
+prototype keys). It is not a newtype and does not answer this issue, and it is a
+runtime-representation change (serialization, merge, and every `.get`/`.has`
+call site), but it would remove the key half of the cost above. It would not
+remove the value half: of the 257 diagnostics, 97 are assignments, 29 arguments
+and 18 excess-property failures against fixture *values* such as `{ model: "…"
+}`, which no key representation touches.
 
 **Do nothing.** Rejected. It leaves the same-typed-argument hazard in place
 without a record of why, so the question gets re-opened by the next review.
