@@ -65,6 +65,56 @@ const CODEX_GOOD: GoodReading = {
   raw: CODEX_RAW,
 };
 
+const ARGON_AT = Date.UTC(2025, 1, 3, 9, 25, 13, 517);
+const GEMINI_AT = Date.UTC(2025, 1, 3, 9, 26, 44, 61);
+const THIRD_PARTY_AT = Date.UTC(2025, 1, 3, 9, 27, 58, 733);
+
+const ARGON_RAW = {
+  groups: [{ displayName: "Gemini 4 Argon", buckets: [{ bucketId: "gemini-argon-wtu-weekly", window: "weekly", remainingFraction: 0.94 }] }],
+};
+const GEMINI_RAW = {
+  groups: [{ displayName: "Gemini Models", buckets: [
+    { bucketId: "gemini-weekly", window: "weekly", remainingFraction: 0.91 },
+    { bucketId: "gemini-5h", window: "5h", remainingFraction: 0.76 },
+  ] }],
+};
+const THIRD_PARTY_RAW = {
+  groups: [{ displayName: "Claude and GPT models", buckets: [
+    { bucketId: "3p-weekly", window: "weekly", remainingFraction: 0.99 },
+    { bucketId: "3p-5h", window: "5h", remainingFraction: 0.97 },
+  ] }],
+};
+
+const ARGON_GOOD: GoodReading = {
+  rail: "antigravity-argon",
+  ok: true,
+  readAt: ARGON_AT,
+  windows: [{ label: "gemini-argon-wtu-weekly", used: 6, budget: "weekly" }],
+  raw: ARGON_RAW,
+};
+
+const GEMINI_GOOD: GoodReading = {
+  rail: "antigravity-gemini",
+  ok: true,
+  readAt: GEMINI_AT,
+  windows: [
+    { label: "gemini-5h", used: 24, budget: "session" },
+    { label: "gemini-weekly", used: 9, budget: "weekly" },
+  ],
+  raw: GEMINI_RAW,
+};
+
+const THIRD_PARTY_GOOD: GoodReading = {
+  rail: "antigravity-3p",
+  ok: true,
+  readAt: THIRD_PARTY_AT,
+  windows: [
+    { label: "3p-5h", used: 3, budget: "session" },
+    { label: "3p-weekly", used: 1, budget: "weekly" },
+  ],
+  raw: THIRD_PARTY_RAW,
+};
+
 const DEEPSEEK: MeteredReading = { rail: "deepseek", ok: true, windows: [], metered: true, note: "metered" };
 
 function failed(rail: VendorRail, note: string, readAt = FAILED_AT): FailedReading {
@@ -76,9 +126,34 @@ function healthy(reading: GoodReading): VendorRailReadings {
   return { latest: reading, lastGood: reading };
 }
 
-function known(claude: VendorRailReadings, codex: VendorRailReadings): KnownReadings {
-  return { claude, codex, deepseek: { latest: DEEPSEEK } };
+/**
+ * A readings record with every rail present, the two vendor rails the caller is
+ * exercising and the three Antigravity pools at their healthy defaults.
+ *
+ * The pools are separate arguments rather than one bag so a test can make one
+ * pool fail and say what the other two were.
+ */
+function known(
+  claude: VendorRailReadings,
+  codex: VendorRailReadings,
+  pools: {
+    argon?: VendorRailReadings;
+    gemini?: VendorRailReadings;
+    threeParty?: VendorRailReadings;
+  } = {},
+): KnownReadings {
+  return {
+    claude,
+    codex,
+    "antigravity-argon": pools.argon ?? healthy(ARGON_GOOD),
+    "antigravity-gemini": pools.gemini ?? healthy(GEMINI_GOOD),
+    "antigravity-3p": pools.threeParty ?? healthy(THIRD_PARTY_GOOD),
+    deepseek: { latest: DEEPSEEK },
+  };
 }
+
+/** The five rails the generator may send, in the order the document states them. */
+const CAPPED = ["claude", "codex", "antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const;
 
 function ready(outcome: GeneratorInputOutcome): GeneratorInput {
   assert.equal(outcome.kind, "ready", outcome.kind === "refused" ? outcome.reason.join("\n") : "");
@@ -103,7 +178,7 @@ const READING_KEYS = new Set(["ok", "readAt", "windows", "raw", "note", "latestF
 const WINDOW_KEYS = new Set(["label", "used", "budget", "resetsAt"]);
 
 function assertFactsOnly(input: GeneratorInput): void {
-  for (const rail of ["claude", "codex"] as const) {
+  for (const rail of CAPPED) {
     const entry = vendorEntry(input, rail);
     for (const key of Object.keys(entry)) assert.ok(READING_KEYS.has(key), `${rail} carries an unexpected key "${key}"`);
     for (const window of entry.windows) {
@@ -124,15 +199,31 @@ const claudeAsMetered: KnownReadings = {
   // @ts-expect-error a vendor rail cannot hold the metered arm
   claude: { latest: DEEPSEEK },
   codex: healthy(CODEX_GOOD),
+  "antigravity-argon": healthy(ARGON_GOOD),
+  "antigravity-gemini": healthy(GEMINI_GOOD),
+  "antigravity-3p": healthy(THIRD_PARTY_GOOD),
+  deepseek: { latest: DEEPSEEK },
+};
+const argonAsMetered: KnownReadings = {
+  claude: healthy(CLAUDE_GOOD),
+  codex: healthy(CODEX_GOOD),
+  // @ts-expect-error a pool is quota-capped, so it cannot hold the metered arm
+  "antigravity-argon": { latest: DEEPSEEK },
+  "antigravity-gemini": healthy(GEMINI_GOOD),
+  "antigravity-3p": healthy(THIRD_PARTY_GOOD),
   deepseek: { latest: DEEPSEEK },
 };
 const deepseekAsRead: KnownReadings = {
   claude: healthy(CLAUDE_GOOD),
   codex: healthy(CODEX_GOOD),
+  "antigravity-argon": healthy(ARGON_GOOD),
+  "antigravity-gemini": healthy(GEMINI_GOOD),
+  "antigravity-3p": healthy(THIRD_PARTY_GOOD),
   // @ts-expect-error the metered rail cannot hold a vendor reading
   deepseek: healthy({ ...CODEX_GOOD, rail: "deepseek" }),
 };
 void claudeAsMetered;
+void argonAsMetered;
 void deepseekAsRead;
 
 // ---------------------------------------------------------------- the document
@@ -142,7 +233,14 @@ test("the document is version 1 and names every rail, even the metered one", () 
   assert.equal(GENERATOR_INPUT_VERSION, 1);
   assert.equal(input.version, 1);
   assert.deepEqual(Object.keys(input).sort(), ["rails", "version"]);
-  assert.deepEqual(Object.keys(input.rails).sort(), ["claude", "codex", "deepseek"]);
+  assert.deepEqual(Object.keys(input.rails).sort(), [
+    "antigravity-3p",
+    "antigravity-argon",
+    "antigravity-gemini",
+    "claude",
+    "codex",
+    "deepseek",
+  ]);
   // A document a subprocess reads is JSON: nothing in it may be lost or changed
   // by serialization (a Date, an `undefined` key, a Map).
   assert.deepEqual(JSON.parse(JSON.stringify(input)), input);
@@ -326,4 +424,57 @@ test("the refusal reason is exactly the header, the failing rail's line and the 
       "Run /quota-dispatch refresh once the rail can be read, then generate again.",
     ],
   );
+});
+
+// ---------------------------------------------------------------- Antigravity pools
+
+test("each pool that never succeeded refuses the run and is the only rail named", () => {
+  for (const [rail, pools] of [
+    ["antigravity-argon", { argon: { latest: failed("antigravity-argon", "no antigravity.access") } }],
+    ["antigravity-gemini", { gemini: { latest: failed("antigravity-gemini", "HTTP 500 after 2 attempts") } }],
+    ["antigravity-3p", { threeParty: { latest: failed("antigravity-3p", "no usage windows returned") } }],
+  ] as const) {
+    const reason = refused(generatorInput(known(healthy(CLAUDE_GOOD), healthy(CODEX_GOOD), pools)));
+    const named = reason.filter((line) => line.startsWith(`the ${rail} rail`));
+    assert.equal(named.length, 1, `${rail} must be named exactly once: ${reason.join("\n")}`);
+    assert.ok(!reason.some((line) => line.startsWith("the claude rail")), reason.join("\n"));
+  }
+});
+
+test("every failing capped rail is reported, in the document's own order", () => {
+  // All five, so neither "report the first" nor "report the two vendors" can
+  // pass: the lines are checked as an ordered subsequence of the reason.
+  const reason = refused(generatorInput({
+    claude: { latest: failed("claude", "no Claude credentials") },
+    codex: { latest: failed("codex", "no pi auth file") },
+    "antigravity-argon": { latest: failed("antigravity-argon", "expired") },
+    "antigravity-gemini": { latest: failed("antigravity-gemini", "HTTP 429") },
+    "antigravity-3p": { latest: failed("antigravity-3p", "no usage windows returned") },
+    deepseek: { latest: DEEPSEEK },
+  }));
+  const order = CAPPED.map((rail) => reason.findIndex((line) => line.startsWith(`the ${rail} rail`)));
+  assert.ok(order.every((index) => index !== -1), reason.join("\n"));
+  assert.deepEqual([...order].sort((a, b) => a - b), order, `rails must be named in canonical order: ${reason.join("\n")}`);
+});
+
+test("each pool's last good reading is projected into its own key", () => {
+  // Distinct instants and distinct raw bodies per pool, so a key hole or a
+  // neighbour's reading shows up as a mismatch rather than as a plausible value.
+  const input = ready(generatorInput(known(healthy(CLAUDE_GOOD), healthy(CODEX_GOOD), {
+    argon: { latest: failed("antigravity-argon", "HTTP 500"), lastGood: ARGON_GOOD },
+    gemini: healthy(GEMINI_GOOD),
+    threeParty: { latest: failed("antigravity-3p", "HTTP 429"), lastGood: THIRD_PARTY_GOOD },
+  })));
+  assert.deepEqual(vendorEntry(input, "antigravity-argon").latestFailure, { at: iso(FAILED_AT), note: "HTTP 500" });
+  assert.equal(vendorEntry(input, "antigravity-argon").readAt, iso(ARGON_AT));
+  assert.deepEqual(vendorEntry(input, "antigravity-argon").raw, ARGON_RAW);
+  assert.equal(vendorEntry(input, "antigravity-gemini").readAt, iso(GEMINI_AT));
+  assert.ok(!("latestFailure" in vendorEntry(input, "antigravity-gemini")), "a healthy pool has no failure marker");
+  assert.deepEqual(vendorEntry(input, "antigravity-3p").raw, THIRD_PARTY_RAW);
+  assert.equal(vendorEntry(input, "antigravity-3p").readAt, iso(THIRD_PARTY_AT));
+  // Argon carries one budget, and the document says so rather than inventing a
+  // session window for the pool that has none.
+  assert.deepEqual(vendorEntry(input, "antigravity-argon").windows, [
+    { label: "gemini-argon-wtu-weekly", used: 6, budget: "weekly" },
+  ]);
 });

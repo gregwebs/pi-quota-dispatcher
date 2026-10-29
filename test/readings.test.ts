@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 
 import {
   DEFAULT_CONFIG,
+  READINGS_FILE_VERSION,
   createDispatcher,
   parseClaudeUsage,
   parseCodexUsage,
@@ -48,7 +49,7 @@ function bodyFor(rail: LiveRail, session = 93, weekly = 21) {
       } };
 }
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, opts: { antigravity?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), "pqd-readings-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const agentDir = join(root, "agents");
@@ -60,13 +61,20 @@ async function fixture(t: TestContext) {
     claudeAiOauth: { accessToken: "test-token", expiresAt: NOW + 86_400_000 },
   }));
   const piAuthPath = join(root, "pi-auth.json");
-  await writeFile(piAuthPath, JSON.stringify({ "openai-codex": { access: "test-token", accountId: "acct-test" } }));
+  await writeFile(piAuthPath, JSON.stringify({
+    "openai-codex": { access: "test-token", accountId: "acct-test" },
+    ...(opts.antigravity === true
+      ? { antigravity: { access: "test-token", expires: NOW + 86_400_000, projectId: "test-project" } }
+      : {}),
+  }));
 
   const probe = {
     clock: NOW,
     bodies: { claude: bodyFor("claude"), codex: bodyFor("codex", 3, 4) } as Record<LiveRail, unknown>,
     failed: { claude: false, codex: false },
     calls: { claude: 0, codex: 0 },
+    /** Antigravity requests, counted apart so the two-vendor assertions stay exact. */
+    antigravityCalls: 0,
     // A hook the concurrency test installs; the stub awaits it before answering,
     // so a test can hold both reads in flight at once. Undefined everywhere else.
     beforeRespond: undefined as undefined | ((rail: LiveRail) => Promise<void>),
@@ -74,18 +82,45 @@ async function fixture(t: TestContext) {
   // A definite HTTP answer avoids retries or real-time backoff in cache tests.
   const fetchImpl = (async (url: string | URL) => {
     const u = String(url);
+    if (u.includes("cloudcode-pa.googleapis.com")) {
+      probe.antigravityCalls++;
+      return { ok: true, status: 200, json: async () => antigravityBody() };
+    }
     const rail = u.includes("anthropic.com") ? "claude" : u.includes("chatgpt.com") ? "codex" : undefined;
     assert.ok(rail, `unexpected network request: ${u}`);
     probe.calls[rail]++;
     if (probe.beforeRespond) await probe.beforeRespond(rail);
     return { ok: !probe.failed[rail], status: probe.failed[rail] ? 429 : 200, json: async () => probe.bodies[rail] };
   }) as unknown as typeof fetch;
+  const readingsPath = join(root, "quota-dispatch-readings.json");
   const dispatcher = createDispatcher({
     ...DEFAULT_CONFIG, agentDir, claudeCredsPath, piAuthPath, ttlMs: TTL, claudeRefresh: "off",
-    readingsPath: join(root, "quota-dispatch-readings.json"),
+    readingsPath,
     agents: agentTable({ planner: routeOf({ primary: { model: PRIMARY, rail: "claude" }, alternates: [{ model: ALTERNATE, rail: "codex" }] }) }),
   }, { fetchImpl, now: () => probe.clock, readKeychain: async () => ({ error: "no keychain" }) });
-  return { dispatcher, probe, agentFile };
+  return { dispatcher, probe, agentFile, piAuthPath, readingsPath };
+}
+
+/**
+ * One `retrieveUserQuotaSummary` body: a week and a session for each of the two
+ * pools that carry both, and a week alone for Argon.
+ */
+function antigravityBody(geminiSession = 42): unknown {
+  const weekly = "2026-11-05T16:46:22Z";
+  const session = "2026-10-29T21:46:22Z";
+  const bucket = (bucketId: string, window: string, used: number, resetTime: string) => ({
+    bucketId,
+    window,
+    resetTime,
+    remainingFraction: 1 - used / 100,
+  });
+  return {
+    groups: [
+      { displayName: "Gemini Models", buckets: [bucket("gemini-weekly", "weekly", 12, weekly), bucket("gemini-5h", "5h", geminiSession, session)] },
+      { displayName: "Gemini 4 Argon", buckets: [bucket("gemini-argon-wtu-weekly", "weekly", 0, weekly)] },
+      { displayName: "Claude and GPT models", buckets: [bucket("3p-weekly", "weekly", 2, weekly)] },
+    ],
+  };
 }
 
 function good(reading: RailReading): GoodReading {
@@ -326,7 +361,16 @@ test("allReadings exposes deepseek as metered with no raw, readAt, lastGood or f
   });
   assert.deepEqual(probe.calls, { claude: 0, codex: 0 });
   const all = await dispatcher.allReadings(true);
-  assert.deepEqual([...all.keys()].sort(), ["claude", "codex", "deepseek"]);
+  // Canonical order, not sorted: the report prints the two long-standing vendor
+  // rails, then one account's three Antigravity pools, then the metered rail.
+  assert.deepEqual([...all.keys()], [
+    "claude",
+    "codex",
+    "antigravity-argon",
+    "antigravity-gemini",
+    "antigravity-3p",
+    "deepseek",
+  ]);
   assert.deepEqual(all.get("deepseek"), {
     latest: { rail: "deepseek", ok: true, windows: [], metered: true, note: "metered" },
   });
@@ -498,8 +542,64 @@ test("knownReadings gives deepseek the metered arm and never fetches it", async 
   assert.deepEqual(known.deepseek, await dispatcher.railReadings("deepseek"));
   assert.equal(known.deepseek.latest.metered, true);
   assert.ok(!("lastGood" in known.deepseek));
-  assert.deepEqual(Object.keys(known).sort(), ["claude", "codex", "deepseek"]);
-  // The fetch stub rejects any URL but the two vendors', so a deepseek request
-  // would already have failed; the count pins that each vendor was asked once.
+  assert.deepEqual(Object.keys(known).sort(), [
+    "antigravity-3p",
+    "antigravity-argon",
+    "antigravity-gemini",
+    "claude",
+    "codex",
+    "deepseek",
+  ]);
+  // The fetch stub rejects any URL but the vendors', so a deepseek request would
+  // already have failed; the count pins that each vendor was asked once. The
+  // Antigravity pools never reach the network here: this fixture's auth file has
+  // no `antigravity` entry, so all three fail as unavailable without a request —
+  // which is exactly what an install without that provider gets.
   assert.deepEqual(probe.calls, { claude: 1, codex: 1 });
+  assert.equal(probe.antigravityCalls, 0);
+  for (const rail of ["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const) {
+    assert.equal(known[rail].latest.ok, false);
+  }
+});
+
+/**
+ * One generation, one picture of the Antigravity group.
+ *
+ * A store holding one pool but not its siblings is what a partially publishable
+ * file leaves behind. Reading each pool independently would let a sibling answer
+ * from before the fetch the missing pool triggers — three readings of one vendor
+ * answer that disagree about when, and about what, was read. The group is warmed
+ * once and read back together, so the three always describe the same request.
+ */
+test("knownReadings warms a partial Antigravity group once, so its siblings cannot disagree", async (t) => {
+  const { dispatcher, probe, piAuthPath, readingsPath } = await fixture(t, { antigravity: true });
+  await writeFile(readingsPath, JSON.stringify({
+    version: READINGS_FILE_VERSION,
+    entries: [{
+      rail: "antigravity-argon",
+      credential: resolve(piAuthPath),
+      at: NOW - 1,
+      // A percentage no pool in the stub's body reports, so a returned Argon
+      // reading of 55% could only be this stored one.
+      latest: {
+        rail: "antigravity-argon",
+        ok: true,
+        readAt: NOW - 1,
+        windows: [{ label: "gemini-argon-wtu-weekly", used: 55, budget: "weekly" }],
+        raw: { groups: [] },
+      },
+    }],
+  }), "utf8");
+
+  const known = await dispatcher.knownReadings();
+  assert.equal(probe.antigravityCalls, 1, "a missing pool warms the group once, not once per pool");
+  const latest = (["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const).map((rail) =>
+    good(known[rail].latest),
+  );
+  assert.deepEqual(new Set(latest.map((r) => r.readAt)), new Set([NOW]), "one vendor answer, one instant");
+  assert.deepEqual(latest.map((r) => r.windows.map((w) => [w.label, w.used])), [
+    [["gemini-argon-wtu-weekly", 0]],
+    [["gemini-weekly", 12], ["gemini-5h", 42]],
+    [["3p-weekly", 2]],
+  ]);
 });

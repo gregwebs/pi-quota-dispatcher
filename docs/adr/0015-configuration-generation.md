@@ -169,6 +169,14 @@ about a polling interval; an unconfigured one has no poll, so `refresh` is the
 way out. The known consequence is that an install with only one of the two
 quota-capped rails cannot generate.
 
+**Partly superseded by [0019](0019-antigravity-pool-rails.md).** There are now
+five quota-capped rails, and the refusal covers all five: it names every rail
+with no successful reading, in the document's own order, and the version-1 wire
+shape is unchanged apart from the larger `rails` map. "The two" above is the two
+that existed when this was written; the consequence is the same in kind and
+stricter in degree, since an install without an authenticated Antigravity
+account cannot generate either.
+
 The document is **facts only**; what each field means is the README's
 ["What the generator reads on stdin"](../../README.md#what-the-generator-reads-on-stdin)
 section, which is the canonical contract. It carries the vendor's response body

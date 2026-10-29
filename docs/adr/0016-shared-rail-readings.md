@@ -33,6 +33,15 @@ names a key of it, and the only thing a caller sees is the same `RailReadings`
 the in-memory cache produced plus the `RefreshGates` the dispatcher asks for by
 credential.
 
+**Extended by [0019](0019-antigravity-pool-rails.md).** Three of the rails that
+came later — Antigravity's pools — are answered by one vendor request, so the
+fetch lock and the in-process in-flight record are now keyed by a *source*: one
+rail, or the three pools together. One fetch still writes one document under the
+one file lock described below, publishing all three entries at once. Version 3
+widens what an entry's `rail` may be; a valid version-2 document is still read,
+which is what keeps the gates and sticky halt above across the upgrade.
+Per-rail keys, per-rail `lastGood` and the best-effort write are unchanged.
+
 ## One file, not one per rail
 
 A shared cache could have been one file per rail and credential, each written

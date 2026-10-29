@@ -45,8 +45,12 @@ import { userInfo } from "node:os";
 import { basename, delimiter, join, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import {
+  ANTIGRAVITY_RAILS,
   DEFAULT_CONFIG,
+  RAILS,
+  isAntigravityRail,
   type AgentRoute,
+  type AntigravityRail,
   type Candidate,
   type ConfigFile,
   type DispatcherConfig,
@@ -86,10 +90,12 @@ import {
 // re-exported here so `src/index.ts` remains the one import path for the
 // extension's whole surface.
 export {
+  ANTIGRAVITY_RAILS,
   CLAUDE_REFRESH_MODES,
   CONFIG_FILE_NAME,
   DEFAULT_CONFIG,
   DEFAULT_GENERATOR_TIMEOUT_MS,
+  RAILS,
   THINKING_LEVELS,
   agentKey,
   configFilesFor,
@@ -98,7 +104,9 @@ export {
   describeConfigLayers,
   describeConfigWarnings,
   globalConfigPath,
+  isAntigravityRail,
   isClaudeRefreshMode,
+  isRail,
   isThinkingLevel,
   loadConfig,
   mergeConfig,
@@ -111,6 +119,7 @@ export {
 } from "./config.ts";
 export type {
   AgentRoute,
+  AntigravityRail,
   Candidate,
   ClaudeRefreshMode,
   ConfigFile,
@@ -164,7 +173,9 @@ export type { Coordination, FileWritePacing, LockAttempt, LockHolder } from "./a
 import {
   DEFAULT_SHARED_READINGS,
   createSharedReadings,
+  type AntigravityReadings,
   type SharedReadingsPacing,
+  type SingleFetchRail,
   type StickyHalt,
   type VendorReading,
 } from "./readings-file.ts";
@@ -180,6 +191,7 @@ export {
   createSharedReadings,
 } from "./readings-file.ts";
 export type {
+  AntigravityReadings,
   CachedReadings,
   CredentialGates,
   GatePatch,
@@ -187,6 +199,7 @@ export type {
   SharedReadings,
   SharedReadingsDeps,
   SharedReadingsPacing,
+  SingleFetchRail,
   StickyHalt,
   VendorReading,
 } from "./readings-file.ts";
@@ -434,6 +447,9 @@ export type VendorRail = Exclude<Rail, "deepseek">;
 export interface KnownReadings {
   readonly claude: VendorRailReadings;
   readonly codex: VendorRailReadings;
+  readonly "antigravity-argon": VendorRailReadings;
+  readonly "antigravity-gemini": VendorRailReadings;
+  readonly "antigravity-3p": VendorRailReadings;
   readonly deepseek: MeteredRailReadings;
 }
 
@@ -528,13 +544,31 @@ function projectVendorRail(readings: VendorRailReadings): VendorRailProjection {
 export function generatorInput(known: KnownReadings): GeneratorInputOutcome {
   const claude = projectVendorRail(known.claude);
   const codex = projectVendorRail(known.codex);
-  if (claude.kind === "no-reading" || codex.kind === "no-reading") {
+  const argon = projectVendorRail(known["antigravity-argon"]);
+  const gemini = projectVendorRail(known["antigravity-gemini"]);
+  const threeParty = projectVendorRail(known["antigravity-3p"]);
+  // Canonical order, and the order the refusal names a failing rail in: a
+  // generator reads one document, so the five capped rails are one list rather
+  // than five independent chances to be the one that is missing.
+  const capped: ReadonlyArray<readonly [VendorRail, VendorRailProjection]> = [
+    ["claude", claude],
+    ["codex", codex],
+    ["antigravity-argon", argon],
+    ["antigravity-gemini", gemini],
+    ["antigravity-3p", threeParty],
+  ];
+  if (
+    claude.kind === "no-reading" ||
+    codex.kind === "no-reading" ||
+    argon.kind === "no-reading" ||
+    gemini.kind === "no-reading" ||
+    threeParty.kind === "no-reading"
+  ) {
     return {
       kind: "refused",
       reason: [
         "the generator was not run: a quota-capped rail has no successful reading yet.",
-        ...refusalLine("claude", claude),
-        ...refusalLine("codex", codex),
+        ...capped.flatMap(([rail, projection]) => refusalLine(rail, projection)),
         // Advice, not a fact about the readings, but the refusal is the only
         // place the user learns the run was skipped before the vendor was
         // asked — and an unforced read is exactly what would clear it. A
@@ -551,6 +585,9 @@ export function generatorInput(known: KnownReadings): GeneratorInputOutcome {
       rails: {
         claude: claude.reading,
         codex: codex.reading,
+        "antigravity-argon": argon.reading,
+        "antigravity-gemini": gemini.reading,
+        "antigravity-3p": threeParty.reading,
         deepseek: { metered: true, windows: [], raw: null },
       },
     },
@@ -722,13 +759,124 @@ export function parseCodexUsage(
   return { windows, limited: rl?.limit_reached === true };
 }
 
+/**
+ * `value` as a plain JSON object, or `undefined` when it is anything else.
+ *
+ * Antigravity's document arrives as parsed JSON, and every level of it is
+ * untrusted: a summary endpoint that answers with a bare array, a `null` bucket
+ * or a string where an object belongs must leave the parser with nothing rather
+ * than reach a property read that throws.
+ */
+function jsonObject(value: unknown): Record<string, unknown> | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+/**
+ * Which pool owns a bucket, by the bucket id's own prefix.
+ *
+ * The vendor groups its buckets under display names, but the names and the group
+ * order are presentation: what a bucket *is* comes from its id. Argon is matched
+ * before the general `gemini-` prefix because the Argon pool's buckets are Gemini
+ * buckets too (`gemini-argon-wtu-weekly`), and only the id distinguishes them.
+ */
+function antigravityPoolFor(bucketId: string): AntigravityRail | undefined {
+  if (bucketId.startsWith("gemini-argon-")) return "antigravity-argon";
+  if (bucketId.startsWith("gemini-")) return "antigravity-gemini";
+  if (bucketId.startsWith("3p-")) return "antigravity-3p";
+  return undefined;
+}
+
+/**
+ * The budget a bucket's window counts toward.
+ *
+ * Exact matches only: an unfamiliar window (a future `monthly`, a vendor rename)
+ * is display-only rather than guessed into a budget, because a guess would make a
+ * required budget look reported when it was not.
+ */
+function antigravityBudget(window: unknown): Budget | undefined {
+  if (window === "5h") return "session";
+  if (window === "weekly") return "weekly";
+  return undefined;
+}
+
+/**
+ * One `retrieveUserQuotaSummary` document partitioned across the three pools.
+ *
+ * A pool with no bucket of its own is an empty list, not an absent key: the
+ * caller states the same three rails whatever the vendor said, and an empty list
+ * is how "this response said nothing about that pool" is spelled. Everything the
+ * parser cannot use — a bucket with no id, a fraction that is missing or not a
+ * number, a bucket belonging to no pool — is dropped rather than repaired.
+ *
+ * `remainingFraction` is what the vendor reports, so `used` is its complement in
+ * whole percent, clamped: a fraction outside `[0, 1]` would otherwise produce a
+ * negative or impossible usage figure that the policy would weigh as real.
+ */
+export function parseAntigravityUsage(data: unknown): Record<AntigravityRail, RailWindow[]> {
+  const windows: Record<AntigravityRail, RailWindow[]> = {
+    "antigravity-argon": [],
+    "antigravity-gemini": [],
+    "antigravity-3p": [],
+  };
+  const groups = jsonObject(data)?.groups;
+  if (!Array.isArray(groups)) return windows;
+  for (const group of groups) {
+    const buckets = jsonObject(group)?.buckets;
+    if (!Array.isArray(buckets)) continue;
+    for (const bucket of buckets) {
+      const fields = jsonObject(bucket);
+      if (fields === undefined) continue;
+      const bucketId = fields.bucketId;
+      if (typeof bucketId !== "string") continue;
+      const rail = antigravityPoolFor(bucketId);
+      if (rail === undefined) continue;
+      const remaining = num(fields.remainingFraction);
+      if (remaining === undefined) continue;
+      const budget = antigravityBudget(fields.window);
+      const resetsAt = instant(fields.resetTime);
+      windows[rail].push({
+        label: bucketId,
+        used: Math.round((1 - Math.min(1, Math.max(0, remaining))) * 100),
+        ...(budget === undefined ? {} : { budget }),
+        ...(resetsAt === undefined ? {} : { resetsAt }),
+      });
+    }
+  }
+  return windows;
+}
+
 // ---------------------------------------------------------------- policy
 
-/** Budgets in the order the policy weighs them: the acute cap first. */
-const BUDGET_ORDER: readonly Budget[] = ["session", "weekly"];
+/**
+ * The budgets each rail actually carries, which is the difference between "no
+ * cap here" and "this read did not say".
+ *
+ * A pool need not impose both caps: Antigravity's Argon pool has one weekly
+ * bucket and no 5-hour window at all, and the metered rail has no cap of either
+ * kind. Only a carried budget can be *missing* — an uncarried one is a budget the
+ * rail cannot exceed, so its effective usage is zero and no threshold, not even
+ * one configured as `0`, can make it tight. Reading the two cases alike is what
+ * would hold every Argon primary for a session window the vendor never promised.
+ *
+ * Declared as one exhaustive record so a new rail cannot be added without
+ * answering this question.
+ */
+const RAIL_BUDGETS: Record<Rail, readonly Budget[]> = {
+  claude: ["session", "weekly"],
+  codex: ["session", "weekly"],
+  "antigravity-argon": ["weekly"],
+  "antigravity-gemini": ["session", "weekly"],
+  "antigravity-3p": ["session", "weekly"],
+  deepseek: [],
+};
 
 /** The budget a destination would still have to survive. */
 const OTHER_BUDGET: Record<Budget, Budget> = { session: "weekly", weekly: "session" };
+
+function carries(rail: Rail, budget: Budget): boolean {
+  return RAIL_BUDGETS[rail].includes(budget);
+}
 
 function thresholdFor(budget: Budget, cfg: DispatcherConfig): number {
   return budget === "session" ? cfg.sessionSwitchAt : cfg.weeklySwitchAt;
@@ -809,42 +957,52 @@ function pctExact(n: number): string {
 }
 
 /**
- * Used-percent for one budget, or `undefined` when the rail did not report it.
+ * Used-percent for one budget, or `undefined` when the rail carries the budget
+ * and did not report it.
  *
- * `undefined` rather than 0 is the point. A missing 5-hour window is not
- * evidence that the 5-hour budget is free, and reading it as free is exactly how
- * a rail that was blocked outright came to look like the roomiest place to send
- * work. Several windows can share a budget — Claude reports an account-wide week
- * plus per-model weeks — so this takes the worst of them.
+ * `undefined` rather than 0 is the point, and applies to a budget the rail
+ * carries. A missing 5-hour window on a rail that has one is not evidence that
+ * the 5-hour budget is free, and reading it as free is exactly how a rail that
+ * was blocked outright came to look like the roomiest place to send work.
+ * Several windows can share a budget — Claude reports an account-wide week plus
+ * per-model weeks, Antigravity reports one bucket per pool — so this takes the
+ * worst of them.
  *
- * A metered rail is billed per token rather than capped, so it has no budget to
- * report and honestly reads 0 on both.
+ * `0` is the answer for a budget the rail does not carry: a metered rail is
+ * billed per token rather than capped, and Argon's pool has no session window, so
+ * neither can ever be tight there. That is a different fact from "the read did
+ * not say", and the two must not be spelled alike — see `RAIL_BUDGETS`.
  */
 export function budgetUsed(reading: RailReading, budget: Budget): number | undefined {
-  if (reading.metered) return 0;
+  if (reading.metered || !carries(reading.rail, budget)) return 0;
   const used = reading.windows.filter((w) => w.budget === budget).map((w) => w.used);
   return used.length ? Math.max(...used) : undefined;
 }
 
 /**
- * Budgets a capped rail failed to report.
+ * The budgets a rail carries and failed to report.
  *
- * A metered rail reads 0 through `budgetUsed`, and unreadable rails are rejected
- * before this is consulted, so anything returned here is a partial reading. The
+ * A budget the rail does not carry is never missing — it reads 0 through
+ * `budgetUsed` — and unreadable rails are rejected before this is consulted, so
+ * anything returned here is a partial reading of a cap the rail really has. The
  * policy holds rather than guessing: an unreported budget is not an idle one.
  */
 function absentBudgets(reading: RailReading): Budget[] {
-  return BUDGET_ORDER.filter((b) => budgetUsed(reading, b) === undefined);
+  return RAIL_BUDGETS[reading.rail].filter((b) => budgetUsed(reading, b) === undefined);
 }
 
-/** Both budgets, for the decision's `why`. */
+/** The budgets the rail carries, for the decision's `why`. */
 function budgetSummary(reading: RailReading): string {
   if (reading.metered) return reading.note ?? "metered";
   if (!reading.windows.length) return reading.note ?? "no windows";
-  return BUDGET_ORDER.map((b) => {
-    const used = budgetUsed(reading, b);
-    return `${b} ${used === undefined ? "unreported" : pct(used)}`;
-  }).join(", ");
+  // Only the carried budgets are named: printing "session unreported" on a pool
+  // that has no session cap would report a fault that does not exist.
+  return RAIL_BUDGETS[reading.rail]
+    .map((b) => {
+      const used = budgetUsed(reading, b);
+      return `${b} ${used === undefined ? "unreported" : pct(used)}`;
+    })
+    .join(", ");
 }
 
 /**
@@ -986,8 +1144,10 @@ export function decide(
 
   // The positive half of the sensitivity rule: a primary below every threshold
   // is assigned whatever the alternates say, because no alternate could have
-  // been chosen, so an unreadable one is no reason to hold.
-  const tightBudgets = BUDGET_ORDER.filter(
+  // been chosen, so an unreadable one is no reason to hold. Only the budgets the
+  // primary's pool actually carries can be tight — a pool with no session cap is
+  // never tight on one, whatever the threshold says.
+  const tightBudgets = RAIL_BUDGETS[primary.rail].filter(
     (budget) => budgetUsed(primary, budget)! >= thresholdFor(budget, cfg),
   );
   if (!tightBudgets.length) {
@@ -995,13 +1155,9 @@ export function decide(
   }
 
   const reasons: string[] = [];
-  for (const budget of BUDGET_ORDER) {
+  for (const budget of tightBudgets) {
     const used = budgetUsed(primary, budget)!;
     const threshold = thresholdFor(budget, cfg);
-    // Only a budget the primary is tight on can trigger a switch; the other one
-    // is weighed on its own pass, so a spent week is not masked by a merely
-    // tight session.
-    if (used < threshold) continue;
 
     const spare = OTHER_BUDGET[budget];
     const spareThreshold = thresholdFor(spare, cfg);
@@ -1035,19 +1191,27 @@ export function decide(
         continue;
       }
       const altUsed = budgetUsed(state, budget)!;
-      const altSpare = budgetUsed(state, spare)!;
 
       // A destination that is tight on its *other* budget would block this work
       // just as surely, so switching there trades one cap for another rather
       // than relieving anything. This is what stops an agent being moved onto
       // the very rail another agent was moved off in the same pass.
-      if (altSpare >= spareThreshold) {
-        // Named by model, not just rail: two alternates can share a rail, and a
-        // rail alone cannot say which one was passed over.
-        rejected.push(
-          `rejected ${candidate.model} on ${candidate.rail} (${spare} ${pct(altSpare)} is itself tight)`,
-        );
-        continue;
+      //
+      // Only a budget the destination carries can be tight: a pool with no cap
+      // on `spare` (Argon has no session cap; a metered rail has neither) cannot
+      // be blocked there, so its effective usage of 0 is never compared against
+      // `spareThreshold` — otherwise a configured `sessionSwitchAt: 0` would
+      // reject every such destination for a cap it does not have.
+      if (carries(state.rail, spare)) {
+        const altSpare = budgetUsed(state, spare)!;
+        if (altSpare >= spareThreshold) {
+          // Named by model, not just rail: two alternates can share a rail, and a
+          // rail alone cannot say which one was passed over.
+          rejected.push(
+            `rejected ${candidate.model} on ${candidate.rail} (${spare} ${pct(altSpare)} is itself tight)`,
+          );
+          continue;
+        }
       }
       if (qualifies(rule, { used, altUsed })) {
         winner = candidate;
@@ -2121,6 +2285,52 @@ export const DEFAULT_QUOTA_READ: QuotaReadPacing = {
   backoffMs: 250,
 };
 
+/**
+ * The quota-summary endpoint Antigravity's own CLI calls.
+ *
+ * Undocumented, like the two vendor endpoints beside it, and the only place the
+ * three pools' bucket ids appear. See `docs/adr/0019-antigravity-pool-rails.md`.
+ */
+export const ANTIGRAVITY_QUOTA_URL =
+  "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+
+/**
+ * The `User-Agent` Antigravity's own current client sends, and the reason it is
+ * pinned rather than borrowed from whatever called pi.
+ *
+ * Load-bearing, not cosmetic: Google omits the Argon group from
+ * `retrieveUserQuotaSummary` for older agent strings, so a request that looks
+ * like an old CLI silently reports two pools instead of three — an honest failed
+ * Argon rail whose cause is nowhere in the body. Bumping the version is a change
+ * to what the vendor is willing to tell us, so it is one constant with one
+ * documented override.
+ */
+export const DEFAULT_ANTIGRAVITY_USER_AGENT =
+  "antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=982146307; auth_method=consumer)";
+
+/**
+ * The `User-Agent` one request carries: the pinned default, unless the
+ * environment overrides it.
+ *
+ * The override exists so a machine behind a proxy that rewrites the header — or
+ * a future vendor build that demands a newer string — does not need a release of
+ * this extension. It is read per request rather than at import, so a session
+ * that sets it before its first quota read is honoured.
+ */
+export function antigravityUserAgent(env: NodeJS.ProcessEnv = process.env): string {
+  return env.ANTIGRAVITY_USER_AGENT?.trim() || DEFAULT_ANTIGRAVITY_USER_AGENT;
+}
+
+/**
+ * How long a delegated provider-token refresh is waited for, in milliseconds.
+ *
+ * Generous because the refresh is a real OAuth exchange under pi's own file lock,
+ * and deliberately finite because the registry exposes no cancellation: when the
+ * bound passes, the wait ends and the refresh is left to finish in the
+ * background. The next credential read is what finds out whether it did.
+ */
+export const PROVIDER_TOKEN_TIMEOUT_MS = 10_000;
+
 /** Waits `ms`, for the pause between two attempts at the same endpoint. */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -2337,6 +2547,67 @@ export function parseClaudeToken(text: string, now: number): ClaudeToken {
     return { error: "claude token expired", reason: "expired" };
   }
   return { token: oauth.accessToken };
+}
+
+/**
+ * What `auth.json`'s `antigravity` entry yielded: a usable credential, or why not.
+ *
+ * `expired` is separated from `unusable` for the same reason Claude's are: an
+ * expiry is the one failure a delegated refresh can fix, and a missing entry or
+ * an unreadable file is not.
+ *
+ * `projectId` rides along because the vendor's own client sends it in the
+ * request body, and a user on a project-scoped account needs the quota summary
+ * of *that* project.
+ */
+export type AntigravityToken =
+  | { readonly token: string; readonly projectId?: string }
+  | { readonly error: string; readonly reason: TokenFailure };
+
+/**
+ * Pulls the Antigravity credential out of `auth.json`'s text.
+ *
+ * `pi-antigravity` registers an OAuth provider with pi, and pi persists what it
+ * obtained in exactly this shape: `access`, an optional `expires` in epoch
+ * milliseconds, and an optional `projectId`. Reading it is all this parser does
+ * — no refresh token is handled here, and nothing is written back.
+ *
+ * The expiry test is `<=` rather than Claude's `<`: a token whose expiry *is*
+ * this instant has no remaining life, and using it would spend a request on a
+ * credential that is already gone. An absent `expires` is not evidence of
+ * expiry, so the token is used; an `expires` that is present but not a number is
+ * a shape this cannot judge, and inventing a lifetime for it is worse than
+ * saying so.
+ *
+ * The expired check comes *before* the access check on purpose: an entry the
+ * provider has expired may have had its `access` cleared already, and the
+ * expiry is still the reason a delegated refresh is worth attempting.
+ */
+export function parseAntigravityToken(text: string, context: { now: number }): AntigravityToken {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // Deliberately fixed text: a JSON syntax error's own message quotes the
+    // document, and this document is a credential file.
+    return { error: "unreadable pi auth: it is not valid JSON", reason: "unusable" };
+  }
+  const entry = jsonObject(jsonObject(parsed)?.["antigravity"]);
+  if (entry === undefined) return { error: "no antigravity.access", reason: "unusable" };
+  const expires = entry.expires;
+  if (expires !== undefined) {
+    if (typeof expires !== "number" || !Number.isFinite(expires)) {
+      return { error: "antigravity credential has no usable expiry", reason: "unusable" };
+    }
+    if (expires <= context.now) return { error: "antigravity token expired", reason: "expired" };
+  }
+  const access = entry.access;
+  if (typeof access !== "string" || access === "") {
+    return { error: "no antigravity.access", reason: "unusable" };
+  }
+  const project = entry.projectId;
+  const projectId = typeof project === "string" && project !== "" ? project : undefined;
+  return { token: access, ...(projectId === undefined ? {} : { projectId }) };
 }
 
 export interface ClaudeTokenDeps {
@@ -2591,6 +2862,36 @@ export interface DispatcherDeps {
    * spending real time; the production default is `setTimeout`.
    */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * pi's own provider-token resolver for the one provider this extension has to
+   * delegate to.
+   *
+   * The Antigravity credential is pi's to refresh: `pi-antigravity` registers an
+   * OAuth provider, and `modelRegistry.getApiKeyForProvider("antigravity")` runs
+   * pi's refresh — under pi's own lock, writing pi's own stores. This extension
+   * never posts a refresh token and never writes `auth.json`, for the reason
+   * ADR 0007 gives about Claude: a rotated refresh token plus a second writer is
+   * a way to end the user's session.
+   *
+   * The returned string is opaque provider output — not a bearer token this
+   * dispatcher sends. It is used only as the signal that a refresh was
+   * attempted, after which the credential file is read again; see
+   * `antigravityToken`.
+   *
+   * Left unset, nothing is delegated and an expired credential is simply
+   * unavailable. Production wires it from the extension context; a test injects
+   * a fake so that no real OAuth provider is ever consulted.
+   */
+  resolveProviderToken?: (provider: "antigravity") => Promise<string | undefined>;
+  /**
+   * How long to wait for that delegated refresh before giving up on it.
+   *
+   * A testing seam, not a configuration key: the registry offers no cancellation,
+   * so the wait is bounded and the refresh is left to finish, and how long that
+   * is worth waiting is a fact about the machine rather than a routing
+   * preference.
+   */
+  providerTokenTimeoutMs?: number;
 }
 
 export interface Dispatcher {
@@ -2634,6 +2935,41 @@ export interface Dispatcher {
   clearStickyHalt(): Promise<void>;
 }
 
+/**
+ * The one thing this extension needs from pi's model registry that `modelLookup`
+ * does not cover: the provider token resolver a registered OAuth provider is
+ * refreshed through.
+ *
+ * Structural rather than pi's own `ModelRegistry`, for the same reasons
+ * `ModelRegistryLike` is — a test can drive it with a fake, and a pi that grew
+ * the method late still type-checks — and deliberately separate from the
+ * model-lookup seam, so a registry that can resolve a model but not refresh a
+ * credential simply leaves an expired Antigravity token unavailable.
+ */
+export interface ProviderTokenRegistryLike {
+  getApiKeyForProvider(provider: string): Promise<string | undefined>;
+}
+
+/**
+ * pi's own provider token resolver, bound to the registry it belongs to.
+ *
+ * The method is called **through** `registry` rather than unbound: a method
+ * captured off an object and called alone has no receiver, and the registry's
+ * implementation reads its own state. Feature-detected rather than assumed — an
+ * older pi, or a context assembled without a registry, has no resolver and no
+ * Antigravity refresh, which is a smaller problem than calling into nothing.
+ *
+ * Nothing is called here; the returned function is what a read uses, once, and
+ * only when a stored token has expired.
+ */
+export function providerTokenResolver(ctx: {
+  modelRegistry?: ProviderTokenRegistryLike;
+}): ((provider: "antigravity") => Promise<string | undefined>) | undefined {
+  const registry = ctx.modelRegistry;
+  if (registry === undefined || typeof registry.getApiKeyForProvider !== "function") return undefined;
+  return (provider) => registry.getApiKeyForProvider(provider);
+}
+
 export function createDispatcher(
   cfg: DispatcherConfig = DEFAULT_CONFIG,
   deps: DispatcherDeps = {},
@@ -2655,14 +2991,20 @@ export function createDispatcher(
   // copy of that rule to keep in step.
   const fileWrite: Coordination = { pacing: deps.fileWrite, now };
   // The longest a single vendor read can honestly take: every attempt timing
-  // out, every backoff between them, and the refresh ping a Claude read may run
-  // inside one of them. A waiter for another process's fetch lock is given this
-  // much before it gives up and fetches for itself, so the bound can never cut
-  // short a read that is still working — and can never hang past one that is
-  // not. A test may state it directly.
+  // out, every backoff between them, and the local work a read may do inside one
+  // of them — a Claude refresh ping, or the delegated provider-token refresh an
+  // expired Antigravity credential waits on. A waiter for another process's
+  // fetch lock is given this much before it gives up and fetches for itself, so
+  // the bound can never cut short a read that is still working — and can never
+  // hang past one that is not. A test may state it directly. As ADR 0016 says,
+  // writer lock and file overhead can still exceed it: this bounds a read, not
+  // the machine it runs on.
+  const providerTokenTimeoutMs = deps.providerTokenTimeoutMs ?? PROVIDER_TOKEN_TIMEOUT_MS;
   const fetchWaitMs =
     deps.readings?.fetchWaitMs ??
-    pacing.attempts * pacing.timeoutMs + (pacing.attempts - 1) * pacing.backoffMs + CLAUDE_PING_TIMEOUT_MS;
+    pacing.attempts * pacing.timeoutMs +
+      (pacing.attempts - 1) * pacing.backoffMs +
+      Math.max(CLAUDE_PING_TIMEOUT_MS, providerTokenTimeoutMs);
   const readings = createSharedReadings({
     path: cfg.readingsPath,
     now,
@@ -2983,6 +3325,187 @@ export function createDispatcher(
   }
 
   /**
+   * `auth.json`'s Antigravity entry, or why there is none.
+   *
+   * Read fresh every time, never cached here: pi is the credential's writer, and
+   * a token this process remembered would be exactly the stale one the next read
+   * has to notice.
+   *
+   * A file that cannot be read is reported by its errno rather than by the error
+   * message — the message quotes the path and, for a parse failure, could quote
+   * the document, which is a credential file.
+   */
+  async function readAntigravityFile(): Promise<AntigravityToken> {
+    if (!existsSync(cfg.piAuthPath)) return { error: "no pi auth file", reason: "unusable" };
+    let text: string;
+    try {
+      text = await readFile(cfg.piAuthPath, "utf8");
+    } catch (err) {
+      return { error: `unreadable pi auth: ${(err as NodeJS.ErrnoException).code ?? "read failed"}`, reason: "unusable" };
+    }
+    return parseAntigravityToken(text, { now: now() });
+  }
+
+  /**
+   * The one delegated provider-token refresh this dispatcher has in flight.
+   *
+   * Single-flight until the resolver *actually settles*, not until a caller stops
+   * waiting: a wait that hits `providerTokenTimeoutMs` must not start a second
+   * refresh, because pi is already doing one under its own lock and a second
+   * attempt would be a second writer racing the first. The rejection is caught
+   * here and reduced to `failed`, since an OAuth error body is not text this
+   * report may echo.
+   */
+  let delegating: Promise<"done" | "failed"> | undefined;
+  function delegatedRefresh(): Promise<"done" | "failed"> {
+    const resolver = deps.resolveProviderToken;
+    if (resolver === undefined) return Promise.resolve("failed");
+    delegating ??= (async (): Promise<"done" | "failed"> => {
+      try {
+        await resolver("antigravity");
+        return "done";
+      } catch {
+        return "failed";
+      }
+    })().finally(() => {
+      delegating = undefined;
+    });
+    return delegating;
+  }
+
+  /**
+   * Wait out one delegated refresh, but no longer than the bound.
+   *
+   * The registry offers no cancellation, so the choice is between waiting
+   * forever and leaving the refresh to finish without us. The timer is cleared
+   * either way, and the unsettled promise keeps its single-flight slot, so the
+   * refresh this process stopped waiting for is still the only one it started.
+   */
+  async function waitForProviderToken(): Promise<"done" | "failed" | "timed out"> {
+    const attempt = delegatedRefresh();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bound = new Promise<"timed out">((done) => {
+      timer = setTimeout(() => done("timed out"), providerTokenTimeoutMs);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([attempt, bound]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * The Antigravity credential, refreshing it only by delegating to pi.
+   *
+   * Three facts decide whether a refresh may be attempted, and all three are
+   * required: the stored token is expired (the one failure a refresh fixes), the
+   * auth file is the default one (the one pi's registered provider owns), and a
+   * resolver is wired. A non-default path names somebody else's profile, and
+   * refreshing *this* machine's provider says nothing about it — the same
+   * restriction ADR 0007 puts on the Claude ping.
+   *
+   * What is returned after a delegation is the re-read file, not the resolver's
+   * own string: the refresh is only useful if it persisted something this
+   * process can use, and the provider's return value is a JSON credential
+   * document in pi's internal shape rather than a token.
+   */
+  async function antigravityToken(): Promise<AntigravityToken> {
+    const first = await readAntigravityFile();
+    if ("token" in first) return first;
+    if (first.reason !== "expired") return first;
+    if (deps.resolveProviderToken === undefined) {
+      return { error: `${first.error}; no provider token resolver is available`, reason: "expired" };
+    }
+    if (cfg.piAuthPath !== DEFAULT_CONFIG.piAuthPath) {
+      return {
+        error: `${first.error}; the pi auth file is not the default one, so no refresh was delegated`,
+        reason: "expired",
+      };
+    }
+    const outcome = await waitForProviderToken();
+    const reread = await readAntigravityFile();
+    if ("token" in reread) return reread;
+    const decision =
+      outcome === "failed"
+        ? "the delegated refresh failed"
+        : outcome === "timed out"
+          ? "the delegated refresh did not finish in time"
+          : "the delegated refresh produced no usable token";
+    // The re-read's own reason, not the first read's: a file that became
+    // unreadable, or lost its `antigravity` entry, while the refresh ran is what
+    // the user has to act on now.
+    return { error: `${reread.error}; ${decision}`, reason: "expired" };
+  }
+
+  /** The three pools one summary describes; a pool it said nothing about is that pool's own failure. */
+  function antigravityReadings(
+    windows: Record<AntigravityRail, RailWindow[]>,
+    readAt: number,
+    raw: unknown,
+  ): AntigravityReadings {
+    const pool = <R extends AntigravityRail>(rail: R): VendorReading & { rail: R } => {
+      const found = windows[rail];
+      if (!found.length) return { rail, ok: false, windows: [], readAt, note: "no usage windows returned" };
+      return { rail, ok: true, windows: found, readAt, raw };
+    };
+    return {
+      "antigravity-argon": pool("antigravity-argon"),
+      "antigravity-gemini": pool("antigravity-gemini"),
+      "antigravity-3p": pool("antigravity-3p"),
+    };
+  }
+
+  /**
+   * One failure for the whole group, stamped once.
+   *
+   * A credential or transport failure happened once, at one instant; giving each
+   * pool its own `now()` would date one failure three ways. `raw` is absent, not
+   * carried from an earlier read: a failure reports why it failed and nothing
+   * else.
+   */
+  function antigravityFailedGroup(note: string, readAt: number): AntigravityReadings {
+    const pool = <R extends AntigravityRail>(rail: R): VendorReading & { rail: R } => ({
+      rail,
+      ok: false,
+      windows: [],
+      readAt,
+      note,
+    });
+    return {
+      "antigravity-argon": pool("antigravity-argon"),
+      "antigravity-gemini": pool("antigravity-gemini"),
+      "antigravity-3p": pool("antigravity-3p"),
+    };
+  }
+
+  /**
+   * The one vendor request that answers for all three Antigravity pools.
+   *
+   * The body carries the project only when the credential names one, an empty
+   * object otherwise: a `{"project": ""}` would ask the vendor about a project
+   * that has no id. The `User-Agent` is the pinned one, whose default is what
+   * makes the vendor report the Argon pool at all.
+   */
+  async function fetchAntigravity(): Promise<AntigravityReadings> {
+    const credential = await antigravityToken();
+    if (!("token" in credential)) return antigravityFailedGroup(credential.error, now());
+    const read = await readUsage(ANTIGRAVITY_QUOTA_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${credential.token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "User-Agent": antigravityUserAgent(),
+      },
+      body: JSON.stringify(credential.projectId === undefined ? {} : { project: credential.projectId }),
+    });
+    const readAt = now();
+    if ("note" in read) return antigravityFailedGroup(read.note, readAt);
+    return antigravityReadings(parseAntigravityUsage(read.json), readAt, read.json);
+  }
+
+  /**
    * The credential a rail's shared entry is keyed by.
    *
    * Resolved, not the raw config string: two configs can name one file through
@@ -2990,18 +3513,27 @@ export function createDispatcher(
    * genuinely different credentials — another Claude profile, another pi auth
    * file — get different keys and therefore never see each other's readings,
    * which is the one thing a shared cache must not do.
+   *
+   * The three Antigravity pools resolve to one key, which is the credential the
+   * group is fetched under — not a per-pool key, because they are not per-pool
+   * credentials.
    */
   function credentialFor(rail: VendorRail): string {
     return resolve(rail === "claude" ? cfg.claudeCredsPath : cfg.piAuthPath);
   }
 
   /**
-   * One rail's vendor read, as the store asks for it. The store is deliberately
-   * not told which rail it is fetching — it keys on the credential the caller
-   * named — so the throw-to-failure translation stays here, where the note it
-   * builds is the one the report has always printed.
+   * One single-rail vendor read, as the store asks for it. The store is
+   * deliberately not told which rail it is fetching — it keys on the credential
+   * the caller named — so the throw-to-failure translation stays here, where the
+   * note it builds is the one the report has always printed.
+   *
+   * Narrowed to the rails that really have a request of their own: the
+   * Antigravity pools are fetched as one group by `antigravityFetch`, and making
+   * that unrepresentable here is what stops a pool from ever reaching Codex's
+   * endpoint by falling through a selector.
    */
-  function fetchFor(rail: VendorRail): () => Promise<VendorReading> {
+  function fetchFor(rail: SingleFetchRail): () => Promise<VendorReading> {
     return async () => {
       try {
         return rail === "claude" ? await fetchClaude() : await fetchCodex();
@@ -3011,12 +3543,31 @@ export function createDispatcher(
     };
   }
 
+  /**
+   * The grouped Antigravity read, as the store asks for it.
+   *
+   * A throw becomes one failure for all three pools rather than propagating: the
+   * store re-raises a body that threw, and a caller asking for a quota reading
+   * should get a reading that failed, not an exception. The note is fixed because
+   * whatever was thrown may quote the response.
+   */
+  function antigravityFetch(): () => Promise<AntigravityReadings> {
+    return async () => {
+      try {
+        return await fetchAntigravity();
+      } catch {
+        return antigravityFailedGroup("antigravity read failed", now());
+      }
+    };
+  }
+
   async function vendorRailReadings(rail: VendorRail, force: boolean): Promise<VendorRailReadings> {
-    return readings.read(rail, credentialFor(rail), {
-      ttlMs: cfg.ttlMs,
-      force,
-      fetch: fetchFor(rail),
-    });
+    const credential = credentialFor(rail);
+    const ttlMs = cfg.ttlMs;
+    if (isAntigravityRail(rail)) {
+      return readings.readAntigravity(rail, credential, { ttlMs, force, fetch: antigravityFetch() });
+    }
+    return readings.read(rail, credential, { ttlMs, force, fetch: fetchFor(rail) });
   }
 
   async function railReadings(rail: Rail, force = false): Promise<RailReadings> {
@@ -3028,8 +3579,10 @@ export function createDispatcher(
   }
 
   async function allReadings(force = false): Promise<Map<Rail, RailReadings>> {
-    const rails: Rail[] = ["claude", "codex", "deepseek"];
-    const entries = await Promise.all(rails.map((r) => railReadings(r, force)));
+    // Every rail is asked for, in canonical order, and the grouped store is what
+    // turns the three Antigravity asks into one request. DeepSeek is unpersisted
+    // and unfetched, so it costs nothing to include.
+    const entries = await Promise.all(RAILS.map((rail) => railReadings(rail, force)));
     return new Map(entries.map((r) => [r.latest.rail, r]));
   }
 
@@ -3045,14 +3598,51 @@ export function createDispatcher(
     return (await readings.known(rail, credentialFor(rail))) ?? vendorRailReadings(rail, false);
   }
 
+  /**
+   * The three Antigravity pools as one consistent picture.
+   *
+   * Asking the store for each pool on its own is not that picture: a pool with no
+   * entry makes the store fetch the group — and that fetch answers for all three
+   * — so a sibling whose `known` call resolved first would report the state
+   * before it. Warming the group once and then reading all three back is what
+   * keeps one generation's three pool readings from disagreeing about which read
+   * they came from.
+   */
+  async function knownAntigravityReadings(): Promise<Record<AntigravityRail, VendorRailReadings>> {
+    const held = await Promise.all(
+      ANTIGRAVITY_RAILS.map((rail) => readings.known(rail, credentialFor(rail))),
+    );
+    const [argon, gemini, threeParty] = held;
+    if (argon !== undefined && gemini !== undefined && threeParty !== undefined) {
+      return { "antigravity-argon": argon, "antigravity-gemini": gemini, "antigravity-3p": threeParty };
+    }
+    // Any pool reaches the same grouped read, so one is enough to warm all three.
+    await vendorRailReadings("antigravity-argon", false);
+    const [warmArgon, warmGemini, warmThreeParty] = await Promise.all(
+      ANTIGRAVITY_RAILS.map((rail) => knownVendorRailReadings(rail)),
+    );
+    return {
+      "antigravity-argon": warmArgon,
+      "antigravity-gemini": warmGemini,
+      "antigravity-3p": warmThreeParty,
+    };
+  }
+
   async function knownReadings(): Promise<KnownReadings> {
-    // Both rails in flight together: the two reads are independent, and a
-    // sequential pair would make generation wait out two vendor latencies.
-    const [claude, codex] = await Promise.all([
+    // Every capped rail in flight together: a sequential walk would make
+    // generation wait out one vendor latency per rail, and the store's grouped
+    // read is what turns the three pool asks into one request.
+    const [claude, codex, antigravity] = await Promise.all([
       knownVendorRailReadings("claude"),
       knownVendorRailReadings("codex"),
+      knownAntigravityReadings(),
     ]);
-    return { claude, codex, deepseek: { latest: deepseekReading() } };
+    return {
+      claude,
+      codex,
+      ...antigravity,
+      deepseek: { latest: deepseekReading() },
+    };
   }
 
   async function decideAll(
@@ -3139,7 +3729,8 @@ export function createDispatcher(
    *
    * Rails are also fetched once and shared with the decisions, so the numbers
    * on screen are the numbers the decisions were made from, and `refresh` costs
-   * two HTTP requests rather than four.
+   * three vendor requests rather than six: one per source, with the three
+   * Antigravity pools answered by a single request.
    */
   async function report(opts: { force?: boolean } = {}): Promise<string[]> {
     const rails = latestReadings(await allReadings(opts.force));
@@ -3148,7 +3739,7 @@ export function createDispatcher(
     // that could disagree.
     const directory = await readAgentDirectory(cfg.agentDir);
     const lines: string[] = [];
-    for (const rail of ["claude", "codex", "deepseek"] as Rail[]) {
+    for (const rail of RAILS) {
       const s = rails.get(rail)!;
       if (!s.ok) lines.push(`${rail}: unavailable — ${s.note}`);
       else if (!s.windows.length) lines.push(`${rail}: ok — ${s.note ?? "no windows"}`);
@@ -3530,6 +4121,7 @@ export default function (pi: ExtensionAPI) {
     // place its warning used to sit when `loadConfig` still made it.
     const agentFileWarnings = checkAgentFiles(base.config, directory);
     const checked = checkModels(base.config, modelLookup(ctx));
+    const tokenResolver = providerTokenResolver(ctx);
     return {
       // The checked config is the effective one; `sources` still describe the
       // config that resulted, because the check only drops candidates it
@@ -3542,6 +4134,10 @@ export default function (pi: ExtensionAPI) {
       dispatcher: createDispatcher(checked.config, {
         held: checked.held,
         droppedAlternates: checked.droppedAlternates,
+        // Feature-detected, and never called at boot: an expired Antigravity
+        // token is the only thing that reaches it. Both the initial dispatcher
+        // and one built after a generation are made here, so both get it.
+        ...(tokenResolver === undefined ? {} : { resolveProviderToken: tokenResolver }),
       }),
       // The occurrences the same check warned about, for `session_start` to
       // surface. Rendered lines would have to be read back apart to be listed

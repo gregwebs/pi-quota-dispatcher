@@ -13,10 +13,13 @@ import {
   type ConfigBase,
   type LoadedConfig,
   type MergeLayer,
+  type Rail,
   type SkipFlag,
   type ThinkingLevel,
+  ANTIGRAVITY_RAILS,
   CONFIG_FILE_NAME,
   DEFAULT_CONFIG,
+  RAILS,
   THINKING_LEVELS,
   configFilesFor,
   defaultConfig,
@@ -24,11 +27,14 @@ import {
   describeConfigLayers,
   describeConfigWarnings,
   globalConfigPath,
+  isAntigravityRail,
+  isRail,
   loadConfig,
   mergeConfig,
   modelIdRejection,
   notJsonFault,
   projectConfigPath,
+  railFromModel,
   skillKey,
   thinkingFor,
   unusableConfigFileLines,
@@ -813,6 +819,104 @@ test("mergeConfig accepts the claude-bridge model on the claude rail", () => {
     },
   ]);
   assert.deepEqual(r.warnings, []);
+});
+
+// ---------------------------------------------------------------- antigravity pools
+
+test("the rail vocabulary is the five capped rails and the metered one", () => {
+  assert.deepEqual(
+    [...RAILS],
+    ["claude", "codex", "antigravity-argon", "antigravity-gemini", "antigravity-3p", "deepseek"],
+    "one canonical order, with the three pools as one account's group",
+  );
+  assert.deepEqual([...ANTIGRAVITY_RAILS], ["antigravity-argon", "antigravity-gemini", "antigravity-3p"]);
+  for (const rail of RAILS) {
+    assert.equal(isRail(rail), true, rail);
+    assert.equal(isAntigravityRail(rail), rail.startsWith("antigravity-"), rail);
+  }
+  // Validated membership, not a cast: near-misses and non-strings are refused.
+  for (const rejected of ["antigravity", "antigravity-", "Antigravity-3p", "openai", "deepseek-chat", "", null, 7, {}]) {
+    assert.equal(isRail(rejected), false, JSON.stringify(rejected));
+    assert.equal(isAntigravityRail(rejected), false, JSON.stringify(rejected));
+  }
+});
+
+test("railFromModel classifies each family, Argon before the general gemini prefix", () => {
+  const cases: Array<[string, Rail | undefined]> = [
+    ["claude-bridge/claude-opus-5-5", "claude"],
+    ["anthropic/claude-sonnet", "claude"],
+    ["openai-codex/gpt-6-sol", "codex"],
+    ["deepseek/deepseek-flash", "deepseek"],
+    ["antigravity/gemini-4-argon", "antigravity-argon"],
+    // The pool's own models share the stem, so a suffix is still Argon — and
+    // `gemini-argon-` starts with `gemini-`, which is why the order matters.
+    ["antigravity/gemini-4-argon-extra", "antigravity-argon"],
+    ["antigravity/gemini-4-7-flash", "antigravity-gemini"],
+    ["antigravity/gemini-4-7-pro", "antigravity-gemini"],
+    ["antigravity/claude-opus-5-5", "antigravity-3p"],
+    ["antigravity/gpt-6-codex", "antigravity-3p"],
+    // A family no pool claims is not guessed at.
+    ["antigravity/unknown", undefined],
+    ["antigravity/imagen-4", undefined],
+    ["mystery/thing", undefined],
+    ["claude-bridge", undefined],
+  ];
+  for (const [model, rail] of cases) assert.equal(railFromModel(model), rail, model);
+});
+
+test("each Antigravity pool registers as its own rail without a warning", () => {
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: {
+        models: {
+          "antigravity/gemini-4-argon": { rail: "antigravity-argon" },
+          "antigravity/gemini-4-7-flash": { rail: "antigravity-gemini" },
+          "antigravity/claude-opus-5-5": { rail: "antigravity-3p" },
+        },
+        agents: {
+          planner: { primary: { model: "antigravity/gemini-4-argon" } },
+          flash: { primary: { model: "antigravity/gemini-4-7-flash" } },
+          proxy: { primary: { model: "antigravity/claude-opus-5-5" } },
+        },
+      },
+    },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.deepEqual(
+    ["planner", "flash", "proxy"].map((a) => r.config.agents[agentName(a)].primary.rail),
+    ["antigravity-argon", "antigravity-gemini", "antigravity-3p"],
+  );
+  // Each registration really is the layer's, so provenance can say where a pool
+  // came from when a route points at the wrong one.
+  assert.equal(r.sources["models.antigravity/gemini-4-argon.rail"], "project");
+});
+
+test("a model registered on the wrong Antigravity pool warns and is applied", () => {
+  // The two Gemini pools are the trap: both serve Gemini models, so only the
+  // prefix check can tell a mis-registered route from a correct one.
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: {
+        models: { "antigravity/gemini-4-argon": { rail: "antigravity-gemini" } },
+        agents: { planner: { primary: { model: "antigravity/gemini-4-argon" } } },
+      },
+    },
+  ]);
+  assert.equal(r.config.agents[agentName("planner")].primary.rail, "antigravity-gemini");
+  assert.ok(
+    r.warnings.some((w) => w.includes("antigravity-argon") && w.includes("antigravity-gemini")),
+    r.warnings.join("\n"),
+  );
+});
+
+test("an Antigravity model still needs a rail stated somewhere", () => {
+  const r = mergeConfig(base(), [
+    { source: "project", data: { agents: { ghost: { primary: { model: "antigravity/gemini-4-7-flash" } } } } },
+  ]);
+  assert.equal("ghost" in r.config.agents, false);
+  assert.ok(r.warnings.some((w) => w.includes("needs a rail")), r.warnings.join("\n"));
 });
 
 test("mergeConfig rejects numeric scalars outside their documented range", () => {

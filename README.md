@@ -12,6 +12,9 @@ thing on a timer.
 $ /quota-dispatch
 claude: 5h 0%, 7d 27%
 codex: 5h 0%, 7d 64%
+antigravity-argon: gemini-argon-wtu-weekly 0%
+antigravity-gemini: gemini-weekly 12%, gemini-5h 42%
+antigravity-3p: 3p-weekly 2%, 3p-5h 3%
 deepseek: ok — metered
 
 planner -> claude-bridge/claude-opus-5-5 (thinking: high)  [unchanged]  (claude ok (session 0%, weekly 27%))
@@ -19,6 +22,12 @@ reviewer -> openai-codex/gpt-6-astra      [unchanged]  (codex ok (session 0%, we
 
 config: built-in < global ~/.pi/agent/quota-dispatch.json (present) < project .pi/quota-dispatch.json (absent)
 ```
+
+One line per rail, always in the same order, and the three Antigravity pools are
+three rails of their own: they are capped separately, so the account can be out
+of Argon's week while the Gemini pool is untouched. A rail this machine cannot
+read says `unavailable` and why, which is what an install without an Antigravity
+account gets for those three lines.
 
 The last line says which config layers were read. Where each *value* came from is
 one command further, because it is a question you ask deliberately rather than
@@ -318,15 +327,18 @@ a project file can register one model's rail without restating the rest.
 
 ### Model rails
 
-A candidate names a `model`; the rail — the account whose quota that model's
-calls consume — is registered once per model under `models`, keyed by the same
-`provider/modelId` pi uses:
+A candidate names a `model`; the rail — the independently capped quota **pool**
+that model's calls draw on — is registered once per model under `models`, keyed
+by the same `provider/modelId` pi uses:
 
 ```json
 {
   "models": {
     "claude-bridge/claude-opus-5-5": { "rail": "claude" },
-    "openai-codex/gpt-6-sol": { "rail": "codex" }
+    "openai-codex/gpt-6-sol": { "rail": "codex" },
+    "antigravity/gemini-4-argon": { "rail": "antigravity-argon" },
+    "antigravity/gemini-4-7-flash": { "rail": "antigravity-gemini" },
+    "antigravity/claude-opus-5-5": { "rail": "antigravity-3p" }
   },
   "agents": {
     "planner": {
@@ -337,7 +349,12 @@ calls consume — is registered once per model under `models`, keyed by the same
 }
 ```
 
-Registering it once keeps a route from restating the account on every candidate
+A rail is not an account: Google Antigravity gives one account three independently
+capped pools, so the three `antigravity-*` rails above are one login and three
+quotas. Which of them a model draws on is stated like any other rail — see
+[0019](docs/adr/0019-antigravity-pool-rails.md).
+
+Registering it once keeps a route from restating the rail on every candidate
 that names the model. A candidate may still state its own `rail`, which outranks
 the registered one, and a layer that moves a candidate to another model
 re-resolves the rail from that model's entry rather than gluing the old one to
@@ -346,12 +363,14 @@ rail is not carried along and the loader warns to register one — while a rail
 the candidate states itself is kept, field-wise. An invalid `rail` is warned
 about and ignored; it does not block a model change beside it, which still
 re-resolves. Either way a candidate whose model has no registered rail and which
-states none of its own is rejected: there is no account to route to, so the
+states none of its own is rejected: there is no pool to route to, so the
 loader warns instead of guessing. The
-model's prefix is **not** used as a fallback — the prefix is only checked
-against the registered rail, and a disagreement warns, which is what turns a
-mis-pointed route into a visible mistake rather than a silent route to the
-wrong quota.
+model's prefix is **not** used as a fallback — the prefix (`claude-bridge/`,
+`anthropic/`, `openai-codex/`, `deepseek/`, `antigravity/gemini-4-argon*`,
+`antigravity/gemini-*`, `antigravity/claude-*`, `antigravity/gpt-*`) is only
+checked against the registered rail, and a disagreement warns, which is what
+turns a mis-pointed route — including one that names the wrong Antigravity pool
+— into a visible mistake rather than a silent route to the wrong quota.
 
 ### Thinking levels
 
@@ -665,8 +684,8 @@ refresh. See [Where the numbers come from](#where-the-numbers-come-from).)
 **A project-declared `generator` is code the repository ships.** Running
 `/quota-dispatch generate project` in a repository executes that repository's
 command, on your machine, before you have read it — and that command is now
-handed both vendors' response bodies on stdin, which may carry account details
-(see below). Prefer a global generator, or read the project file before
+handed every configured vendor's response bodies on stdin, which may carry
+account details (see below). Prefer a global generator, or read the project file before
 generating from it. The run is bounded — a timeout
 (default 5s, settable with `timeoutMs`), capped output, and a process-group kill
 — but it is not a sandbox. See
@@ -703,6 +722,32 @@ reading it, still succeeds.
       "raw": { "rate_limit": { "limit_reached": true, "primary_window": { "used_percent": 7, "limit_window_seconds": 18000, "reset_after_seconds": 3600 }, "secondary_window": { "used_percent": 3, "limit_window_seconds": 604800 } } },
       "note": "limit_reached=true"
     },
+    "antigravity-argon": {
+      "ok": true,
+      "readAt": "2025-02-03T09:21:11.006Z",
+      "windows": [
+        { "label": "gemini-argon-wtu-weekly", "used": 0, "budget": "weekly", "resetsAt": "2025-02-10T09:14:22.000Z" }
+      ],
+      "raw": { "groups": [ { "buckets": [ { "bucketId": "gemini-argon-wtu-weekly", "window": "weekly", "resetTime": "2025-02-10T09:14:22Z", "remainingFraction": 1 }, { "bucketId": "gemini-weekly", "window": "weekly", "resetTime": "2025-02-10T09:20:07Z", "remainingFraction": 0.88 }, { "bucketId": "gemini-5h", "window": "5h", "resetTime": "2025-02-03T14:20:07Z", "remainingFraction": 0.58 }, { "bucketId": "3p-weekly", "window": "weekly", "resetTime": "2025-02-10T09:20:07Z", "remainingFraction": 0.98 }, { "bucketId": "3p-5h", "window": "5h", "resetTime": "2025-02-03T14:20:07Z", "remainingFraction": 0.97 } ] } ] }
+    },
+    "antigravity-gemini": {
+      "ok": true,
+      "readAt": "2025-02-03T09:21:11.006Z",
+      "windows": [
+        { "label": "gemini-weekly", "used": 12, "budget": "weekly", "resetsAt": "2025-02-10T09:20:07.000Z" },
+        { "label": "gemini-5h", "used": 42, "budget": "session", "resetsAt": "2025-02-03T14:20:07.000Z" }
+      ],
+      "raw": { "groups": [ { "buckets": [ { "bucketId": "gemini-argon-wtu-weekly", "window": "weekly", "resetTime": "2025-02-10T09:14:22Z", "remainingFraction": 1 }, { "bucketId": "gemini-weekly", "window": "weekly", "resetTime": "2025-02-10T09:20:07Z", "remainingFraction": 0.88 }, { "bucketId": "gemini-5h", "window": "5h", "resetTime": "2025-02-03T14:20:07Z", "remainingFraction": 0.58 }, { "bucketId": "3p-weekly", "window": "weekly", "resetTime": "2025-02-10T09:20:07Z", "remainingFraction": 0.98 }, { "bucketId": "3p-5h", "window": "5h", "resetTime": "2025-02-03T14:20:07Z", "remainingFraction": 0.97 } ] } ] }
+    },
+    "antigravity-3p": {
+      "ok": true,
+      "readAt": "2025-02-03T09:21:11.006Z",
+      "windows": [
+        { "label": "3p-weekly", "used": 2, "budget": "weekly", "resetsAt": "2025-02-10T09:20:07.000Z" },
+        { "label": "3p-5h", "used": 3, "budget": "session", "resetsAt": "2025-02-03T14:20:07.000Z" }
+      ],
+      "raw": { "groups": [ { "buckets": [ { "bucketId": "gemini-argon-wtu-weekly", "window": "weekly", "resetTime": "2025-02-10T09:14:22Z", "remainingFraction": 1 }, { "bucketId": "gemini-weekly", "window": "weekly", "resetTime": "2025-02-10T09:20:07Z", "remainingFraction": 0.88 }, { "bucketId": "gemini-5h", "window": "5h", "resetTime": "2025-02-03T14:20:07Z", "remainingFraction": 0.58 }, { "bucketId": "3p-weekly", "window": "weekly", "resetTime": "2025-02-10T09:20:07Z", "remainingFraction": 0.98 }, { "bucketId": "3p-5h", "window": "5h", "resetTime": "2025-02-03T14:20:07Z", "remainingFraction": 0.97 } ] } ] }
+    },
     "deepseek": { "metered": true, "windows": [], "raw": null }
   }
 }
@@ -714,14 +759,28 @@ into. That is the only thing the marker means. The codex entry shows a `note`:
 under `limit_reached` every window reads 100 while `raw` keeps the vendor's own
 lower percentages, and the note is what tells a generator why they disagree.
 
+The three `antigravity-*` entries are one account's three independently capped
+pools, all answered by **one** `retrieveUserQuotaSummary` request — which is why,
+when all three came from the same successful read, they share a `readAt` to the
+millisecond. Each pool's `raw` is that whole response, the same document three
+times over: the buckets were partitioned by `bucketId` (see
+[Where the numbers come from](#where-the-numbers-come-from)), so any one pool's
+`raw` describes the whole account. Nothing is redacted per pool.
+
+A pool that fell back to its own earlier success is the exception, and it says so
+with `latestFailure`: that pool's `readAt` and `raw` are then its `lastGood`
+reading's, taken at a different time from its siblings' and from a body that need
+not mention them. The shared instant is a fact about one read, not a promise that
+three rails always agree.
+
 | Field | Meaning |
 |---|---|
 | `version` | `1`. A change to this shape bumps it. |
-| `rails` | One key per rail, **always all three**. A capped rail with no usable reading is not sent empty — it refuses the run instead (below). |
+| `rails` | One key per rail, **always all six**: the five quota-capped rails and the metered one. A capped rail with no usable reading is not sent empty — it refuses the run instead (below). |
 | `ok` | `true`: what follows is a reading, not a failure. The metered rail has no `ok` at all, so a generator should test `metered` before it tests `ok`. |
 | `readAt` | ISO 8601, when the reading sent was taken — the last good reading's own time when `latestFailure` is present. |
-| `windows` | Every window that read reported. `used` is percent; `budget` (`session` or `weekly`) is present only when the window counts toward one; `resetsAt` (ISO 8601) only when the vendor said when it clears. |
-| `raw` | The vendor's response body as parsed JSON — the document `windows` was parsed from — re-serialized, so its formatting and number spelling may differ (an integer beyond 2^53 loses precision, and a duplicate key is already gone). It may carry account details, so do not log it. `used` is not always recomputable from it: under Codex's `limit_reached` every window reads 100 whatever `raw` says. |
+| `windows` | Every window that read reported. `used` is percent; `budget` (`session` or `weekly`) is present only when the window counts toward one; `resetsAt` (ISO 8601) only when the vendor said when it clears. A pool that carries only one budget reports only that one: `antigravity-argon` has a week and no session. |
+| `raw` | The vendor's response body as parsed JSON — the document `windows` was parsed from — re-serialized, so its formatting and number spelling may differ (an integer beyond 2^53 loses precision, and a duplicate key is already gone). It may carry account details, so do not log it. `used` is not always recomputable from it: under Codex's `limit_reached` every window reads 100 whatever `raw` says. One Antigravity response is carried on all three pools, so the document is bigger than the sum of its `windows`. |
 | `note` | A display-only qualifier the read carried, when it carried one: Codex's `limit_reached=true`, or a note from refreshing the Claude credential (which may be this extension's own, not the vendor's). |
 | `latestFailure` | `{ at, note }` of the newest failed read. Present only when that read failed and an earlier success stood in for it. |
 | `metered` | A per-token rail: `{ "metered": true, "windows": [], "raw": null }`, and nothing to decide. |
@@ -734,15 +793,17 @@ command runs. Run
 [`/quota-dispatch refresh`](#commands) first when you want fresh numbers. There
 is no `generate refresh` form.
 
-If **`claude` or `codex` has no successful reading** in what the shared
-[rail readings file](#where-the-numbers-come-from) holds — nothing this machine
-has recorded for the rail, at any age — the command is **not run** and the
-failure says which rail and why. A recorded failure is not retried: a rail with
-no successful reading in the file counts as having no reading, and the refusal
-says so. That is deliberate: a generator cannot choose without the
-numbers, and a placeholder would be a guess the policy itself refuses to make.
-One consequence: an install with only one of the two quota-capped rails cannot
-generate.
+If **any of the five quota-capped rails has no successful reading** in what the
+shared [rail readings file](#where-the-numbers-come-from) holds — nothing this
+machine has recorded for the rail, at any age — the command is **not run** and
+the failure names every rail that is missing, in the document's own order, and
+why. A recorded failure is not retried: a rail with no successful reading in the
+file counts as having no reading, and the refusal says so. That is deliberate: a
+generator cannot choose without the numbers, and a placeholder would be a guess
+the policy itself refuses to make. One consequence: an install without every
+quota-capped rail's credentials — both vendor accounts *and* an authenticated
+Antigravity account — cannot generate at all, even to print a table that only
+uses the rails it does have.
 
 `generator.timeoutMs` covers the command only, starting when it is spawned. The
 quota reads before it are bounded by the reads' own limits (see
@@ -757,9 +818,9 @@ and when a run is refused — is in
 ### Out of scope
 
 Config can only route among the rails the extension already knows how to read
-(`claude`, `codex`, `deepseek`). Adding a genuinely new quota rail — its
-endpoint and response parser — still requires code, so there is no `rails` block
-to configure.
+(`claude`, `codex`, `antigravity-argon`, `antigravity-gemini`, `antigravity-3p`,
+`deepseek`). Adding a genuinely new quota rail — its endpoint and response
+parser — still requires code, so there is no `rails` block to configure.
 
 ## The policy
 
@@ -769,19 +830,28 @@ drift. The one thing a file does not converge on is the `thinking:` line, which 
 pass that resolves no level leaves alone; see
 [Thinking levels](#thinking-levels).
 
-Each rail reports **two budgets that move on very different clocks**, and they
-are weighed separately:
+A rail reports **up to two budgets that move on very different clocks**, and
+they are weighed separately:
 
-- **session** — Claude's 5-hour window, Codex's `primary_window`. This is the
-  acute cap. It is what blocks you mid-task, and it clears within hours, so
-  acting on it is reversible.
+- **session** — Claude's 5-hour window, Codex's `primary_window`, Antigravity's
+  `5h` bucket. This is the acute cap. It is what blocks you mid-task, and it
+  clears within hours, so acting on it is reversible.
 - **weekly** — the opposite shape. It rarely blocks you, but when it does it does
   so for *days*, so a switch made on it is close to one-way.
+
+A pool need not impose both. `antigravity-argon` has a week and no session cap,
+and the metered rail has neither — so only a budget a rail **carries** can be
+missing, and an uncarried one is 0% by construction rather than by reading. That
+distinction is what stops an Argon primary being held for a 5-hour window the
+vendor never promised, and what lets it take work off a session-tight primary
+without being refused for a session cap it does not have.
 
 1. **Session first.** If the primary's session budget is at or above
    `sessionSwitchAt`, the alternates are walked **in the order you listed them**
    and the first one whose session budget is more than `margin` points healthier
-   wins. When `sessionAlwaysSwitchAt` is configured and the primary's session
+   wins. A destination that carries no session budget competes on 0% there, so
+   Argon can be chosen on a session pass; a primary that carries none never
+   starts one. When `sessionAlwaysSwitchAt` is configured and the primary's session
    budget has also reached it, that margin is set aside for the rest of the
    walk: an alternate is eligible as soon as its session budget is **strictly
    below** `sessionAlwaysSwitchAt`, and one at or above it is refused whatever
@@ -799,10 +869,12 @@ are weighed separately:
    alternate that is tight on the week is refused by both passes.
 3. **The destination has to be somewhere worth going.** A rail is only a valid
    target if — besides being better on the budget that triggered the move — it
-   is **not itself tight on the other budget**. A rail tight on its *other* cap
-   would block the work just as surely, so switching there trades one cap for
-   another rather than relieving anything. Without this, one pass can move an
-   agent *onto* the very rail it moves another agent *off*.
+   is **not itself tight on the other budget**, when it carries that budget at
+   all. A rail tight on its *other* cap would block the work just as surely, so
+   switching there trades one cap for another rather than relieving anything.
+   Without this, one pass can move an agent *onto* the very rail it moves
+   another agent *off*. Argon carries no session budget, so it is never refused
+   on one — which is also why `sessionSwitchAt: 0` cannot reject it.
 4. Otherwise stay on the primary.
 5. **Unreadable is not idle — but it only holds where it could have changed the
    answer.** A reading the dispatcher does not have is not evidence of pressure
@@ -872,10 +944,12 @@ it is wrong: the weekly figure is almost always the larger of the two, so it
 quietly becomes the only one that matters. A rail with a completely full session
 budget then gets abandoned for days because its *week* looks busy.
 
-Rails are per-provider: `claude-bridge/*` and `anthropic/*` consume the Claude
-subscription, and `openai-codex/*` consumes the Codex subscription. `deepseek/*`
-is metered per token rather than capped, so it reports no windows at all and is
-never tight — it is the resting place.
+Rails are per-provider or per-pool: `claude-bridge/*` and `anthropic/*` consume
+the Claude subscription, `openai-codex/*` the Codex subscription, and
+`antigravity/*` one of the three Antigravity pools (`gemini-4-argon*`, the other
+Gemini models, and the Claude/GPT models it proxies) that share one login.
+`deepseek/*` is metered per token rather than capped, so it reports no windows at
+all and is never tight — it is the resting place.
 
 One thing this deliberately does *not* do is predict exhaustion. A weekly budget
 at 65% with a third of the week gone is burning at roughly twice its sustainable
@@ -922,7 +996,7 @@ takes no lock at all. See ADR
 
 ## Where the numbers come from
 
-Two endpoints that the vendors' own clients use. Neither is a documented public
+Three endpoints that the vendors' own clients use. None is a documented public
 API, so treat them as best-effort — the extension is built to degrade quietly if
 they change or move.
 
@@ -930,6 +1004,22 @@ they change or move.
 |---|---|---|
 | Claude | the macOS login keychain (`Claude Code-credentials`), falling back to `~/.claude/.credentials.json` → `claudeAiOauth.accessToken` | `api.anthropic.com/api/oauth/usage` |
 | Codex | `<agent dir>/auth.json` (normally `~/.pi/agent/auth.json`) → `openai-codex.access` + `accountId` | `chatgpt.com/backend-api/wham/usage` |
+| Antigravity (all three pools) | the same `auth.json` → `antigravity.access`, with `antigravity.projectId` sent when it names one | `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` |
+
+Antigravity's three pools share a row because they share a request: one `POST`
+answers for all of them, and the buckets in that one body are partitioned by
+bucket id — `gemini-argon-*` to `antigravity-argon`, other `gemini-*` to
+`antigravity-gemini`, `3p-*` to `antigravity-3p`. A report prints each pool's own
+windows and percentages, and one shared answer is also why a group the vendor
+omitted costs one pool its reading rather than all three. See
+[0019](docs/adr/0019-antigravity-pool-rails.md).
+
+The request's `User-Agent` is pinned to the string Antigravity's current CLI
+sends, and it is load-bearing rather than polite: Google omits the `Gemini 4
+Argon` group for older or generic agent strings, so a request that looks like an
+old client reports two pools instead of three. `ANTIGRAVITY_USER_AGENT`
+overrides it (trimmed; blank is ignored) for a proxy that rewrites the header or
+a vendor build that demands a newer string.
 
 Credentials are read, never logged, and never transmitted anywhere except to the
 provider that issued them.
@@ -952,7 +1042,7 @@ file, because a `CLAUDE_CONFIG_DIR` profile keeps its credential in its own file
 and never writes the keychain: for any other path the keychain would answer for
 a different account.
 
-Both reads are **bounded**, because the evaluation that `session_start` awaits
+Every read is **bounded**, because the evaluation that `session_start` awaits
 depends on them. Each attempt is abandoned by a 5s timeout, and a failed attempt
 is retried once after 250ms; a rail still unreadable after that is a missing
 reading like any other, so it holds rather than falling through to a later
@@ -1033,6 +1123,19 @@ is doing the work, so the next read may try again.
 See [0007](docs/adr/0007-refresh-pings.md) for the measurements, the bounds, and
 the alternatives that were rejected.
 
+### The Antigravity token is pi's to refresh
+
+`pi-antigravity` registers an OAuth provider with pi, so the token in
+`auth.json` has exactly one writer and it is not this extension: the dispatcher
+never posts a refresh token and never writes `auth.json`. When the stored token
+has expired **and** the auth file is the one pi's provider owns, the dispatcher
+asks pi to refresh it and then re-reads the file, so what it uses is what is now
+stored. A `piAuthPath` naming another profile, a pi with no such resolver, or a
+`401`/`429` from the endpoint is reported as unavailable rather than refreshed.
+The wait is bounded, and it never starts a second refresh. See
+[0019](docs/adr/0019-antigravity-pool-rails.md) for the mechanics and, for the
+single-writer principle, [0007](docs/adr/0007-refresh-pings.md).
+
 ## Caveats
 
 - **The Claude token expires** (typically within hours). Claude Code refreshes it
@@ -1042,8 +1145,13 @@ the alternatives that were rejected.
   Code. Once *both* stores lapse — the file and, on macOS, the keychain — and
   nothing refreshes them, the Claude rail reports unavailable and the dispatcher
   holds, leaving every agent file untouched. If you stop using Claude Code the
-  Claude side goes dormant — but nothing gets moved onto the other plan to
+  Claude side goes dormant — but nothing gets moved onto another plan to
   compensate, so the failure is quiet.
+- **The Antigravity token expires too**, and only pi refreshes it. When it has
+  lapsed and pi's provider resolver is available on the default auth file, the
+  next read delegates the refresh (see [above](#the-antigravity-token-is-pis-to-refresh));
+  otherwise the three Antigravity rails report unavailable and hold, exactly as
+  a failed read does. Nothing is moved onto another plan to compensate.
 - **The macOS keychain read can ask for permission.** `security` is a different
   process from the one that created the item, so macOS may prompt the first time
   and remember your answer; choose *Always Allow* if you want the poll to stay
@@ -1070,10 +1178,10 @@ the alternatives that were rejected.
   [0013](docs/adr/0013-agent-file-writes-are-coordinated.md).
 - **A running agent keeps its model.** A switch applies to the next spawn, not to
   work already in flight.
-- **Same-rail congestion is possible.** If both plans are tight, agents can end
-  up resting on the same rail; the policy does not balance load across agents.
-- **The margin is not hysteresis.** Each evaluation compares the two rails
-  against each other only, with no memory of what an agent is currently assigned
+- **Same-rail congestion is possible.** If every rail is tight, agents can end
+  up resting on the same one; the policy does not balance load across agents.
+- **The margin is not hysteresis.** Each evaluation compares the primary's rail
+  against the alternate's only, with no memory of what an agent is currently assigned
   to. So when a budget hovers around its threshold — primary session at 90,
   alternate oscillating either side of 80 — an agent can alternate between rails
   on successive polls. `sessionAlwaysSwitchAt` does not change that: it is a
@@ -1084,7 +1192,7 @@ the alternatives that were rejected.
   is abandoned after 5s and retried once after 250ms, so a vendor that has gone
   quiet costs a session about 10s — a few seconds more on macOS, where a Claude
   credential that has to fall back to the keychain waits out its own 5s first,
-  since the two rails are read in parallel. A `claudeRefresh` ping adds a bounded
+  since the rails are read in parallel. A `claudeRefresh` ping adds a bounded
   run of its own and the credential re-read that follows it, once per expiry —
   see [Keeping the Claude token
   fresh](#keeping-the-claude-token-fresh). The agents whose route depends on that

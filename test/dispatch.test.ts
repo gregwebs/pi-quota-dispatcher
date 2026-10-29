@@ -468,7 +468,7 @@ test("a real multi-alternate decision puts each passed-over candidate on its own
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
       railState("codex", { session: 20, weekly: 0 }),
-      railState("deepseek", { session: 0, weekly: 0 }),
+      railState("antigravity-3p", { session: 0, weekly: 0 }),
     ),
     cfg,
   );
@@ -730,11 +730,15 @@ test("a metered primary is never tight, so it is left where it is", () => {
 
 // ------------------------------------------------- alternates in priority order
 
+// The third pool carries both budgets, so a candidate on it can be rejected on
+// one of them. A pool with no session cap — the metered rail, or Antigravity's
+// Argon pool — reads 0% there and is always a session destination; those have
+// their own tests below.
 const MULTI: AgentRoute = routeOf({
   primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
   alternates: [
     { model: "openai-codex/gpt-6-sol", rail: "codex" },
-    { model: "deepseek/deepseek-flash", rail: "deepseek" },
+    { model: "antigravity/claude-sonnet-4-5", rail: "antigravity-3p" },
   ],
 });
 
@@ -746,13 +750,13 @@ test("decide walks alternates in priority order and takes the first usable one",
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
       railState("codex", { session: 20, weekly: 0 }),
-      railState("deepseek", { session: 0, weekly: 0 }),
+      railState("antigravity-3p", { session: 0, weekly: 0 }),
     ),
     cfg,
   );
   assert.equal(assignedModel(d), "openai-codex/gpt-6-sol");
   // The decision names the rejected alternate and why it lost its place.
-  assert.ok(d.why.includes("deepseek/deepseek-flash"), d.why);
+  assert.ok(d.why.includes("antigravity/claude-sonnet-4-5"), d.why);
 });
 
 test("two alternates on one rail are told apart by model, not just rail", () => {
@@ -787,11 +791,11 @@ test("an alternate within margin is passed over for a later usable one", () => {
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
       railState("codex", { session: 85, weekly: 0 }), // within margin: 90 - 85 = 5 <= 10
-      railState("deepseek", { session: 20, weekly: 0 }),
+      railState("antigravity-3p", { session: 20, weekly: 0 }),
     ),
     cfg,
   );
-  assert.equal(assignedModel(d), "deepseek/deepseek-flash");
+  assert.equal(assignedModel(d), "antigravity/claude-sonnet-4-5");
   assert.ok(d.why.includes("openai-codex/gpt-6-sol"), d.why);
 });
 
@@ -802,28 +806,39 @@ test("an alternate tight on its other budget is passed over for a later usable o
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
       railState("codex", { session: 20, weekly: 100 }), // itself tight on the week
-      railState("deepseek", { session: 30, weekly: 0 }),
+      railState("antigravity-3p", { session: 30, weekly: 0 }),
     ),
     cfg,
   );
-  assert.equal(assignedModel(d), "deepseek/deepseek-flash");
+  assert.equal(assignedModel(d), "antigravity/claude-sonnet-4-5");
   assert.ok(d.why.includes("openai-codex/gpt-6-sol"), d.why);
 });
 
 test("when every readable alternate is rejected and none is unreadable, the primary is assigned", () => {
+  // Both alternates carry the compared budget and are within it. A pool that
+  // carries no session cap at all (the metered rail, or Antigravity's Argon
+  // pool) reads 0% there and would always be eligible, so the two pools here are
+  // ones that really do have a session cap.
+  const twoPools: AgentRoute = routeOf({
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [
+      { model: "openai-codex/gpt-6-sol", rail: "codex" },
+      { model: "antigravity/gemini-5-pro", rail: "antigravity-gemini" },
+    ],
+  });
   const d = decide(
     definitionOf("planner", cfg),
-    MULTI,
+    twoPools,
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
       railState("codex", { session: 85, weekly: 0 }),
-      railState("deepseek", { session: 88, weekly: 0 }),
+      railState("antigravity-gemini", { session: 88, weekly: 0 }),
     ),
     cfg,
   );
   assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
   assert.ok(d.why.includes("openai-codex/gpt-6-sol"), d.why);
-  assert.ok(d.why.includes("deepseek/deepseek-flash"), d.why);
+  assert.ok(d.why.includes("antigravity/gemini-5-pro"), d.why);
 });
 
 // ------------------------------------- empty alternates pin to the primary
@@ -967,7 +982,7 @@ test("a readable primary below every threshold is assigned even when every alter
     railMap(
       railState("claude", { session: 10, weekly: 10 }),
       railState("codex", { ok: false, note: "HTTP 500" }),
-      railState("deepseek", { ok: false, note: "HTTP 500" }),
+      railState("antigravity-3p", { ok: false, note: "HTTP 500" }),
     ),
     cfg,
   );
@@ -982,7 +997,7 @@ test("an unreadable alternate earlier in order than a usable one holds instead",
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
       railState("codex", { ok: false, note: "HTTP 500" }),
-      railState("deepseek", { session: 20, weekly: 0 }),
+      railState("antigravity-3p", { session: 20, weekly: 0 }),
     ),
     cfg,
   );
@@ -1057,7 +1072,7 @@ test("an unreadable alternate later in order than a usable winner does not hold"
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
       railState("codex", { session: 20, weekly: 0 }),
-      railState("deepseek", { ok: false, note: "HTTP 500" }),
+      railState("antigravity-3p", { ok: false, note: "HTTP 500" }),
     ),
     cfg,
   );
@@ -1072,7 +1087,7 @@ test("when no readable alternate qualifies, an unreadable one holds rather than 
     railMap(
       railState("claude", { session: 90, weekly: 0 }),
       railState("codex", { session: 85, weekly: 0 }), // readable, but within margin
-      railState("deepseek", { ok: false, note: "HTTP 500" }),
+      railState("antigravity-3p", { ok: false, note: "HTTP 500" }),
     ),
     cfg,
   );
@@ -1193,6 +1208,240 @@ test("a metered rail reports no budgets rather than unreported ones", () => {
   const partial = railState("codex", { weekly: 10 });
   assert.equal(budgetUsed(partial, "session"), undefined);
   assert.equal(budgetUsed(partial, "weekly"), 10);
+});
+
+// ------------------------------------- budgets a rail does not carry
+
+// A pool need not impose both caps. Argon has one weekly bucket and no 5-hour
+// window at all, so "no session cap" (usage 0, never tight) has to be a
+// different fact from "this read did not say" (undefined, a hold).
+test("budgetUsed separates a budget a rail does not carry from one it did not report", () => {
+  const argon = railState("antigravity-argon", { weekly: 20 });
+  assert.equal(budgetUsed(argon, "weekly"), 20);
+  assert.equal(budgetUsed(argon, "session"), 0, "Argon has no session cap, so it is never tight there");
+
+  const gemini = railState("antigravity-gemini", { session: 20 });
+  assert.equal(budgetUsed(gemini, "weekly"), undefined, "Gemini does have a weekly cap and did not report it");
+
+  // An uncarried budget reads 0 even if a vendor anomaly put a window on it.
+  const anomalous: RailReading = {
+    rail: "antigravity-argon",
+    ok: true,
+    windows: [
+      { label: "gemini-argon-wtu-weekly", used: 20, budget: "weekly" },
+      { label: "unexpected-5h", used: 100, budget: "session" },
+    ],
+    readAt: 0,
+    raw: {},
+  };
+  assert.equal(budgetUsed(anomalous, "session"), 0);
+  assert.equal(budgetUsed(anomalous, "weekly"), 20);
+});
+
+const ARGON_PRIMARY: AgentRoute = routeOf({
+  primary: { model: "antigravity/gemini-4-argon", rail: "antigravity-argon" },
+  alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
+});
+
+test("an Argon primary reporting only its week is not missing a session budget", () => {
+  const d = decide(
+    definitionOf("planner", cfg),
+    ARGON_PRIMARY,
+    railMap(railState("antigravity-argon", { weekly: 20 }), railState("codex", { session: 0, weekly: 0 })),
+    cfg,
+  );
+  assert.equal(d.kind, "assign");
+  assert.equal(assignedModel(d), "antigravity/gemini-4-argon");
+  // The line names the one budget the pool carries, rather than inventing a
+  // reported session figure or reporting a session fault that cannot exist.
+  assert.ok(d.why.includes("weekly 20%"), d.why);
+  assert.ok(!d.why.includes("session"), d.why);
+});
+
+test("an Argon primary that fails to report its week holds", () => {
+  const d = decide(
+    definitionOf("planner", cfg),
+    ARGON_PRIMARY,
+    railMap(railState("antigravity-argon", {}), railState("codex", { session: 0, weekly: 0 })),
+    cfg,
+  );
+  assert.equal(d.kind, "hold");
+  assert.ok(d.why.includes("weekly"), d.why);
+  assert.ok(!d.why.includes("session"), d.why);
+});
+
+for (const [rail, model] of [
+  ["antigravity-gemini", "antigravity/gemini-5-pro"],
+  ["antigravity-3p", "antigravity/claude-sonnet-4-5"],
+] as const) {
+  test(`a ${rail} alternate missing a carried budget holds instead of being read as idle`, () => {
+    const route = routeOf({
+      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+      alternates: [{ model, rail }],
+    });
+    for (const partial of [{ session: 10 }, { weekly: 10 }] as const) {
+      const d = decide(
+        definitionOf("planner", cfg),
+        route,
+        railMap(railState("claude", { session: 95, weekly: 0 }), railState(rail, partial)),
+        cfg,
+      );
+      assert.equal(d.kind, "hold", `${rail} ${JSON.stringify(partial)}: ${d.why}`);
+      assert.ok(d.why.includes(missingBudget(partial)), d.why);
+    }
+  });
+}
+
+/** The budget a partial fixture above left out, as the hold's note names it. */
+function missingBudget(partial: { session?: number; weekly?: number }): string {
+  return partial.session === undefined ? "session" : "weekly";
+}
+
+test("display-only windows do not satisfy a carried budget", () => {
+  const d = decide(
+    definitionOf("planner", cfg),
+    routeOf({
+      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+      alternates: [{ model: "antigravity/gemini-5-pro", rail: "antigravity-gemini" }],
+    }),
+    railMap(
+      railState("claude", { session: 95, weekly: 0 }),
+      {
+        rail: "antigravity-gemini",
+        ok: true,
+        windows: [{ label: "gemini-future", used: 5 }],
+        readAt: 0,
+        raw: {},
+      },
+    ),
+    cfg,
+  );
+  assert.equal(d.kind, "hold");
+  assert.ok(d.why.includes("session and weekly"), d.why);
+});
+
+test("an Argon alternate takes work off a session-tight primary", () => {
+  // Argon has no session cap, so its effective session usage is 0 — the same
+  // reading a metered rail gets — and that is what lets it relieve an acute
+  // session squeeze. Only its week has to be safe.
+  const d = decide(
+    definitionOf("planner", cfg),
+    routeOf({
+      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+      alternates: [{ model: "antigravity/gemini-4-argon", rail: "antigravity-argon" }],
+    }),
+    railMap(
+      railState("claude", { session: 95, weekly: 20 }),
+      railState("antigravity-argon", { weekly: 30 }),
+    ),
+    cfg,
+  );
+  assert.equal(assignedModel(d), "antigravity/gemini-4-argon");
+  assert.ok(d.why.includes("session 0%"), d.why);
+});
+
+test("an Argon alternate whose own week is tight is not a destination", () => {
+  const d = decide(
+    definitionOf("planner", cfg),
+    routeOf({
+      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+      alternates: [{ model: "antigravity/gemini-4-argon", rail: "antigravity-argon" }],
+    }),
+    railMap(
+      railState("claude", { session: 95, weekly: 20 }),
+      railState("antigravity-argon", { weekly: 90 }),
+    ),
+    cfg,
+  );
+  assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
+  assert.ok(d.why.includes("weekly 90% is itself tight"), d.why);
+});
+
+test("a week-tight Argon primary is not relieved by an alternate whose own session is tight", () => {
+  const d = decide(
+    definitionOf("planner", cfg),
+    routeOf({
+      primary: { model: "antigravity/gemini-4-argon", rail: "antigravity-argon" },
+      alternates: [{ model: "antigravity/gemini-5-pro", rail: "antigravity-gemini" }],
+    }),
+    railMap(
+      railState("antigravity-argon", { weekly: 95 }),
+      railState("antigravity-gemini", { session: 75, weekly: 20 }),
+    ),
+    cfg,
+  );
+  assert.equal(assignedModel(d), "antigravity/gemini-4-argon");
+  assert.ok(d.why.includes("session 75% is itself tight"), d.why);
+});
+
+test("an uncarried spare budget is never rejected, even at a zero threshold", () => {
+  // `sessionSwitchAt: 0` makes every rail that really carries a session cap
+  // tight there, which is why the destination has to be one that does not: the
+  // week is the only budget this primary is tight on, so the pass that fires
+  // weighs `session` on the destination, and the destination has none.
+  const zeroSession: DispatcherConfig = { ...cfg, sessionSwitchAt: 0 };
+  const d = decide(
+    definitionOf("planner", cfg),
+    routeOf({
+      primary: { model: "antigravity/gemini-4-argon", rail: "antigravity-argon" },
+      alternates: [{ model: "deepseek/deepseek-flash", rail: "deepseek" }],
+    }),
+    railMap(
+      railState("antigravity-argon", { weekly: 95 }),
+      railState("deepseek", { metered: true }),
+    ),
+    zeroSession,
+  );
+  assert.equal(assignedModel(d), "deepseek/deepseek-flash");
+  assert.ok(!d.why.includes("is itself tight"), d.why);
+});
+
+test("a weekly-tight primary still reaches a session-free destination at a zero threshold", () => {
+  const zeroSession: DispatcherConfig = { ...cfg, sessionSwitchAt: 0 };
+  const d = decide(
+    definitionOf("planner", cfg),
+    routeOf({
+      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+      alternates: [{ model: "antigravity/gemini-4-argon", rail: "antigravity-argon" }],
+    }),
+    railMap(
+      railState("claude", { session: 20, weekly: 95 }),
+      railState("antigravity-argon", { weekly: 30 }),
+    ),
+    zeroSession,
+  );
+  assert.equal(assignedModel(d), "antigravity/gemini-4-argon");
+  assert.ok(!d.why.includes("is itself tight"), d.why);
+});
+
+test("a metered alternate is never rejected for a budget it does not carry", () => {
+  const zeroBoth: DispatcherConfig = { ...cfg, sessionSwitchAt: 0, weeklySwitchAt: 0 };
+  const d = decide(
+    definitionOf("planner", cfg),
+    routeOf({
+      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+      alternates: [{ model: "deepseek/deepseek-flash", rail: "deepseek" }],
+    }),
+    railMap(
+      railState("claude", { session: 20, weekly: 95 }),
+      railState("deepseek", { metered: true }),
+    ),
+    zeroBoth,
+  );
+  assert.equal(assignedModel(d), "deepseek/deepseek-flash");
+});
+
+test("an Argon primary is never tight on a session the pool does not have", () => {
+  // Argon carries one budget, so a zero session threshold has nothing to fire on.
+  const zeroSession: DispatcherConfig = { ...cfg, sessionSwitchAt: 0 };
+  const d = decide(
+    definitionOf("planner", cfg),
+    ARGON_PRIMARY,
+    railMap(railState("antigravity-argon", { weekly: 20 }), railState("codex", { session: 0, weekly: 0 })),
+    zeroSession,
+  );
+  assert.equal(assignedModel(d), "antigravity/gemini-4-argon");
+  assert.ok(!d.why.includes("tight on session"), d.why);
 });
 
 // A hold is not "assign the primary". These decisions carry no model at all,
@@ -1820,7 +2069,7 @@ const sessionAlternateModel = AGENT_ROUTES.planner.alternates[0].model;
 function sessionOverrideDecision(primary: Readings, first: Readings, second?: Readings, config = sessionOverrideConfig): Decision {
   return decide(definitionOf("planner", config), second ? MULTI : AGENT_ROUTES.planner,
     railMap(railState("claude", primary), railState("codex", first),
-      ...(second ? [railState("deepseek", second)] : [])), config);
+      ...(second ? [railState("antigravity-3p", second)] : [])), config);
 }
 
 for (const [p, a, expected] of [
@@ -1867,7 +2116,8 @@ test("override endpoint zero admits no nonnegative alternate", () => {
       { ...sessionOverrideConfig, sessionSwitchAt: 0, sessionAlwaysSwitchAt: 0, margin: 0 })), sessionPrimaryModel, `${p}/${a}`);
   }
 });
-for (const [first, second, expected] of [[92, 85, "deepseek/deepseek-flash"], [89, 20, sessionAlternateModel], [90, 95, sessionPrimaryModel]] as const) {
+const thirdPoolModel = "antigravity/claude-sonnet-4-5";
+for (const [first, second, expected] of [[92, 85, thirdPoolModel], [89, 20, sessionAlternateModel], [90, 95, sessionPrimaryModel]] as const) {
   test(`override priority walk selects ${expected} at 95/${first}/${second}`, () => {
     assert.equal(assignedModel(sessionOverrideDecision({ session: 95, weekly: 0 }, { session: first, weekly: 0 },
       { session: second, weekly: 0 })), expected);
@@ -1875,7 +2125,7 @@ for (const [first, second, expected] of [[92, 85, "deepseek/deepseek-flash"], [8
 }
 test("weekly-tight first alternate rejected for later override winner", () => {
   assert.equal(assignedModel(sessionOverrideDecision({ session: 95, weekly: 0 }, { session: 85, weekly: 90 },
-    { session: 89, weekly: 89.9 })), "deepseek/deepseek-flash");
+    { session: 89, weekly: 89.9 })), thirdPoolModel);
 });
 for (const [label, p, a, expected, config] of [
   ["weekly-only", { session: 10, weekly: 95 }, { session: 69.9, weekly: 10 }, sessionAlternateModel, sessionOverrideConfig],
