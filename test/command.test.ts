@@ -79,7 +79,12 @@ async function fixture(
 
   await writeFile(
     join(agentDir, "auth.json"),
-    JSON.stringify({ "openai-codex": { access: "test-token", accountId: "acct-test" } }),
+    JSON.stringify({
+      "openai-codex": { access: "test-token", accountId: "acct-test" },
+      // The one credential all three Antigravity pools are read under, so a
+      // complete read of them is one request, not three.
+      antigravity: { access: "test-token", expires: Date.now() + 3_600_000, projectId: "test-project" },
+    }),
     "utf8",
   );
 
@@ -107,23 +112,86 @@ interface RailReadings {
   claudeWeekly: number;
   codexSession: number;
   codexWeekly: number;
+  /** Antigravity's Argon pool: a week, and no session cap at all. */
+  argonWeekly: number;
+  geminiSession: number;
+  geminiWeekly: number;
+  threePartySession: number;
+  threePartyWeekly: number;
 }
 
 /**
  * The only network boundary. The default readings make a real switch: claude
  * session at 90% is tight, codex session at 10% is more than `margin`
  * healthier and not tight on its week, so the claude-primary planner moves to
- * its codex alternate. Two requests only: deepseek is metered and never
- * fetched.
+ * its codex alternate. Three requests only: claude, codex, and the one
+ * Antigravity summary that answers for all three of its pools; deepseek is
+ * metered and never fetched.
  */
-function stubFetch(overrides: Partial<RailReadings> = {}): typeof fetch {
-  const r: RailReadings = {
-    claudeSession: 90,
-    claudeWeekly: 0,
-    codexSession: 10,
-    codexWeekly: 0,
-    ...overrides,
+const DEFAULT_READINGS: RailReadings = {
+  claudeSession: 90,
+  claudeWeekly: 0,
+  codexSession: 10,
+  codexWeekly: 0,
+  argonWeekly: 0,
+  geminiSession: 20,
+  geminiWeekly: 0,
+  threePartySession: 30,
+  threePartyWeekly: 0,
+};
+
+/**
+ * The reset instants the stub's Antigravity body reports.
+ *
+ * Fixed rather than computed from `Date.now()`, because a test asserts the pool's
+ * projected `resetsAt` exactly: an instant derived at response time can land a
+ * millisecond after the reading's own `readAt`, which would make the assertion
+ * depend on how long the fetch took rather than on the projection being right.
+ */
+const ANTIGRAVITY_WEEKLY_RESET = "2026-11-05T16:46:22Z";
+const ANTIGRAVITY_SESSION_RESET = "2026-10-29T21:46:22Z";
+
+/**
+ * One `retrieveUserQuotaSummary` body for those readings: three pools, told
+ * apart by bucket id. The display names and the group order are deliberately not
+ * the partition — the parser must not depend on either.
+ */
+function antigravityBody(r: RailReadings): unknown {
+  // The vendor reports what is left of a window, so a used percentage is a fraction.
+  const remaining = (used: number) => 1 - used / 100;
+  const bucket = (bucketId: string, window: string, used: number, resetTime: string) => ({
+    bucketId,
+    window,
+    resetTime,
+    remainingFraction: remaining(used),
+  });
+  return {
+    groups: [
+      {
+        displayName: "Gemini Models",
+        buckets: [
+          bucket("gemini-weekly", "weekly", r.geminiWeekly, ANTIGRAVITY_WEEKLY_RESET),
+          bucket("gemini-5h", "5h", r.geminiSession, ANTIGRAVITY_SESSION_RESET),
+        ],
+      },
+      {
+        displayName: "Claude and GPT models",
+        buckets: [
+          bucket("3p-weekly", "weekly", r.threePartyWeekly, ANTIGRAVITY_WEEKLY_RESET),
+          bucket("3p-5h", "5h", r.threePartySession, ANTIGRAVITY_SESSION_RESET),
+        ],
+      },
+      {
+        // Last in the body: an ordering the partition must ignore.
+        displayName: "Gemini 4 Argon",
+        buckets: [bucket("gemini-argon-wtu-weekly", "weekly", r.argonWeekly, ANTIGRAVITY_WEEKLY_RESET)],
+      },
+    ],
   };
+}
+
+function stubFetch(overrides: Partial<RailReadings> = {}): typeof fetch {
+  const r: RailReadings = { ...DEFAULT_READINGS, ...overrides };
   return (async (url: string | URL) => {
     const u = String(url);
     if (u.includes("anthropic.com")) {
@@ -148,6 +216,9 @@ function stubFetch(overrides: Partial<RailReadings> = {}): typeof fetch {
           },
         }),
       };
+    }
+    if (u.includes("cloudcode-pa.googleapis.com")) {
+      return { ok: true, status: 200, json: async () => antigravityBody(r) };
     }
     throw new Error(`unexpected url ${u}`);
   }) as unknown as typeof fetch;
@@ -527,6 +598,124 @@ test("the config command prints where each value came from without reading a quo
   assert.equal(await readFile(fx.plannerFile, "utf8"), before, "the config form must not write");
 });
 
+/**
+ * A registry that carries pi's provider-token method beside the model lookup.
+ *
+ * Nothing here is called unless the dispatcher decides a refresh is due — which
+ * is what these tests assert. The method's receiver is pinned by the unit test
+ * for `providerTokenResolver` in `test/antigravity.test.ts`; the wiring proved
+ * here only needs to notice a call.
+ */
+function tokenRegistry(calls: string[]) {
+  return {
+    find: (provider: string, modelId: string) => modelOf(`${provider}/${modelId}`),
+    async getApiKeyForProvider(provider: string) {
+      calls.push(provider);
+      return JSON.stringify({ token: provider });
+    },
+  };
+}
+
+/**
+ * The Antigravity credential is pi's to refresh, so the resolver is a dependency
+ * of the dispatcher rather than something a read reaches for.
+ *
+ * Only a wired resolver produces the "not the default one" note, so that note is
+ * the evidence that boot passed it on — for the dispatcher booted at load and for
+ * the one a generation prepares. Neither boot, and neither report, may call it:
+ * this fixture's auth file is not the one pi's provider owns, so no refresh is
+ * due and a call would be a refresh this extension must never start.
+ */
+test("bootFrom wires pi's provider-token resolver into every dispatcher, and calls it for nothing", async () => {
+  const fx = await generateFixture(GENERATED_LAYER);
+  // A generated layer replaces the config file, so it has to name the fixture's
+  // Claude credential itself — otherwise the post-generation evaluation would
+  // read the developer's own `~/.claude`.
+  await writeFile(
+    fx.layerPath,
+    JSON.stringify({ ...GENERATED_LAYER, claudeCredsPath: join(dirname(fx.agentDir), "claude-credentials.json") }),
+    "utf8",
+  );
+  const calls: string[] = [];
+  const WIRED = "the pi auth file is not the default one";
+  const UNWIRED = "no provider token resolver is available";
+  const authWith = (expires: number) =>
+    writeFile(
+      join(fx.agentDir, "auth.json"),
+      JSON.stringify({
+        "openai-codex": { access: "test-token", accountId: "acct-test" },
+        antigravity: { access: "stored-access", expires, projectId: "test-project" },
+      }),
+      "utf8",
+    );
+
+  await withExtension(
+    fx,
+    async ({ run }) => {
+      const config = await run("config");
+      assert.equal(calls.length, 0, "a config form that boots must not refresh a credential");
+      assert.ok(config.includes("config: built-in < global"), config);
+
+      // A usable token: all three pools read, and nothing consults the resolver.
+      const healthy = await run("refresh");
+      assert.ok(healthy.includes("antigravity-argon: gemini-argon-wtu-weekly 0%"), healthy);
+      assert.equal(calls.length, 0, "a usable token never refreshes anything");
+
+      // Expired, so a read has something to consult a resolver about; the note it
+      // earns names the branch only a wired resolver reaches.
+      await authWith(Date.now() - 1_000);
+      // The provenance form boots and reads no quota, so an expired credential is
+      // still not a reason to touch the provider.
+      await run("config");
+      assert.equal(calls.length, 0, "a config form reads no quota, so it refreshes nothing");
+      const report = await run("refresh");
+      assert.equal(calls.length, 0, "this profile's auth file is not pi's to refresh");
+      assert.ok(report.includes(`antigravity-argon: unavailable — antigravity token expired; ${WIRED}`), report);
+      assert.ok(!report.includes(UNWIRED), `boot must have passed the resolver on: ${report}`);
+
+      // Generation is the second place a dispatcher is built: it carries the
+      // pools' last good readings, so the failed refresh above does not refuse it,
+      // and the dispatcher it prepares for the new layer must be wired as well.
+      const generated = await run("generate");
+      assert.ok(generated.startsWith("[generated]"), generated);
+      const afterGenerate = await run("refresh");
+      assert.ok(afterGenerate.includes(`antigravity-gemini: unavailable — antigravity token expired; ${WIRED}`), afterGenerate);
+      assert.ok(!afterGenerate.includes(UNWIRED), `the prepared dispatcher must be wired too: ${afterGenerate}`);
+      assert.equal(calls.length, 0, "a wired resolver is still not called when no refresh is due");
+    },
+    stubFetch,
+    { modelRegistry: tokenRegistry(calls) },
+  );
+});
+
+/**
+ * An Antigravity pool is a rail like any other, so a route may name it — and the
+ * write is the same write: the pool's model, the thinking level the route stated
+ * for it, and the agent's body left alone.
+ */
+test("an Antigravity alternate is selected and applied with its own thinking level", async () => {
+  const fx = await fixture(2_147_483_647, {
+    planner: {
+      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+      alternates: [{ model: "antigravity/gemini-3-pro", rail: "antigravity-gemini", thinking: "low" }],
+    },
+  });
+
+  await withExtension(fx, async ({ run }) => {
+    // claude's session is tight at 90% and the Gemini pool's session sits at 20%
+    // with its week at 0, so the pool is the destination the policy picks.
+    const text = await run("apply");
+    assert.ok(text.includes("planner -> antigravity/gemini-3-pro (thinking: low)"), text);
+    assert.ok(text.includes("[applied]"), text);
+    assertNoProvenance(text);
+  });
+
+  const after = await readFile(fx.plannerFile, "utf8");
+  assert.match(after, /^model: "antigravity\/gemini-3-pro"$/m);
+  assert.match(after, /^thinking: low$/m);
+  assert.match(after, /^Body\.$/m);
+});
+
 test("the apply command writes the decision, skips missing files, and reports only what it did", async () => {
   const fx = await fixture();
 
@@ -665,7 +854,12 @@ async function generateFixture(
   );
   await writeFile(
     join(agentDir, "auth.json"),
-    JSON.stringify({ "openai-codex": { access: "test-token", accountId: "acct-test" } }),
+    JSON.stringify({
+      "openai-codex": { access: "test-token", accountId: "acct-test" },
+      // Generation needs a successful reading for every quota-capped rail, and
+      // the three Antigravity pools are one credential and one request.
+      antigravity: { access: "test-token", expires: Date.now() + 3_600_000, projectId: "test-project" },
+    }),
     "utf8",
   );
 
@@ -988,7 +1182,7 @@ test("a warmed install generates an empty table without reading a quota again", 
     fx,
     async ({ run, sessionStart }) => {
       await sessionStart();
-      assert.equal(quota.count(), 2, "precondition: startup read both capped rails");
+      assert.equal(quota.count(), 3, "precondition: startup read both vendor rails and the one Antigravity group");
       // Real time past the 1 ms TTL, so the readings are expired by any clock.
       await new Promise((done) => setTimeout(done, 20));
       const text = await run("generate");
@@ -997,7 +1191,7 @@ test("a warmed install generates an empty table without reading a quota again", 
     quota.factory,
   );
 
-  assert.equal(quota.count(), 2, "a warmed install must cost no further usage request to generate an empty table");
+  assert.equal(quota.count(), 3, "a warmed install must cost no further usage request to generate an empty table");
 });
 
 /** A generator that saves what it was fed on stdin beside the layer, then prints the layer. */
@@ -1020,7 +1214,14 @@ test("a generator reading stdin receives every rail's reading in the documented 
   const input = await capturedInput(fx);
 
   assert.equal(input.version, 1);
-  assert.deepEqual(Object.keys(input.rails).sort(), ["claude", "codex", "deepseek"]);
+  assert.deepEqual(Object.keys(input.rails).sort(), [
+    "antigravity-3p",
+    "antigravity-argon",
+    "antigravity-gemini",
+    "claude",
+    "codex",
+    "deepseek",
+  ]);
   assert.deepEqual(input.rails.deepseek, { metered: true, windows: [], raw: null });
 
   // The stub's numbers: claude session 90 with no reset reported, so the window
@@ -1048,6 +1249,42 @@ test("a generator reading stdin receives every rail's reading in the documented 
   assert.equal(Date.parse(codex.windows[1].resetsAt) - readAt, 400_000_000);
   assert.equal(codex.raw.rate_limit.primary_window.used_percent, 10);
   assert.ok(!("latestFailure" in codex));
+
+  // The three pools are one response partitioned by bucket id, so they share
+  // `readAt` and `raw` and differ only in the windows each owns. Argon carries
+  // a week and no session: the document must not invent a window for a cap that
+  // pool does not have.
+  const argon = input.rails["antigravity-argon"];
+  const gemini = input.rails["antigravity-gemini"];
+  const threeParty = input.rails["antigravity-3p"];
+  assert.equal(argon.ok, true);
+  assert.equal(gemini.ok, true);
+  assert.equal(threeParty.ok, true);
+  assert.deepEqual(argon.windows.map((w: any) => [w.label, w.used, w.budget]), [
+    ["gemini-argon-wtu-weekly", 0, "weekly"],
+  ]);
+  assert.deepEqual(gemini.windows.map((w: any) => [w.label, w.used, w.budget]), [
+    ["gemini-weekly", 0, "weekly"],
+    ["gemini-5h", 20, "session"],
+  ]);
+  assert.deepEqual(threeParty.windows.map((w: any) => [w.label, w.used, w.budget]), [
+    ["3p-weekly", 0, "weekly"],
+    ["3p-5h", 30, "session"],
+  ]);
+  const poolReadAt = Date.parse(argon.readAt);
+  const poolAfter = Date.now();
+  assert.ok(before <= poolReadAt && poolReadAt <= poolAfter, `pool readAt ${argon.readAt} is not this run's`);
+  // One vendor answer, one instant: three stamps would be three answers.
+  assert.equal(gemini.readAt, argon.readAt);
+  assert.equal(threeParty.readAt, argon.readAt);
+  // Each pool carries the whole document — the same account-wide body three
+  // times over — not a per-pool excerpt.
+  assert.deepEqual(gemini.raw, argon.raw);
+  assert.deepEqual(threeParty.raw, argon.raw);
+  assert.deepEqual(Object.keys(argon.raw), ["groups"]);
+  // Every window keeps the vendor's own reset instant.
+  assert.equal(argon.windows[0].resetsAt, new Date(Date.parse(ANTIGRAVITY_WEEKLY_RESET)).toISOString());
+  assert.equal(gemini.windows[1].resetsAt, new Date(Date.parse(ANTIGRAVITY_SESSION_RESET)).toISOString());
 });
 
 test("a never-read install reads each capped rail once to generate, and no more", async () => {
@@ -1061,9 +1298,10 @@ test("a never-read install reads each capped rail once to generate, and no more"
     },
     quota.factory,
   );
-  // One per capped rail for the input; the empty generated table's own
-  // evaluation asks nothing.
-  assert.equal(quota.count(), 2);
+  // One per capped rail for the input — and the Antigravity pools are one
+  // request between them — while the empty generated table's own evaluation
+  // asks nothing.
+  assert.equal(quota.count(), 3);
 });
 
 test("a rail whose newest read failed is fed as its last good reading, marked", async () => {
@@ -1413,6 +1651,11 @@ test("refresh forces a re-fetch while the plain form reuses the cache", async ()
         }),
       };
     }
+    // The three pools are one request, so a complete read is three requests and
+    // a refresh is three more.
+    if (u.includes("cloudcode-pa.googleapis.com")) {
+      return { ok: true, status: 200, json: async () => antigravityBody(DEFAULT_READINGS) };
+    }
     throw new Error(`unexpected url ${u}`);
   }) as unknown as typeof fetch;
 
@@ -1420,7 +1663,7 @@ test("refresh forces a re-fetch while the plain form reuses the cache", async ()
     fx,
     async ({ run }) => {
       const first = await run("");
-      assert.equal(fetches, 2, "a cold plain report fetches both live rails");
+      assert.equal(fetches, 3, "a cold plain report fetches both live rails and the Antigravity group once");
       assert.ok(first.includes("claude: 5h 90%"), first);
 
       // Change what the endpoint would report. Within `ttlMs` the plain form
@@ -1428,12 +1671,12 @@ test("refresh forces a re-fetch while the plain form reuses the cache", async ()
       claudeSession = 40;
       codexSession = 5;
       const second = await run("");
-      assert.equal(fetches, 2, "the plain form reuses the cached reading within ttlMs");
+      assert.equal(fetches, 3, "the plain form reuses the cached reading within ttlMs");
       assert.ok(second.includes("claude: 5h 90%"), second);
       assert.ok(!second.includes("claude: 5h 40%"), second);
 
       const refreshed = await run("refresh");
-      assert.equal(fetches, 4, "refresh forces a re-fetch of both live rails");
+      assert.equal(fetches, 6, "refresh forces a re-fetch of both live rails and the Antigravity group");
       assert.ok(refreshed.includes("claude: 5h 40%"), refreshed);
     },
     () => countingFetch,

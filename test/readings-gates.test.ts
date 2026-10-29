@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
-import { createSharedReadings, type StickyHalt } from "../src/readings-file.ts";
+import { READINGS_FILE_VERSION, createSharedReadings, type StickyHalt } from "../src/readings-file.ts";
 import { lockPathFor, withLockPath } from "../src/agent-file.ts";
 
 const NOW = 1_730_123_456_789;
@@ -112,7 +112,7 @@ for (const [name, broken] of [
     const repaired = fx.make();
     assert.deepEqual(await repaired.gates(fx.credential), { cooldown });
     assert.deepEqual(repaired.warnings(), []);
-    assert.equal(JSON.parse(await readFile(fx.path, "utf8")).version, 2);
+    assert.equal(JSON.parse(await readFile(fx.path, "utf8")).version, READINGS_FILE_VERSION);
   });
 }
 

@@ -2,12 +2,14 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createSharedReadings, type SharedReadingsPacing } from "../../src/index.ts";
+import { createSharedReadings, isAntigravityRail, type Rail, type SharedReadingsPacing } from "../../src/index.ts";
 import { waitUntil, type ChildResult } from "./agent-write-child.ts";
 
 interface Job {
   readingsPath: string;
   credential: string;
+  /** Which rail to ask for; `antigravity-*` asks through the grouped method. */
+  rail?: Rail;
   kind?: "read" | "hold-then-die";
   marker?: string;
   release?: string;
@@ -43,14 +45,39 @@ async function run(job: Job) {
     },
     pacing: { fetchWaitMs: 5_000, writeWaitMs: 1_000, pollMs: 2, staleMs: 10_000, ...job.pacing },
   });
-  const result = await store.read("claude", job.credential, { ttlMs: 60_000, fetch: async () => {
+
+  /** Everything a fetch does before answering: the cues a test orders itself by. */
+  const begin = async () => {
     fetched = true;
     if (job.marker) await writeFile(job.marker, "fetching");
     if (job.kind === "hold-then-die") process.kill(process.pid, "SIGKILL");
     if (job.release) await waitUntil("release cue", () => existsSync(job.release!));
     if (job.delayMs) await new Promise((resolve) => setTimeout(resolve, job.delayMs));
-    return { rail: "claude", ok: true, windows: [{ label: "5h", used: 17, budget: "session" }], readAt: Date.now(), raw: { child: true } };
-  } });
+  };
+
+  const rail = job.rail ?? "claude";
+  // The three pools are one request in production, so the fixture answers all
+  // three at once — that is the shape `readAntigravity` is given.
+  const result = isAntigravityRail(rail)
+    ? await store.readAntigravity(rail, job.credential, {
+        ttlMs: 60_000,
+        fetch: async () => {
+          await begin();
+          const readAt = Date.now();
+          return {
+            "antigravity-argon": { rail: "antigravity-argon", ok: true, windows: [{ label: "gemini-argon-wtu-weekly", used: 5, budget: "weekly" }], readAt, raw: { child: "argon" } },
+            "antigravity-gemini": { rail: "antigravity-gemini", ok: true, windows: [{ label: "gemini-5h", used: 17, budget: "session" }], readAt, raw: { child: "gemini" } },
+            "antigravity-3p": { rail: "antigravity-3p", ok: true, windows: [{ label: "3p-weekly", used: 2, budget: "weekly" }], readAt, raw: { child: "3p" } },
+          };
+        },
+      })
+    : await store.read("claude", job.credential, {
+        ttlMs: 60_000,
+        fetch: async () => {
+          await begin();
+          return { rail: "claude", ok: true, windows: [{ label: "5h", used: 17, budget: "session" }], readAt: Date.now(), raw: { child: true } };
+        },
+      });
   process.stdout.write(`${JSON.stringify({ fetched, result })}\n`);
 }
 

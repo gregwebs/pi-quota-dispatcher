@@ -81,15 +81,19 @@ an empty list means the agent is pinned to its primary.
 _Avoid_: fallback, secondary, backup
 
 **Rail**:
-One account whose quota is consumed by model calls. A rail is per-account, not
-per-provider: several model prefixes can draw on the same rail.
+One independently capped quota pool that model calls draw on; an account may own
+several. A rail is per-pool, not per-provider or per-account: several model
+prefixes can draw on the same rail, and one account can back more than one rail.
 _Avoid_: provider, plan, account, budget
 
 **Rail reading**:
 What one quota read reports for one rail: each window the vendor reported, how
 much of it is used, which budget it counts toward and when it resets — or why
-the read failed. A reading states facts only; whether a budget is **tight** is a
-judgment the policy makes about it, not part of it.
+the read failed. A rail does not have to carry both budgets: one whose pool has
+no **session budget** or no **weekly budget** simply reports no window for it,
+and only a budget the rail carries can be missing. A reading states facts only;
+whether a budget is **tight** is a judgment the policy makes about it, not part
+of it.
 _Avoid_: usage data, quota data, rail state, usage snapshot
 
 **Last good reading**:

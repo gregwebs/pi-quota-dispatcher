@@ -47,7 +47,13 @@ import { createHash } from "node:crypto";
 import { open, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { errnoIs, lockPathFor, withLockPath, type FileWritePacing, type LockAttempt } from "./agent-file.ts";
-import { READINGS_FILE_NAME } from "./config.ts";
+import {
+  ANTIGRAVITY_RAILS,
+  READINGS_FILE_NAME,
+  isAntigravityRail,
+  isRail,
+  type AntigravityRail,
+} from "./config.ts";
 import type {
   FailedReading,
   GoodReading,
@@ -57,14 +63,39 @@ import type {
 } from "./index.ts";
 
 /**
- * The version this module writes and the only one it reads.
+ * The version this module writes.
  *
- * 2 added the refresh gates and the sticky halt beside the entries. A 1 document
- * is an unknown version and faults the whole file, which is what the field is
- * for: a version this writer does not know is a shape it cannot promise to
- * preserve, and the entries are a cache that the next write repairs anyway.
+ * 2 added the refresh gates and the sticky halt beside the entries. 3 widened
+ * the accepted rail vocabulary to the three Antigravity pools, which is a change
+ * to what an entry's `rail` may be — the one field whose acceptance the version
+ * answers for.
+ *
+ * A version-2 document is still *read*, and that is deliberate: it can only hold
+ * Claude and Codex entries, whose shape did not change, so accepting it costs
+ * nothing and keeping its readings — and, far more importantly, its refresh
+ * gates and sticky halt — through the upgrade is what stops an upgrade from
+ * forgetting that a ping already spent money. Writes are always version 3. Any
+ * other version is an unknown shape this writer cannot promise to preserve, so
+ * it faults the whole file and the next write repairs it.
  */
-export const READINGS_FILE_VERSION = 2;
+export const READINGS_FILE_VERSION = 3;
+
+/**
+ * The versions this reader accepts.
+ *
+ * Version 2 rather than "every version at or below 3" on purpose: the list is of
+ * shapes that were checked, not of numbers that happen to be smaller. It is also
+ * what `ReadableVersion` is derived from, so a version this reader does not
+ * accept cannot be written into the code that reads one.
+ */
+const READABLE_VERSIONS = [2, 3] as const;
+
+type ReadableVersion = (typeof READABLE_VERSIONS)[number];
+
+/** Whether a decoded document's `version` is one whose shape this reader checked. */
+function isReadableVersion(value: number): value is ReadableVersion {
+  return READABLE_VERSIONS.some((version) => version === value);
+}
 
 /**
  * Pacing for the two locks a shared reading takes, all of it in milliseconds.
@@ -103,6 +134,19 @@ export const DEFAULT_SHARED_READINGS: Omit<SharedReadingsPacing, "fetchWaitMs"> 
 
 /** A reading that came from asking: every rail but the metered one, and the only kind the file holds. */
 export type VendorReading = GoodReading | FailedReading;
+
+/**
+ * What one Antigravity fetch answers: all three pool rails, each correlated with
+ * its own rail.
+ *
+ * One type for three results because one vendor request produces them — the
+ * buckets of a single `retrieveUserQuotaSummary` body are partitioned across the
+ * pools. It is the *fetch*'s answer, not history: which of a pool's earlier
+ * readings survives is the store's business.
+ */
+export type AntigravityReadings = {
+  readonly [R in AntigravityRail]: VendorReading & { readonly rail: R };
+};
 
 /**
  * One cached rail: the reading that was stored, and when storing it made it the
@@ -165,20 +209,44 @@ export interface GatePatch {
 }
 
 /**
- * What a shared store answers, in the three forms the dispatcher needs.
+ * A rail whose readings come from a request of its own.
+ *
+ * The Antigravity pools are deliberately not in this set: one
+ * `retrieveUserQuotaSummary` answers for all three, so a per-pool fetch can be
+ * neither locked nor published on its own — see `readAntigravity`.
+ */
+export type SingleFetchRail = Exclude<VendorRail, AntigravityRail>;
+
+/**
+ * What a shared store answers, in the forms the dispatcher needs.
  *
  * `read` is the policy's path — a reading fresh within its TTL, a fetch when it
  * has lapsed — and `known` is the generator path, which is deliberately
- * age-blind (see ADR 0015). `warnings` is a rendering, not state: the report is
- * where a corrupt file becomes visible, and nowhere else is allowed to refuse
- * work over one.
+ * age-blind (see ADR 0015). `readAntigravity` is `read` for the three pools one
+ * vendor call answers, so the group is fetched, locked and published once.
+ * `warnings` is a rendering, not state: the report is where a corrupt file
+ * becomes visible, and nowhere else is allowed to refuse work over one.
  */
 export interface SharedReadings {
   /** Fresh-within-ttl entry, else lock/recheck/fetch/write. Never routes on lastGood. */
   read(
-    rail: VendorRail,
+    rail: SingleFetchRail,
     credential: string,
     opts: { ttlMs: number; force?: boolean; fetch: () => Promise<VendorReading> },
+  ): Promise<VendorRailReadings>;
+  /**
+   * One Antigravity pool's readings, from a fetch that answers for all three.
+   *
+   * The selected rail is what the caller asked about; the store fetches, locks
+   * and publishes the whole group, and every other caller wanting a pool of the
+   * same credential joins that same work. A group whose earlier three entries are
+   * all present and fresh is a cache hit for all three, so a caller wanting a
+   * pool the group already holds costs no request at all.
+   */
+  readAntigravity(
+    rail: AntigravityRail,
+    credential: string,
+    opts: { ttlMs: number; force?: boolean; fetch: () => Promise<AntigravityReadings> },
   ): Promise<VendorRailReadings>;
   /** Whatever entry the file/process already holds, at any age; no fetch. */
   known(rail: VendorRail, credential: string): Promise<VendorRailReadings | undefined>;
@@ -206,17 +274,52 @@ export interface SharedReadingsDeps {
 }
 
 /**
+ * One fetch's answer for every pool it reports on, correlated with the rail each
+ * reading is filed under.
+ *
+ * The single-rail source has one member; Antigravity has three. Every member is
+ * present or the source failed as a whole — a fetch that answered for only some
+ * of the pools it was asked for is not a source, and no member is ever
+ * fabricated from a neighbour's numbers.
+ */
+type SourceReadings =
+  | { readonly kind: "single"; readonly rail: SingleFetchRail; readonly entry: CachedReadings }
+  | { readonly kind: "antigravity"; readonly entries: AntigravityCachedReadings };
+
+/**
+ * One Antigravity pool's cached entry, correlated with the rail it is filed
+ * under.
+ *
+ * The correlation is what keeps a group's three results from being handed out
+ * as one indistinguishable bag: a caller asking about `antigravity-gemini` gets
+ * a reading the store knows is Gemini's.
+ */
+type AntigravityCachedReadings = {
+  readonly [R in AntigravityRail]: CachedReadings & {
+    readonly latest: VendorReading & { readonly rail: R };
+  };
+};
+
+/** What one operation asks the vendor: one reading, or all three pools at once. */
+type ReadSource =
+  | { readonly kind: "single"; readonly rail: SingleFetchRail; readonly fetch: () => Promise<VendorReading> }
+  | { readonly kind: "antigravity"; readonly fetch: () => Promise<AntigravityReadings> };
+
+/**
  * One operation this process has in flight, and whether it counts as a fetch.
  *
- * `fetched` is mutable because only `perform` knows when the question is
+ * `fetched` is mutable because only `performSource` knows when the question is
  * settled: a read registered before its first `await` cannot say yet whether it
  * will answer from the local cache, ask the vendor, or return a vendor answer a
  * peer published while it waited. Those last two are what a forced read may
  * join, so they set the flag; a forced read that joined a record whose flag
  * stayed false knows the result is a cache hit and runs a fetch of its own.
+ *
+ * The promise carries *every* member's result, not the rail the first caller
+ * happened to ask for: a caller joins the work and then projects its own rail.
  */
 interface InFlight {
-  promise: Promise<VendorRailReadings>;
+  promise: Promise<SourceReadings>;
   fetched: boolean;
 }
 
@@ -346,12 +449,29 @@ function entryFault(rail: unknown, index: number): string {
     : `entry ${index + 1} is invalid`;
 }
 
+/**
+ * The rails one version of the document may hold an entry for.
+ *
+ * A version-2 document was written before Antigravity existed, so a Claude or
+ * Codex entry is all it can legitimately carry and anything else in it is a
+ * hand edit rather than an older writer's work. Version 3 added the pools, and
+ * still refuses the metered rail: it is never read and so has nothing to cache.
+ */
+function readableRail(rail: unknown, version: ReadableVersion): rail is VendorRail {
+  if (!isRail(rail) || rail === "deepseek") return false;
+  return version === 3 || !isAntigravityRail(rail);
+}
+
 /** One entry of the document, validated, or the fault that makes the whole file unusable. */
-function fileEntry(value: unknown, index: number): { entry: FileEntry } | { fault: string } {
+function fileEntry(
+  value: unknown,
+  index: number,
+  version: ReadableVersion,
+): { entry: FileEntry } | { fault: string } {
   if (value === null || typeof value !== "object") return { fault: entryFault(undefined, index) };
   const e = value as Record<string, unknown>;
   const rail = e.rail;
-  if (rail !== "claude" && rail !== "codex") return { fault: entryFault(rail, index) };
+  if (!readableRail(rail, version)) return { fault: entryFault(rail, index) };
   if (typeof e.credential !== "string" || e.credential === "") return { fault: entryFault(rail, index) };
   if (typeof e.at !== "number" || !Number.isFinite(e.at)) return { fault: entryFault(rail, index) };
   const latest = goodReading(e.latest, rail) ?? failedReading(e.latest, rail);
@@ -514,13 +634,14 @@ function decode(text: string): Decoded {
     return { fault: "it is not a readings document" };
   }
   const doc = parsed as Record<string, unknown>;
-  if (doc.version !== READINGS_FILE_VERSION) {
-    return { fault: `unknown version ${String(doc.version)}` };
+  const version = doc.version;
+  if (typeof version !== "number" || !isReadableVersion(version)) {
+    return { fault: `unknown version ${String(version)}` };
   }
   if (!Array.isArray(doc.entries)) return { fault: "its entries are not a list" };
   const entries: FileEntry[] = [];
   for (const [index, raw] of doc.entries.entries()) {
-    const result = fileEntry(raw, index);
+    const result = fileEntry(raw, index, version);
     if ("fault" in result) return result;
     entries.push(result.entry);
   }
@@ -542,12 +663,13 @@ function decode(text: string): Decoded {
 }
 
 /**
- * The document text one document is published as.
+ * The document text one document is published as. Always the current version,
+ * whatever version it was read as.
  *
- * `gates` and `stickyHalt` are omitted rather than written empty or null: a
- * file holding nothing but readings is the shape every version-2 writer can
- * read, and a key that is absent cannot be mistaken for a value a later version
- * gave a meaning to.
+ * `gates` and `stickyHalt` are omitted rather than written empty or null: a key
+ * that is absent cannot be mistaken for a value a later version gave a meaning
+ * to, and a file holding nothing but readings is the smallest shape a reader has
+ * to understand.
  */
 function encode(document: FileDocument): string {
   const { entries, gates, stickyHalt } = document;
@@ -683,6 +805,118 @@ function sameEntry(a: CachedReadings | undefined, b: CachedReadings | undefined)
 }
 
 /**
+ * The key one fetch is locked and joined under.
+ *
+ * A single-rail read keeps its per-rail key. Antigravity's three pools share one
+ * key, which is what makes two processes — and two rails of one process — agree
+ * to make one request. The group key lives in its own domain rather than reusing
+ * any member's: `antigravity` is not a rail name, so no `storeKey` can collide
+ * with it, and Codex — which is configured from the same `auth.json` — is not
+ * swept into the group merely by sharing a credential path.
+ */
+function sourceKey(source: ReadSource, credential: string): string {
+  return source.kind === "single" ? storeKey(source.rail, credential) : `antigravity\u0000${credential}`;
+}
+
+/** One thing a source files its readings under: a rail and that rail's entry key. */
+interface SourceMember {
+  readonly rail: VendorRail;
+  readonly key: string;
+}
+
+/** The rails one source answers for, in the order the store keeps them. */
+function sourceMembers(source: ReadSource, credential: string): readonly SourceMember[] {
+  const members = source.kind === "single" ? [source.rail] : ANTIGRAVITY_RAILS;
+  return members.map((rail) => ({ rail, key: storeKey(rail, credential) }));
+}
+
+/**
+ * `entry` filed under `rail`, with the correlation the type states.
+ *
+ * The cast is the one place this module asserts it, and it is guarded rather
+ * than trusted: `newestFor`/`mergeEntry` speak in the rail-agnostic
+ * `CachedReadings`, so the correlation cannot survive them in the type, while the
+ * *decoder* already refused any entry whose `rail` field is not the rail it was
+ * validated as. A mismatch that reached here is an invariant failure — a bug in
+ * this module — and throwing it is the honest report, not delivering another
+ * pool's numbers as this one's.
+ */
+function correlated<R extends AntigravityRail>(
+  rail: R,
+  entry: CachedReadings,
+): CachedReadings & { readonly latest: VendorReading & { readonly rail: R } } {
+  if (entry.latest.rail !== rail) {
+    throw new Error(`readings entry filed under ${rail} carries ${entry.latest.rail}`);
+  }
+  return entry as CachedReadings & { readonly latest: VendorReading & { readonly rail: R } };
+}
+
+/** A group of three entries, in the rails' canonical order. */
+function antigravityGroup(
+  entries: Readonly<Record<AntigravityRail, CachedReadings>>,
+): AntigravityCachedReadings {
+  return {
+    "antigravity-argon": correlated("antigravity-argon", entries["antigravity-argon"]),
+    "antigravity-gemini": correlated("antigravity-gemini", entries["antigravity-gemini"]),
+    "antigravity-3p": correlated("antigravity-3p", entries["antigravity-3p"]),
+  };
+}
+
+/**
+ * The source's answer, from the entry each of its members settled on.
+ *
+ * Every member must be present: a single fetch answers for its one rail, and an
+ * Antigravity fetch answers for all three pools whatever the vendor omitted —
+ * the omitted pool's `latest` is its failure. An absent member is therefore a bug
+ * here, never a reading this module invents.
+ */
+function sourceReadings(
+  source: ReadSource,
+  settled: readonly (CachedReadings | undefined)[],
+): SourceReadings {
+  if (source.kind === "single") {
+    const [entry] = settled;
+    if (entry === undefined) throw new Error(`no reading settled for ${source.rail}`);
+    return { kind: "single", rail: source.rail, entry };
+  }
+  const [argon, gemini, threeParty] = settled;
+  if (argon === undefined || gemini === undefined || threeParty === undefined) {
+    throw new Error("the antigravity group settled without all three pools");
+  }
+  return {
+    kind: "antigravity",
+    entries: antigravityGroup({
+      "antigravity-argon": argon,
+      "antigravity-gemini": gemini,
+      "antigravity-3p": threeParty,
+    }),
+  };
+}
+
+/** One member's entry out of a source's answer. */
+function memberEntry(readings: SourceReadings, rail: VendorRail): CachedReadings {
+  if (readings.kind === "single") {
+    if (readings.rail !== rail) throw new Error(`this read settled ${readings.rail}, not ${rail}`);
+    return readings.entry;
+  }
+  if (!isAntigravityRail(rail)) throw new Error(`${rail} is not an antigravity pool`);
+  return readings.entries[rail];
+}
+
+/**
+ * Whether two looks at a source name the same vendor answer, member by member.
+ *
+ * The group version of `sameEntry`: a forced read compares the vector it saw
+ * before taking the lock with the vector under it, and only a group in which
+ * every member is unchanged republished nothing. An incomplete vector never
+ * equals a complete one, because an absent member is not the reading a peer
+ * published.
+ */
+function sameSourceReadings(a: readonly (CachedReadings | undefined)[], b: readonly (CachedReadings | undefined)[]): boolean {
+  return a.length === b.length && a.every((entry, index) => sameEntry(entry, b[index]));
+}
+
+/**
  * Write `text` to `path` as an atomic `0600` replace.
  *
  * Atomic in the same sense `replaceFileAtomically` is: a unique temp file, then
@@ -815,77 +1049,113 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
   }
 
   /**
-   * Ask, remember, and publish the answer.
+   * Ask, remember, and publish the answer for one source — one rail, or the
+   * whole Antigravity group.
    *
-   * `prior` is what this process knew before asking — the entry a failure must
-   * carry forward as its `lastGood`. It is passed in rather than read here
+   * `prior` is what this process knew before asking — the entries a failure must
+   * carry forward as their `lastGood`. It is passed in rather than read here
    * because it must be the value from *before* the fetch, not the overlay after
    * a concurrent read has moved it.
+   *
+   * One `at` stamps the whole answer, because it is one vendor answer: the TTL
+   * counts from when the group was stored, and a group whose members carried
+   * three different stamps would be three half-groups pretending to be one read.
+   * Each member's `lastGood` is still its own, computed from that member's own
+   * prior entry — never a neighbour's.
    */
   async function fetchAndStore(
-    rail: VendorRail,
+    source: ReadSource,
     credential: string,
-    prior: CachedReadings | undefined,
-    fetch: () => Promise<VendorReading>,
-  ): Promise<VendorRailReadings> {
-    const latest = await fetch();
-    const lastGood = latest.ok ? latest : prior?.lastGood ?? (prior?.latest.ok ? prior.latest : undefined);
-    const entry: CachedReadings = { at: now(), latest, ...(lastGood === undefined ? {} : { lastGood }) };
-    // The merged entry, not the one fetched: the file can hold a newer answer
+    prior: readonly (CachedReadings | undefined)[],
+    members: readonly SourceMember[],
+  ): Promise<SourceReadings> {
+    const asked = await ask(source);
+    const at = now();
+    const incoming = members.map((member, index) => {
+      const latest = asked[index];
+      const before = prior[index];
+      const lastGood = latest.ok ? latest : before?.lastGood ?? (before?.latest.ok ? before.latest : undefined);
+      const entry: CachedReadings = { at, latest, ...(lastGood === undefined ? {} : { lastGood }) };
+      return { member, entry };
+    });
+    // The merged entries, not the ones fetched: the file can hold a newer answer
     // from a process that self-fetched past our fetch lock, and the overlay is
     // the copy this process answers from, so it must agree with the file.
-    const merged = await writeEntry(rail, credential, entry);
-    overlay.set(storeKey(rail, credential), merged);
-    return asReadings(merged);
+    const merged = await writeEntries(credential, incoming);
+    for (const { member, entry } of merged) overlay.set(member.key, entry);
+    return sourceReadings(source, merged.map(({ entry }) => entry));
+  }
+
+  /** What one source's request answered, in its members' order. */
+  async function ask(source: ReadSource): Promise<readonly VendorReading[]> {
+    if (source.kind === "single") {
+      const latest = await source.fetch();
+      if (latest.rail !== source.rail) {
+        throw new Error(`the ${source.rail} read answered for ${latest.rail}`);
+      }
+      return [latest];
+    }
+    const answered = await source.fetch();
+    // The group's own type is what makes every pool reachable here: a fetch that
+    // omitted one would not be an `AntigravityReadings` at all.
+    return ANTIGRAVITY_RAILS.map((rail) => answered[rail]);
   }
 
   /**
-   * Replace one key's entry in the file, under the file's write lock, and return
-   * the entry the file holds for that key afterwards.
+   * Replace one source's entries in the file, under the file's one write lock,
+   * and return the entries the file holds afterwards.
    *
    * The whole read-modify-write is inside the lock because two processes adding
    * *different* keys must both survive: a plain whole-file write would let the
    * second publish a document without the first's entry. The lock is also what
    * lets this write merge rather than clobber: a process that self-fetched past
    * `fetchWaitMs` finishes holding an answer older than the one the lock holder
-   * it could not wait for already stored, so the stored entry is compared by
-   * `at` and the newer one wins (see `mergeEntry`). Returning the merge is what
-   * lets `fetchAndStore` publish the same reading in its overlay.
+   * it could not wait for already stored, so each entry is compared by `at` and
+   * the newer one wins (see `mergeEntry`). Returning the merges is what lets
+   * `fetchAndStore` publish the same readings in its overlay.
+   *
+   * A group is written in **one** replace, so a reader — or a crash — never sees
+   * two of three pools published. Everything unrelated in the document, the
+   * gates and the sticky halt included, is carried forward untouched.
    *
    * A lock that cannot be taken in time skips the write and nothing else — the
-   * reading is already in the overlay, which is the copy this process answers
+   * readings are already in the overlay, which is the copy this process answers
    * from — and every error is swallowed for the same reason: a cache that could
    * not be written must not fail the evaluation that read it. Those cases return
-   * the incoming entry, since without the lock there is no stored entry to merge
-   * against.
+   * the incoming entries, since without the lock there is no stored entry to
+   * merge against.
    */
-  async function writeEntry(
-    rail: VendorRail,
+  async function writeEntries(
     credential: string,
-    entry: CachedReadings,
-  ): Promise<CachedReadings> {
-    const key = storeKey(rail, credential);
+    incoming: readonly { readonly member: SourceMember; readonly entry: CachedReadings }[],
+  ): Promise<readonly { readonly member: SourceMember; readonly entry: CachedReadings }[]> {
     try {
       const placed = await withLockPath(fileLock, writePacing, now, sleep, async () => {
         const loaded = await loadDocument();
-        const merged = mergeEntry(newestFor(loaded.entries, key), entry);
-        const others = loaded.entries.filter((e) => entryKey(e) !== key);
-        others.push({
-          rail,
-          credential,
-          at: merged.at,
-          latest: merged.latest,
-          ...(merged.lastGood === undefined ? {} : { lastGood: merged.lastGood }),
-        });
+        const merged = new Map<string, CachedReadings>();
+        for (const { member, entry } of incoming) {
+          merged.set(member.key, mergeEntry(newestFor(loaded.entries, member.key), entry));
+        }
+        const others = loaded.entries.filter((e) => !merged.has(entryKey(e)));
+        for (const { member } of incoming) {
+          const entry = merged.get(member.key)!;
+          others.push({
+            rail: member.rail,
+            credential,
+            at: entry.at,
+            latest: entry.latest,
+            ...(entry.lastGood === undefined ? {} : { lastGood: entry.lastGood }),
+          });
+        }
         await writeAtomically(path, encode({ ...loaded, entries: others }));
-        return merged;
+        return incoming.map(({ member }) => ({ member, entry: merged.get(member.key)! }));
       });
       if (placed.ok) return placed.value;
     } catch {
-      // Deliberately silent: this is a cache write. The reading is in the
+      // Deliberately silent: this is a cache write. The readings are in the
       // overlay, so the caller already has everything it asked for.
     }
-    return entry;
+    return incoming;
   }
 
   /**
@@ -899,13 +1169,20 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
    * join, which is what makes an explicit `refresh` share a fetch this process
    * already started rather than starting a second one.
    *
+   * A source is answered as a whole. Its cache hit is every member present and
+   * fresh — one missing pool means the group this store could serve is not the
+   * group it was asked to keep, so it fetches rather than handing back two
+   * pools and a guess. A pool the vendor omitted is not a missing entry: it is a
+   * failure entry, which is a reading like any other and is honoured for the
+   * TTL.
+   *
    * Taking the fetch lock is best effort. The lock file needs a writable parent
    * directory and may be held by a process this host cannot confirm, and neither
    * is a reason to refuse a read the caller asked for: a failure to create,
    * judge, or release the lock falls through to the same self-fetch a bound that
-   * ran out takes. A body that already produced a reading keeps it —
+   * ran out takes. An answer that already produced readings keeps them —
    * `produced` — because a release that fails after a successful fetch must not
-   * cost the caller the reading it came for, and must not ask the vendor twice.
+   * cost the caller the read it came for, and must not ask the vendor twice.
    *
    * `markFetched` tells the caller's in-flight record that this operation either
    * asked the vendor or is returning a vendor answer a peer published while it
@@ -913,22 +1190,29 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
    * the local cache marks nothing, so a forced caller that joined it knows the
    * result is not the fetch it asked for and runs its own.
    */
-  async function perform(
-    key: string,
-    rail: VendorRail,
-    credential: string,
-    opts: {
-      ttlMs: number;
-      force: boolean;
-      fetch: () => Promise<VendorReading>;
-      markFetched: () => void;
-    },
-  ): Promise<VendorRailReadings> {
-    const { ttlMs, force, fetch, markFetched } = opts;
+  async function performSource(input: {
+    source: ReadSource;
+    credential: string;
+    ttlMs: number;
+    force: boolean;
+    markFetched: () => void;
+  }): Promise<SourceReadings> {
+    const { source, credential, ttlMs, force, markFetched } = input;
+    const members = sourceMembers(source, credential);
     const fresh = (entry: CachedReadings): boolean => now() - entry.at < ttlMs;
+    const complete = (
+      entries: readonly (CachedReadings | undefined)[],
+    ): entries is readonly CachedReadings[] =>
+      entries.every((entry): entry is CachedReadings => entry !== undefined);
+    /** Publish entries this process now answers from, so a sibling read is free. */
+    const install = (entries: readonly CachedReadings[]): void => {
+      members.forEach((member, index) => overlay.set(member.key, entries[index]));
+    };
 
-    const overlayEntry = overlay.get(key);
-    if (!force && overlayEntry !== undefined && fresh(overlayEntry)) return asReadings(overlayEntry);
+    // The warm-overlay fast path: every member present and fresh, so this read
+    // costs no file I/O at all — the same courtesy a single-rail read gets.
+    const warm = members.map((member) => overlay.get(member.key));
+    if (!force && complete(warm) && warm.every(fresh)) return sourceReadings(source, warm);
 
     // What the store knows before the lock is taken. For a forced read this is
     // the baseline a joining fetch is measured against: `force` means "give me a
@@ -936,39 +1220,41 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
     // is such a reading. A fetch that finished before the command does not count,
     // and neither does the same entry the file already held, however many times
     // it is re-decoded.
-    const before = newer(overlayEntry, await entryFromFile(key));
-    if (!force && before !== undefined && fresh(before)) {
-      overlay.set(key, before);
-      return asReadings(before);
+    const before = await combineMembers(members);
+    if (!force && complete(before) && before.every(fresh)) {
+      install(before);
+      return sourceReadings(source, before);
     }
 
-    // The reading the lock body produced, captured so a release failure after a
+    // The readings the lock body produced, captured so a release failure after a
     // successful body does not cost the caller the read it came for. `undefined`
     // is what says the body never produced one — it never ran because the lock
     // could not be created, which is a coordination failure the caller survives,
     // or it ran and threw, which is the body's own fault and is re-raised.
-    let produced: VendorRailReadings | undefined;
+    let produced: SourceReadings | undefined;
     let bodyStarted = false;
-    let attempt: LockAttempt<VendorRailReadings> | undefined;
+    let attempt: LockAttempt<SourceReadings> | undefined;
     try {
-      attempt = await withLockPath(fetchLockFor(key), fetchPacing, now, sleep, async () => {
+      attempt = await withLockPath(fetchLockFor(sourceKey(source, credential)), fetchPacing, now, sleep, async () => {
         bodyStarted = true;
-        const current = newer(overlay.get(key), await entryFromFile(key));
-        if (!force && current !== undefined && fresh(current)) {
+        const current = await combineMembers(members);
+        if (!force && complete(current) && current.every(fresh)) {
           // Fresh here where `before` was stale or absent means a peer's fetch
           // was published while we waited; it is exactly what our caller would
           // join, so this operation counts as having fetched.
           markFetched();
-          produced = asReadings(current);
+          install(current);
+          produced = sourceReadings(source, current);
           return produced;
         }
-        if (force && current !== undefined && !sameEntry(current, before)) {
+        if (force && complete(current) && !sameSourceReadings(current, before)) {
           markFetched();
-          produced = asReadings(current);
+          install(current);
+          produced = sourceReadings(source, current);
           return produced;
         }
         markFetched();
-        produced = await fetchAndStore(rail, credential, current ?? before, fetch);
+        produced = await fetchAndStore(source, credential, priorOf(members, current, before), members);
         return produced;
       });
     } catch (err) {
@@ -986,15 +1272,55 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
     // here rather than waiting longer is the promise that a stuck process, a
     // missing directory, or a read-only one cannot stall an evaluation.
     markFetched();
-    return fetchAndStore(rail, credential, newer(overlay.get(key), before), fetch);
+    return fetchAndStore(source, credential, priorOf(members, [], before), members);
   }
 
-  async function read(
-    rail: VendorRail,
+  /**
+   * Every member's entry as this process should see it: the overlay and the file
+   * combined, from **one** read of the document so the members are one picture.
+   */
+  async function combineMembers(
+    members: readonly SourceMember[],
+  ): Promise<readonly (CachedReadings | undefined)[]> {
+    const loaded = await loadDocument();
+    return members.map((member) => newer(overlay.get(member.key), newestFor(loaded.entries, member.key)));
+  }
+
+  /**
+   * The entries a fetch's failures must carry forward as `lastGood`.
+   *
+   * The under-lock view wins, and the pre-lock view stands in where the current
+   * one has nothing to say — the same relationship `newer` has, so a bounded
+   * waiter's history is not lost to a slower holder's failure. The overlay is
+   * re-combined in so a reading this process published after `before` was taken
+   * is not discarded.
+   */
+  function priorOf(
+    members: readonly SourceMember[],
+    current: readonly (CachedReadings | undefined)[],
+    before: readonly (CachedReadings | undefined)[],
+  ): readonly (CachedReadings | undefined)[] {
+    return members.map((member, index) =>
+      newer(overlay.get(member.key), newer(current[index], before[index])),
+    );
+  }
+
+  /**
+   * One source's readings, from the process-local record it joins or the one it
+   * registers.
+   *
+   * The record is keyed by the *source*, not by the rail that asked: every caller
+   * wanting any pool of one Antigravity credential joins one operation, and each
+   * projects its own rail out of the answer afterwards. That is what makes three
+   * concurrent pool reads one request, both within this process and — through the
+   * fetch lock the operation itself takes — across processes.
+   */
+  async function sourceReadingsFor(
+    source: ReadSource,
     credential: string,
-    opts: { ttlMs: number; force?: boolean; fetch: () => Promise<VendorReading> },
-  ): Promise<VendorRailReadings> {
-    const key = storeKey(rail, credential);
+    opts: { ttlMs: number; force?: boolean },
+  ): Promise<SourceReadings> {
+    const key = sourceKey(source, credential);
     const force = opts.force === true;
     for (;;) {
       const joined = inFlight.get(key);
@@ -1010,18 +1336,18 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
       // fetch: that caller's record is now in the map, and joining it makes the
       // two share one request instead of racing two.
     }
-    // No fetch is in flight. Registered before the first `await`: two reads of
-    // one rail that arrive in the same tick must share one promise, and there
-    // is no `await` between this check and the `inFlight.set` below, so two
-    // callers cannot both install. The record is handed its flag by
-    // `markFetched`, which runs only after `perform` has awaited a vendor answer
-    // — by then this initializer has finished, so the self-reference is safe.
+    // No fetch is in flight. The record is registered before the first `await`,
+    // so two reads of one source arriving in the same tick share one promise
+    // rather than installing two. `fetched` is set by `markFetched`, which runs
+    // only after `performSource` has awaited a vendor answer — by then this
+    // initializer has finished, so the self-reference is safe.
     const record: InFlight = {
       fetched: false,
-      promise: perform(key, rail, credential, {
+      promise: performSource({
+        source,
+        credential,
         ttlMs: opts.ttlMs,
         force,
-        fetch: opts.fetch,
         markFetched: () => {
           record.fetched = true;
         },
@@ -1031,6 +1357,24 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
     };
     inFlight.set(key, record);
     return record.promise;
+  }
+
+  async function read(
+    rail: SingleFetchRail,
+    credential: string,
+    opts: { ttlMs: number; force?: boolean; fetch: () => Promise<VendorReading> },
+  ): Promise<VendorRailReadings> {
+    const settled = await sourceReadingsFor({ kind: "single", rail, fetch: opts.fetch }, credential, opts);
+    return asReadings(memberEntry(settled, rail));
+  }
+
+  async function readAntigravity(
+    rail: AntigravityRail,
+    credential: string,
+    opts: { ttlMs: number; force?: boolean; fetch: () => Promise<AntigravityReadings> },
+  ): Promise<VendorRailReadings> {
+    const settled = await sourceReadingsFor({ kind: "antigravity", fetch: opts.fetch }, credential, opts);
+    return asReadings(memberEntry(settled, rail));
   }
 
   /**
@@ -1208,5 +1552,5 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
     }
   }
 
-  return { read, known, gates, setGates, setStickyHalt, warnings: () => warningLines };
+  return { read, readAntigravity, known, gates, setGates, setStickyHalt, warnings: () => warningLines };
 }

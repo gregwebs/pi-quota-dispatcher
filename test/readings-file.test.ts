@@ -4,7 +4,13 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
-import { createSharedReadings, READINGS_FILE_VERSION, type VendorReading, type SharedReadingsPacing } from "../src/index.ts";
+import {
+  READINGS_FILE_VERSION,
+  createSharedReadings,
+  type AntigravityReadings,
+  type SharedReadingsPacing,
+  type VendorReading,
+} from "../src/index.ts";
 import { lockPathFor, withLockPath } from "../src/agent-file.ts";
 import { assertCleanExit, startHolder, waitUntil } from "./fixtures/agent-write-child.ts";
 import { spawnReadingsChild } from "./fixtures/readings-child.ts";
@@ -442,5 +448,298 @@ for (const fetchWaitMs of [Number.NaN, undefined as unknown as number]) {
     assert.equal(calls, 1, "the wait must end and the read fetch for itself");
     finish.release();
     await held;
+  });
+}
+
+// ---------------------------------------------------------------- Antigravity pools
+
+// Three independently capped pools answered by one vendor request. The store's
+// job is to make that one request *one* request — within a process, between two
+// rails of one process, and across processes — while still keeping three
+// separate readings that never borrow each other's numbers.
+const POOLS = ["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const;
+
+function argon(readAt: number, tag = "group"): AntigravityReadings["antigravity-argon"] {
+  return { rail: "antigravity-argon", ok: true, windows: [{ label: "gemini-argon-wtu-weekly", used: 5, budget: "weekly" }], readAt, raw: { tag, pool: "argon" } };
+}
+function gemini(readAt: number, tag = "group"): AntigravityReadings["antigravity-gemini"] {
+  return { rail: "antigravity-gemini", ok: true, windows: [{ label: "gemini-5h", used: 17, budget: "session" }], readAt, raw: { tag, pool: "gemini" } };
+}
+function threeParty(readAt: number, tag = "group"): AntigravityReadings["antigravity-3p"] {
+  return { rail: "antigravity-3p", ok: true, windows: [{ label: "3p-weekly", used: 2, budget: "weekly" }], readAt, raw: { tag, pool: "3p" } };
+}
+function group(readAt: number, tag = "group"): AntigravityReadings {
+  return { "antigravity-argon": argon(readAt, tag), "antigravity-gemini": gemini(readAt, tag), "antigravity-3p": threeParty(readAt, tag) };
+}
+
+test("concurrent pool reads in one store make one Antigravity request", async (t) => {
+  const fx = await fixture(t);
+  const store = fx.store();
+  let calls = 0;
+  const fetch = async () => { calls++; return group(fx.now()); };
+  const results = await Promise.all(POOLS.map((rail) => store.readAntigravity(rail, fx.credential, { ttlMs: TTL, fetch })));
+  assert.equal(calls, 1, "the three pools are one vendor answer, so one request");
+  assert.deepEqual(results.map((r) => r.latest.rail), POOLS, "each caller gets the pool it asked for");
+  assert.deepEqual(results.map((r) => r.latest.ok), [true, true, true]);
+});
+
+test("two stores reading different pools make one Antigravity request between them", async (t) => {
+  const fx = await fixture(t);
+  const started = gate(); const finish = gate();
+  let calls = 0;
+  const fetch = async () => { calls++; started.release(); await finish.promise; return group(fx.now()); };
+  const first = fx.store().readAntigravity("antigravity-argon", fx.credential, { ttlMs: TTL, fetch });
+  await started.promise;
+  const second = fx.store().readAntigravity("antigravity-3p", fx.credential, { ttlMs: TTL, fetch });
+  finish.release();
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(calls, 1, "the fetch lock is keyed to the group, not to the selected pool");
+  assert.equal(a.latest.rail, "antigravity-argon");
+  assert.equal(b.latest.rail, "antigravity-3p");
+});
+
+test("a pool the vendor omitted is a failure reading, honoured for the TTL", async (t) => {
+  const fx = await fixture(t);
+  const store = fx.store();
+  let calls = 0;
+  const fetch = async () => {
+    calls++;
+    return {
+      "antigravity-argon": { rail: "antigravity-argon", ok: false, windows: [], readAt: fx.now(), note: "no usage windows returned" },
+      "antigravity-gemini": gemini(fx.now()),
+      "antigravity-3p": threeParty(fx.now()),
+    } as AntigravityReadings;
+  };
+  const failed = await store.readAntigravity("antigravity-argon", fx.credential, { ttlMs: TTL, fetch });
+  assert.equal(failed.latest.ok, false);
+  assert.equal(failed.latest.ok === false ? failed.latest.note : "", "no usage windows returned");
+  // A stored failure is a reading like any other: it is what keeps an omitted
+  // pool from being asked for again on every pass.
+  for (const rail of POOLS) await store.readAntigravity(rail, fx.credential, { ttlMs: TTL, fetch });
+  assert.equal(calls, 1);
+});
+
+test("a group with a sibling absent from disk is not a warm group", async (t) => {
+  const fx = await fixture(t);
+  await writeFile(fx.path, JSON.stringify({
+    version: READINGS_FILE_VERSION,
+    entries: [{ rail: "antigravity-argon", credential: fx.credential, at: fx.now(), latest: argon(fx.now(), "seeded") }],
+  }));
+  let calls = 0;
+  const fetch = async () => { calls++; return group(fx.now(), "complete"); };
+  const store = fx.store();
+  const result = await store.readAntigravity("antigravity-gemini", fx.credential, { ttlMs: TTL, fetch });
+  assert.equal(result.latest.ok, true);
+  assert.equal(calls, 1, "two of three pools is not a complete group");
+  // The fetch published all three, so every pool is now free to read.
+  for (const rail of POOLS) await store.readAntigravity(rail, fx.credential, { ttlMs: TTL, fetch });
+  assert.equal(calls, 1);
+  const seeded = await store.known("antigravity-argon", fx.credential);
+  assert.deepEqual(seeded?.latest.ok === true ? seeded.latest.raw : undefined, { tag: "complete", pool: "argon" });
+});
+
+test("one group fetch stamps all three entries with one instant", async (t) => {
+  const fx = await fixture(t);
+  // A clock that moves on every read: three separate stamps would be three
+  // different numbers, and one answer would be indistinguishable from three.
+  let ticking = 1_000;
+  const store = createSharedReadings({
+    path: fx.path, now: () => (ticking += 1), sleep: pause,
+    pacing: { fetchWaitMs: 1_000, writeWaitMs: 100, pollMs: 2, staleMs: 10_000 },
+  });
+  await store.readAntigravity("antigravity-3p", fx.credential, {
+    ttlMs: TTL,
+    fetch: async () => {
+      const at = 900;
+      return group(at);
+    },
+  });
+  const document = JSON.parse(await readFile(fx.path, "utf8"));
+  const entries = document.entries as Array<{ rail: string; at: number }>;
+  assert.equal(entries.length, 3);
+  const stamps = new Set(entries.map((entry) => entry.at));
+  assert.equal(stamps.size, 1, `one vendor answer must be stamped once, got ${[...stamps].join(", ")}`);
+});
+
+test("each pool keeps its own last good reading across a group fetch", async (t) => {
+  const fx = await fixture(t);
+  const store = fx.store();
+  await store.readAntigravity("antigravity-argon", fx.credential, { ttlMs: TTL, fetch: async () => group(fx.now(), "first") });
+  fx.advance(TTL);
+  await store.readAntigravity("antigravity-gemini", fx.credential, {
+    ttlMs: TTL,
+    fetch: async () => ({
+      "antigravity-argon": { rail: "antigravity-argon", ok: false, windows: [], readAt: fx.now(), note: "HTTP 500" },
+      "antigravity-gemini": gemini(fx.now(), "second"),
+      "antigravity-3p": threeParty(fx.now(), "second"),
+    } as AntigravityReadings),
+  });
+  const failedPool = await store.known("antigravity-argon", fx.credential);
+  assert.equal(failedPool?.latest.ok, false);
+  assert.deepEqual(failedPool?.lastGood?.raw, { tag: "first", pool: "argon" }, "argon keeps argon's own last success");
+  const healthy = await store.known("antigravity-gemini", fx.credential);
+  assert.deepEqual(healthy?.latest.ok === true ? healthy.latest.raw : undefined, { tag: "second", pool: "gemini" });
+  assert.deepEqual(healthy?.lastGood?.raw, { tag: "second", pool: "gemini" }, "a success is its own last good reading");
+});
+
+test("a forced group read fetches, and two forced callers share that one fetch", async (t) => {
+  const fx = await fixture(t);
+  const store = fx.store();
+  let calls = 0;
+  const fetch = async () => { calls++; return group(fx.now(), `tag-${calls}`); };
+  await store.readAntigravity("antigravity-argon", fx.credential, { ttlMs: TTL, fetch });
+  assert.equal(calls, 1);
+  const started = gate(); const finish = gate();
+  const forcedFetch = async () => { calls++; started.release(); await finish.promise; return group(fx.now(), "forced"); };
+  const a = store.readAntigravity("antigravity-argon", fx.credential, { ttlMs: TTL, force: true, fetch: forcedFetch });
+  await started.promise;
+  const b = store.readAntigravity("antigravity-3p", fx.credential, { ttlMs: TTL, force: true, fetch: forcedFetch });
+  finish.release();
+  const [ar, br] = await Promise.all([a, b]);
+  assert.equal(calls, 2, "one ordinary fetch, then one shared forced fetch");
+  assert.equal(ar.latest.ok === true ? ar.latest.raw && (ar.latest.raw as { tag: string }).tag : "", "forced");
+  assert.equal(br.latest.rail, "antigravity-3p");
+});
+
+test("a forced group read that joined a cache hit still starts a real fetch", async (t) => {
+  const fx = await fixture(t);
+  const store = fx.store();
+  let calls = 0;
+  const fetch = async () => { calls++; return group(fx.now(), `tag-${calls}`); };
+  await store.readAntigravity("antigravity-gemini", fx.credential, { ttlMs: TTL, fetch });
+  const [cached, forced] = await Promise.all([
+    store.readAntigravity("antigravity-gemini", fx.credential, { ttlMs: TTL, fetch }),
+    store.readAntigravity("antigravity-gemini", fx.credential, { ttlMs: TTL, force: true, fetch }),
+  ]);
+  assert.equal(calls, 2, "force must not be answered by the warm cache");
+  assert.notDeepEqual(cached.latest, forced.latest);
+});
+
+test("a group publication carries unrelated entries, gates and the sticky halt", async (t) => {
+  const fx = await fixture(t);
+  const store = fx.store();
+  await store.read("codex", fx.credential, { ttlMs: TTL, fetch: async () => good("codex", fx.now(), "codex") });
+  await store.setGates(fx.credential, { halt: "spent once" });
+  await store.setStickyHalt({ note: "undiverted", claudePath: null, claudeMtimeMs: null });
+  await store.readAntigravity("antigravity-argon", fx.credential, { ttlMs: TTL, fetch: async () => group(fx.now()) });
+
+  const document = JSON.parse(await readFile(fx.path, "utf8"));
+  assert.equal(document.version, READINGS_FILE_VERSION);
+  assert.equal(document.entries.length, 4, "three pools plus the unrelated codex reading");
+  assert.deepEqual((await fx.store().gates(fx.credential)).halt, "spent once");
+  assert.equal((await fx.store().gates(fx.credential)).sticky?.note, "undiverted");
+  assert.equal((await fx.store().known("codex", fx.credential))?.latest.ok, true);
+  assert.equal((await stat(fx.path)).mode & 0o777, 0o600);
+});
+
+test("a group read the store cannot publish still answers all three pools in memory", async (t) => {
+  const fx = await fixture(t);
+  const unwritable = join(fx.root, "missing", "quota-dispatch-readings.json");
+  const store = createSharedReadings({
+    path: unwritable, now: fx.now,
+    pacing: { fetchWaitMs: 1_000, writeWaitMs: 100, pollMs: 2, staleMs: 10_000 },
+  });
+  let calls = 0;
+  const fetch = async () => { calls++; return group(fx.now()); };
+  const first = await store.readAntigravity("antigravity-argon", fx.credential, { ttlMs: TTL, fetch });
+  assert.equal(first.latest.ok, true);
+  for (const rail of POOLS) {
+    const sibling = await store.readAntigravity(rail, fx.credential, { ttlMs: TTL, fetch });
+    assert.equal(sibling.latest.ok, true);
+  }
+  assert.equal(calls, 1, "the un-published group is still the overlay this process answers from");
+  assert.equal(existsSync(unwritable), false);
+});
+
+test("a real child asking for a different pool joins one grouped request", async (t) => {
+  const fx = await fixture(t);
+  const marker = join(fx.root, "group-fetching"); const release = join(fx.root, "group-release");
+  const waiting = join(fx.root, "group-waiting");
+  const a = spawnReadingsChild({ readingsPath: fx.path, credential: fx.credential, rail: "antigravity-argon", marker, release, delayMs: 20 });
+  t.after(a.kill);
+  await waitUntil("first child's grouped fetch", () => existsSync(marker));
+  // The second child arrives while the first is *inside* its fetch — so the first
+  // is holding the group's fetch lock, and the only way the second can be asleep
+  // is inside that one lock's wait. Its `waitingMarker` is what proves it: a pool
+  // that took a lock of its own would never sleep at all.
+  const b = spawnReadingsChild({ readingsPath: fx.path, credential: fx.credential, rail: "antigravity-3p", waitingMarker: waiting });
+  t.after(b.kill);
+  await waitUntil("the second child to wait on the group's fetch lock", () => existsSync(waiting));
+  await writeFile(release, "go");
+  const [ar, br] = await Promise.all([a.done, b.done]);
+  assertCleanExit(ar); assertCleanExit(br);
+  const first = JSON.parse(ar.stdout); const second = JSON.parse(br.stdout);
+  assert.equal(Number(first.fetched) + Number(second.fetched), 1, "one process asked the vendor, the other joined");
+  assert.equal(second.fetched, false, "the pool that arrived second is the one that joined");
+  // A third, fresh process reads a pool neither of them asked about and needs
+  // no request of its own: the group was published whole.
+  const c = spawnReadingsChild({ readingsPath: fx.path, credential: fx.credential, rail: "antigravity-gemini" });
+  t.after(c.kill);
+  const cr = await c.done; assertCleanExit(cr);
+  const third = JSON.parse(cr.stdout);
+  assert.equal(third.fetched, false);
+  assert.equal(third.result.latest.rail, "antigravity-gemini");
+});
+
+// ---------------------------------------------------------------- file versions
+
+test("a version-2 document reads without warning and survives a version-3 publication", async (t) => {
+  const fx = await fixture(t);
+  const cooldown = { at: 113, note: "the ping appeared to do nothing" };
+  // What the previous version of this extension writes: two vendor readings, a
+  // credential's refresh gate and the machine-wide sticky halt. None of it is a
+  // cache to throw away — the cooldown records that a ping already ran, and
+  // dropping it on upgrade would spend that budget again.
+  await writeFile(fx.path, JSON.stringify({
+    version: 2,
+    entries: [
+      { rail: "claude", credential: fx.credential, at: 111, latest: good("claude", 100, "legacy-claude") },
+      { rail: "codex", credential: fx.credential, at: 112, latest: good("codex", 101, "legacy-codex") },
+    ],
+    gates: [{ credential: fx.credential, cooldown, halt: "a real request was spent" }],
+    stickyHalt: { note: "undiverted", claudePath: null, claudeMtimeMs: null },
+  }));
+  const store = fx.store();
+  assert.deepEqual(store.warnings(), []);
+  assert.equal((await store.known("claude", fx.credential))?.latest.ok, true);
+  assert.equal((await store.known("codex", fx.credential))?.latest.ok, true);
+  const gates = { cooldown, halt: "a real request was spent", sticky: { note: "undiverted", claudePath: null, claudeMtimeMs: null } };
+  assert.deepEqual(await store.gates(fx.credential), gates);
+
+  // A group fetch publishes the whole document again, at the current version.
+  await store.readAntigravity("antigravity-argon", fx.credential, { ttlMs: TTL, fetch: async () => group(fx.now()) });
+  const published = JSON.parse(await readFile(fx.path, "utf8"));
+  assert.equal(published.version, READINGS_FILE_VERSION);
+  assert.equal(published.entries.length, 5, "three pools plus the two vendor readings it already held");
+  const reopened = fx.store();
+  assert.deepEqual(reopened.warnings(), []);
+  assert.deepEqual(await reopened.gates(fx.credential), gates, "an upgrade must not erase a refresh gate");
+  assert.equal((await reopened.known("codex", fx.credential))?.latest.ok, true);
+});
+
+test("a version-2 document may not name an Antigravity pool", async (t) => {
+  const fx = await fixture(t);
+  // A pool entry in a version-2 document is not something that version's writer
+  // could have produced, so the file is a hand edit and faults whole.
+  await writeFile(fx.path, JSON.stringify({
+    version: 2,
+    entries: [{ rail: "antigravity-argon", credential: fx.credential, at: 1, latest: argon(1) }],
+  }));
+  const store = fx.store();
+  assert.equal(await store.known("antigravity-argon", fx.credential), undefined);
+  assert.equal(store.warnings().length, 1);
+  assert.match(store.warnings()[0]!, /antigravity-argon/);
+});
+
+for (const version of [1, READINGS_FILE_VERSION + 1]) {
+  test(`a version-${version} readings document warns once and is repaired by the next write`, async (t) => {
+    const fx = await fixture(t);
+    await writeFile(fx.path, JSON.stringify({ version, entries: [] }));
+    const store = fx.store();
+    assert.equal(await store.known("claude", fx.credential), undefined);
+    assert.equal(store.warnings().length, 1);
+    await store.read("claude", fx.credential, { ttlMs: TTL, fetch: async () => good("claude", fx.now()) });
+    assert.equal(JSON.parse(await readFile(fx.path, "utf8")).version, READINGS_FILE_VERSION);
+    assert.deepEqual(fx.store().warnings(), []);
   });
 }

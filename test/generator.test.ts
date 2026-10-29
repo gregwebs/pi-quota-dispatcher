@@ -25,6 +25,7 @@ import {
 } from "../src/generator.ts";
 import {
   generatorInput,
+  parseAntigravityUsage,
   parseClaudeUsage,
   parseCodexUsage,
   type FailedReading,
@@ -191,9 +192,19 @@ test("the README's stdin document example is the documented shape", async () => 
   const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
   const doc = JSON.parse(firstJsonBlockAfter(readme, "#### What the generator reads on stdin"));
   assert.equal(doc.version, GENERATOR_INPUT_VERSION);
-  assert.deepEqual(Object.keys(doc.rails).sort(), ["claude", "codex", "deepseek"]);
+  assert.deepEqual(Object.keys(doc.rails).sort(), [
+    "antigravity-3p",
+    "antigravity-argon",
+    "antigravity-gemini",
+    "claude",
+    "codex",
+    "deepseek",
+  ]);
   assert.deepEqual(doc.rails.deepseek, { metered: true, windows: [], raw: null });
-  for (const rail of ["claude", "codex"] as const) {
+  // Five capped rails, not two: the document a generator reads names every rail
+  // the policy can route on.
+  const capped = ["claude", "codex", "antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const;
+  for (const rail of capped) {
     assert.equal(doc.rails[rail].ok, true, rail);
     assert.ok(!Number.isNaN(Date.parse(doc.rails[rail].readAt)), `${rail}.readAt must be an ISO instant`);
   }
@@ -233,9 +244,29 @@ test("the README's stdin document example is the documented shape", async () => 
     note: "HTTP 500 after 2 attempts",
   };
   const metered: MeteredReading = { rail: "deepseek", ok: true, windows: [], metered: true, note: "metered" };
+  // The three pools are one vendor body partitioned by bucket id, so the example
+  // must be readable as exactly that: parse each pool's own `raw` with the real
+  // parser and keep only that pool's windows.
+  const poolGood = (rail: "antigravity-argon" | "antigravity-gemini" | "antigravity-3p"): GoodReading => ({
+    rail,
+    ok: true,
+    readAt: Date.parse(doc.rails[rail].readAt),
+    windows: parseAntigravityUsage(doc.rails[rail].raw)[rail],
+    raw: doc.rails[rail].raw,
+  });
+  const argonGood = poolGood("antigravity-argon");
+  const geminiGood = poolGood("antigravity-gemini");
+  const threePartyGood = poolGood("antigravity-3p");
+  // One response, three pools: the same document is carried on each, and the
+  // example is wrong if they disagree.
+  assert.deepEqual(doc.rails["antigravity-argon"].raw, doc.rails["antigravity-3p"].raw);
+  assert.equal(doc.rails["antigravity-argon"].readAt, doc.rails["antigravity-gemini"].readAt);
   const readings: KnownReadings = {
     claude: { latest: claudeFailure, lastGood: claudeGood },
     codex: { latest: codexGood, lastGood: codexGood },
+    "antigravity-argon": { latest: argonGood, lastGood: argonGood },
+    "antigravity-gemini": { latest: geminiGood, lastGood: geminiGood },
+    "antigravity-3p": { latest: threePartyGood, lastGood: threePartyGood },
     deepseek: { latest: metered },
   };
   const outcome = generatorInput(readings);
@@ -245,19 +276,33 @@ test("the README's stdin document example is the documented shape", async () => 
   // Exact sorted key sets, not a subset: the README cannot document a field the
   // code never emits, nor leave out one it does.
   const keys = (value: object) => Object.keys(value).sort();
-  for (const rail of ["claude", "codex", "deepseek"] as const) {
+  for (const rail of [...capped, "deepseek"] as const) {
     assert.deepEqual(keys(doc.rails[rail]), keys(outcome.input.rails[rail]), `${rail} entry keys`);
+  }
+  // The Antigravity pools' `windows` must be exactly what the parser derives
+  // from the raw beside them: their `used` *is* recomputable, so a documented
+  // window the parser never emits cannot survive. Claude's per-model weeks and
+  // Codex's `limit_reached` reads are the two places `used` is the vendor's own
+  // number rather than a fraction, and the prose above says so.
+  for (const rail of ["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const) {
+    assert.deepEqual(doc.rails[rail].windows, outcome.input.rails[rail].windows, `${rail} windows`);
   }
   // Per rail, over every window: the same shapes the code emits, whatever their
   // order, so a window missing `resetsAt` beside one that carries it cannot hide.
   const windowShapes = (windows: readonly object[]) => windows.map((w) => keys(w).join(",")).sort();
-  for (const rail of ["claude", "codex"] as const) {
+  for (const rail of capped) {
     assert.deepEqual(
       windowShapes(doc.rails[rail].windows),
       windowShapes(outcome.input.rails[rail].windows),
       `${rail} window key sets`,
     );
   }
+  // Argon carries a week and no session, and the example says so rather than
+  // inventing a session window the pool has none of.
+  assert.deepEqual(
+    doc.rails["antigravity-argon"].windows.map((w: { budget?: string }) => w.budget),
+    ["weekly"],
+  );
 });
 
 test("a plain valid replacement is accepted with no warnings", async () => {
@@ -417,6 +462,39 @@ test("a threshold conflict rejects when the replacement supplies either value", 
   }
 });
 
+test("the strict replacement accepts a generated layer that registers and routes the Antigravity pools", async () => {
+  // The generated layer is checked by the same strict replacement an ordinary
+  // load uses, so a wrapper that only the tolerant path knew — or a rail name the
+  // generator cannot write back — would be refused here rather than at the next
+  // boot.
+  const result = await replaceGlobal({
+    models: {
+      "antigravity/gemini-4-argon": { rail: "antigravity-argon", thinking: "high" },
+      "antigravity/gemini-3-pro": { rail: "antigravity-gemini" },
+      "antigravity/claude-sonnet-5": { rail: "antigravity-3p", thinking: "low" },
+    },
+    agents: {
+      planner: {
+        primary: { model: "antigravity/gemini-3-pro" },
+        alternates: [{ model: "antigravity/gemini-4-argon" }, { model: "antigravity/claude-sonnet-5" }],
+      },
+    },
+  });
+  assert.equal(result.kind, "accepted", JSON.stringify(result));
+  if (result.kind !== "accepted") return;
+  const planner = result.loaded.config.agents[agentName("planner")];
+  assert.equal(planner.primary.rail, "antigravity-gemini");
+  assert.deepEqual(planner.alternates.map((c) => [c.model, c.rail]), [
+    ["antigravity/gemini-4-argon", "antigravity-argon"],
+    ["antigravity/claude-sonnet-5", "antigravity-3p"],
+  ]);
+  // The rail is what the models table supplied, and its source says so; each
+  // prefix agrees with the rail it was registered under, so nothing warns.
+  assert.equal(result.loaded.sources["agents.planner.primary.rail"], "global");
+  assert.equal(result.loaded.sources["models.antigravity/claude-sonnet-5.thinking"], "global");
+  assert.deepEqual(result.loaded.warnings, []);
+});
+
 test("the accepted configuration is what a later ordinary load produces", async () => {
   const layer = {
     agents: { planner: VALID_ROUTE },
@@ -479,6 +557,9 @@ const READY_INPUT = {
   rails: {
     claude: { ok: true, readAt: "2024-01-01T00:00:00.000Z", windows: [], raw: {} },
     codex: { ok: true, readAt: "2024-01-01T00:00:00.000Z", windows: [], raw: {} },
+    "antigravity-argon": { ok: true, readAt: "2024-01-01T00:00:00.000Z", windows: [], raw: {} },
+    "antigravity-gemini": { ok: true, readAt: "2024-01-01T00:00:00.000Z", windows: [], raw: {} },
+    "antigravity-3p": { ok: true, readAt: "2024-01-01T00:00:00.000Z", windows: [], raw: {} },
     deepseek: { metered: true, windows: [], raw: null },
   },
 } as const;
@@ -770,6 +851,29 @@ const RICH_INPUT = {
       windows: [{ label: "7d", used: 100, budget: "weekly" }],
       raw: { rate_limit: { limit_reached: true } },
       note: "limit_reached=true",
+    },
+    // Distinct instants, budgets and raw bodies per pool, so a document that
+    // dropped a key or copied a neighbour's reading would not round-trip.
+    "antigravity-argon": {
+      ok: true,
+      readAt: "2025-02-03T09:21:11.006Z",
+      windows: [{ label: "gemini-argon-wtu-weekly", used: 6, budget: "weekly" }],
+      raw: { groups: [{ buckets: [{ bucketId: "gemini-argon-wtu-weekly" }] }] },
+    },
+    "antigravity-gemini": {
+      ok: true,
+      readAt: "2025-02-03T09:21:11.007Z",
+      windows: [
+        { label: "gemini-weekly", used: 9, budget: "weekly" },
+        { label: "gemini-5h", used: 24, budget: "session" },
+      ],
+      raw: { groups: [{ buckets: [{ bucketId: "gemini-5h" }] }] },
+    },
+    "antigravity-3p": {
+      ok: true,
+      readAt: "2025-02-03T09:21:11.008Z",
+      windows: [{ label: "3p-5h", used: 3, budget: "session" }],
+      raw: { groups: [{ buckets: [{ bucketId: "3p-5h" }] }] },
     },
     deepseek: { metered: true, windows: [], raw: null },
   },

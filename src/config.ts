@@ -36,7 +36,39 @@ export { agentNameRejection, modelIdRejection } from "./identifiers.ts";
 
 // ---------------------------------------------------------------- shape
 
-export type Rail = "claude" | "codex" | "deepseek";
+/**
+ * The three quota pools Antigravity gives one account, each independently capped.
+ *
+ * They are separate rails rather than one account rail because the vendor caps
+ * them separately: spending the Claude-and-GPT pool says nothing about the
+ * Gemini one. They share a credential and a single vendor read, which is why the
+ * dispatcher fetches them as a group — see
+ * `docs/adr/0019-antigravity-pool-rails.md`.
+ */
+export const ANTIGRAVITY_RAILS = ["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const;
+
+export type AntigravityRail = (typeof ANTIGRAVITY_RAILS)[number];
+
+/**
+ * Every rail, in the order the report prints them: the two long-standing vendor
+ * rails, then the three Antigravity pools as one account's group, then the
+ * metered rail.
+ *
+ * One ordered list rather than a literal repeated at each reader, so the report
+ * and the generator cannot disagree about which rails exist or how they read —
+ * and the list is what the `Rail` type is derived from, so a rail cannot be
+ * named in the type without being in the order.
+ */
+export const RAILS = ["claude", "codex", ...ANTIGRAVITY_RAILS, "deepseek"] as const;
+
+/**
+ * One independently capped quota pool that model calls draw on.
+ *
+ * A rail is per-pool, not per-provider or per-account: several model prefixes
+ * can draw on one rail, and one account can back more than one. `deepseek` is
+ * the metered one, billed per token rather than capped.
+ */
+export type Rail = (typeof RAILS)[number];
 
 /**
  * A thinking level, spelled the way an agent file's `thinking:` line spells it.
@@ -654,8 +686,18 @@ function foldSkillEntries(
   }
 }
 
-function isRail(value: unknown): value is Rail {
-  return value === "claude" || value === "codex" || value === "deepseek";
+export function isRail(value: unknown): value is Rail {
+  return typeof value === "string" && (RAILS as readonly string[]).includes(value);
+}
+
+/**
+ * Whether `value` is one of the three Antigravity pool rails.
+ *
+ * Exported because the readings store groups those three behind one fetch, and
+ * the grouping is stated once here rather than re-derived from a prefix.
+ */
+export function isAntigravityRail(value: unknown): value is AntigravityRail {
+  return typeof value === "string" && (ANTIGRAVITY_RAILS as readonly string[]).includes(value);
 }
 
 /**
@@ -670,6 +712,15 @@ export function railFromModel(model: string): Rail | undefined {
   if (model.startsWith("claude-bridge/") || model.startsWith("anthropic/")) return "claude";
   if (model.startsWith("openai-codex/")) return "codex";
   if (model.startsWith("deepseek/")) return "deepseek";
+  // Argon is checked before the general Gemini prefix: both pools serve Gemini
+  // models, and only the Argon one has its own weekly bucket. A suffix such as
+  // `gemini-4-argon-extra` is still Argon, because the vendor's own bucket ids
+  // for the pool all share that stem.
+  if (model.startsWith("antigravity/gemini-4-argon")) return "antigravity-argon";
+  if (model.startsWith("antigravity/gemini-")) return "antigravity-gemini";
+  if (model.startsWith("antigravity/claude-") || model.startsWith("antigravity/gpt-")) {
+    return "antigravity-3p";
+  }
   return undefined;
 }
 
