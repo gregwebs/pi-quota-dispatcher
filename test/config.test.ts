@@ -2236,6 +2236,56 @@ test("the rejection names every level pi accepts", () => {
   for (const level of THINKING_LEVELS) assert.ok(warning.includes(`"${level}"`), warning);
 });
 
+/**
+ * A mistyped rail is the one rejection a user meets while registering a pool, so
+ * the message has to name the pool rails too.
+ *
+ * The two seams that validate a rail are tested apart because they word their
+ * warnings differently; the assertion is on the spelled-out list rather than on
+ * `RAILS`, so a list left behind when a rail is added fails here.
+ */
+test("the rail rejection names every rail, at a candidate and in the models table", () => {
+  const RAILS_AS_WRITTEN = [
+    '"claude"',
+    '"codex"',
+    '"antigravity-argon"',
+    '"antigravity-gemini"',
+    '"antigravity-3p"',
+    '"deepseek"',
+  ];
+
+  // A near-miss on a pool rail: the shape a typo actually takes.
+  const candidate = mergeConfig(base(), [
+    {
+      source: "project",
+      data: { agents: { planner: { primary: { rail: "antigravity-3-" } } } },
+    },
+  ]);
+  const candidateWarning = candidate.warnings.find((w) => w.includes("agents.planner.primary.rail"));
+  assert.ok(candidateWarning, candidate.warnings.join("\n"));
+  for (const rail of RAILS_AS_WRITTEN) {
+    assert.ok(candidateWarning.includes(rail), `${rail} missing from: ${candidateWarning}`);
+  }
+
+  const table = mergeConfig(base(), [
+    {
+      source: "project",
+      data: {
+        models: { "antigravity/claude-opus-5-5": { rail: "antigravity-3-", thinking: "low" } },
+      },
+    },
+  ]);
+  const tableWarning = table.warnings.find((w) => w.includes("models.antigravity/claude-opus-5-5.rail"));
+  assert.ok(tableWarning, table.warnings.join("\n"));
+  for (const rail of RAILS_AS_WRITTEN) {
+    assert.ok(tableWarning.includes(rail), `${rail} missing from: ${tableWarning}`);
+  }
+  // The typo still costs only the rail: the entry's other fields stand.
+  const entry = table.config.models[modelId("antigravity/claude-opus-5-5")];
+  assert.equal(entry?.rail, undefined);
+  assert.equal(entry?.thinking, "low");
+});
+
 test("the models table rejects a shapeless key, a shapeless entry and an unknown key", () => {
   const r = mergeConfig(base(), [
     {
