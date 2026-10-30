@@ -70,6 +70,9 @@ export const RAILS = ["claude", "codex", ...ANTIGRAVITY_RAILS, "deepseek"] as co
  */
 export type Rail = (typeof RAILS)[number];
 
+/** The rails as a rejection words them, e.g. `"claude", "codex", ...`. */
+export const RAIL_LIST = RAILS.map((rail) => `"${rail}"`).join(", ");
+
 /**
  * A thinking level, spelled the way an agent file's `thinking:` line spells it.
  *
@@ -1482,7 +1485,7 @@ function parseCandidate(
         statedRail = true;
         sources.set(`${dotted}.rail`, source);
       } else {
-        warn(`"${dotted}.rail" must be one of "claude", "codex", "deepseek"`);
+        warn(`"${dotted}.rail" must be one of ${RAIL_LIST}`);
       }
     } else if (key === "thinking") {
       // A level is validated for its *spelling* here and for nothing else. Pi
@@ -2043,7 +2046,7 @@ export function mergeConfig(
       for (const [field, fieldValue] of Object.entries(entryValue)) {
         if (field === "rail") {
           if (!isRail(fieldValue)) {
-            warn(`"models.${id}.rail" must be one of "claude", "codex", "deepseek"`);
+            warn(`"models.${id}.rail" must be one of ${RAIL_LIST}`);
             continue;
           }
           config.models[modelKey] = { ...config.models[modelKey], rail: fieldValue };
