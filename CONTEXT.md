@@ -230,6 +230,15 @@ and its `refresh` form; the per-value **provenance** is deliberately not part of
 it.
 _Avoid_: output, status, summary, dump
 
+**Rail gauge**:
+The one line the footer holds between **reports**: each capped rail some route
+names, with how much of each of its budgets is used, a **tight** budget marked,
+with its reset when the vendor reports one. It shows readings and tightness,
+never decisions, and is drawn from the readings an evaluation already made — it
+never causes a read. A rail whose latest read failed shows its **last good
+reading** marked stale. A **metered** rail has no budgets and is left out.
+_Avoid_: status line, footer status, usage widget, quota bar
+
 **Provenance**:
 The record of which config layer supplied each effective value, printed by
 `/quota-dispatch config`. A warning is not provenance: the **report** and the

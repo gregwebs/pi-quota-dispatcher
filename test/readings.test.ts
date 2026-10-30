@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -12,8 +13,11 @@ import {
   parseCodexUsage,
   type GoodReading,
   type MeteredReading,
+  type PassReadings,
+  type Rail,
   type RailReading,
   type RailReadings,
+  railGauge,
 } from "../src/index.ts";
 
 import { agentTable, routeOf } from "./helpers/identifiers.ts";
@@ -78,6 +82,8 @@ async function fixture(t: TestContext, opts: { antigravity?: boolean } = {}) {
     // A hook the concurrency test installs; the stub awaits it before answering,
     // so a test can hold both reads in flight at once. Undefined everywhere else.
     beforeRespond: undefined as undefined | ((rail: LiveRail) => Promise<void>),
+    /** The extension's observer, installed here so a test can watch each pass. */
+    onReadings: undefined as undefined | ((pass: PassReadings) => void),
   };
   // A definite HTTP answer avoids retries or real-time backoff in cache tests.
   const fetchImpl = (async (url: string | URL) => {
@@ -97,7 +103,12 @@ async function fixture(t: TestContext, opts: { antigravity?: boolean } = {}) {
     ...DEFAULT_CONFIG, agentDir, claudeCredsPath, piAuthPath, ttlMs: TTL, claudeRefresh: "off",
     readingsPath,
     agents: agentTable({ planner: routeOf({ primary: { model: PRIMARY, rail: "claude" }, alternates: [{ model: ALTERNATE, rail: "codex" }] }) }),
-  }, { fetchImpl, now: () => probe.clock, readKeychain: async () => ({ error: "no keychain" }) });
+  }, {
+    fetchImpl,
+    now: () => probe.clock,
+    readKeychain: async () => ({ error: "no keychain" }),
+    onReadings: (pass) => probe.onReadings?.(pass),
+  });
   return { dispatcher, probe, agentFile, piAuthPath, readingsPath };
 }
 
@@ -602,4 +613,118 @@ test("knownReadings warms a partial Antigravity group once, so its siblings cann
     [["gemini-weekly", 12], ["gemini-5h", 42]],
     [["3p-weekly", 2]],
   ]);
+});
+
+// ---------------------------------------------------------------- the readings observer
+
+/**
+ * The footer's gauge draws what a pass read, so the pass has to hand its
+ * readings over. One call per pass, and the map is the pass's own — `lastGood`
+ * included, since that is what a rail's stale numbers are drawn from.
+ *
+ * The hand-over also carries the pass's number and the dispatcher's clock: the
+ * number is what lets a display drop a pass that read earlier but finished
+ * later, and the clock is the one the readings' own instants are on.
+ */
+test("onReadings is called once per evaluate and once per report, lastGood included", async (t) => {
+  const { dispatcher, probe } = await fixture(t);
+  // A good reading first, so the later failure has something behind it.
+  await dispatcher.railReadings("codex", true);
+  probe.failed.codex = true;
+  probe.clock += 500;
+
+  const seen: PassReadings[] = [];
+  probe.onReadings = (pass) => seen.push(pass);
+
+  await dispatcher.evaluate({ force: true });
+  assert.equal(seen.length, 1, "one pass, one observation");
+
+  const codex = seen[0].readings.get("codex")!;
+  assert.equal(codex.latest.ok, false);
+  assert.ok(
+    withLastGood(codex).lastGood !== undefined,
+    "the observer sees the last good reading the policy discards",
+  );
+  assert.deepEqual(
+    seen.map((pass) => [pass.seq, pass.now]),
+    [[1, probe.clock]],
+    "the pass is numbered and carries the dispatcher's own clock",
+  );
+
+  probe.clock += 500;
+  await dispatcher.report({ force: true });
+  assert.equal(seen.length, 2, "the report is a pass too");
+  assert.deepEqual(
+    seen.map((pass) => [pass.seq, pass.now]),
+    [[1, probe.clock - 500], [2, probe.clock]],
+    "pass numbers rise by one, and each is clocked as it is handed over",
+  );
+});
+
+/**
+ * An observer is a display, so it must run after the pass has applied its
+ * decisions: a gauge drawn mid-pass would report numbers the files do not yet
+ * agree with, and a display that could throw into the pass would be a veto.
+ */
+test("onReadings is called after the pass's agent-file write", async (t) => {
+  const { dispatcher, probe, agentFile } = await fixture(t);
+  let observed: string | undefined;
+  probe.onReadings = () => {
+    // A synchronous read of what the pass has already put on disk. The claude
+    // primary is at 93% with a threshold of 75, so the decision is a switch.
+    observed = readFileSync(agentFile, "utf8");
+  };
+
+  await dispatcher.evaluate({ force: true });
+  assert.ok(observed !== undefined, "the observer ran");
+  assert.ok(
+    observed.includes(`model: "${ALTERNATE}"`),
+    `the observer must see the switched model:\n${observed}`,
+  );
+});
+
+/**
+ * Rendering is handed readings, so there is nothing it could fetch. Pinned twice
+ * over: the counters do not move across the `railGauge` call itself, and the pass
+ * that draws is not charged a request the pass without it would skip.
+ */
+test("drawing the rail gauge makes no vendor request", async (t) => {
+  const { dispatcher, probe } = await fixture(t);
+  const counts = () => `${probe.calls.claude}/${probe.calls.codex}/${probe.antigravityCalls}`;
+  let rendered: string | undefined;
+  let acrossRendering: [string, string] | undefined;
+  const cfg = {
+    ...DEFAULT_CONFIG,
+    agents: agentTable({
+      planner: routeOf({
+        primary: { model: PRIMARY, rail: "claude" },
+        alternates: [{ model: ALTERNATE, rail: "codex" }],
+      }),
+    }),
+  };
+
+  // The same pass, counted without the gauge first.
+  await dispatcher.evaluate({ force: true });
+  const undrawn = counts();
+
+  probe.onReadings = (pass) => {
+    const before = counts();
+    rendered = railGauge({
+      readings: pass.readings,
+      cfg,
+      now: probe.clock,
+      style: { dim: (text) => text, warning: (text) => text },
+    });
+    acrossRendering = [before, counts()];
+  };
+  // Both passes are forced, so each re-reads every rail: the two totals compare
+  // like with like rather than across a cache the first pass warmed.
+  await dispatcher.evaluate({ force: true });
+
+  assert.ok(rendered !== undefined && rendered.includes("claude"), `the gauge drew: ${rendered}`);
+  assert.ok(acrossRendering !== undefined);
+  assert.equal(acrossRendering[1], acrossRendering[0], "rendering itself makes no request");
+  // Two forced passes over two vendor rails: one read each per pass, drawn or not.
+  assert.equal(undrawn, "1/1/0", "the undrawn pass is charged one read per rail");
+  assert.equal(counts(), "2/2/0", "the drawn pass is charged exactly the same");
 });

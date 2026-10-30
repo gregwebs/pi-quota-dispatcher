@@ -133,9 +133,10 @@ with a model whose prefix is not one of the rails this extension reads, is
 listed but left out rather than guessed at.
 
 While the table is empty, a footer line (`quota-dispatcher: no agents
-configured`) holds the state, and clears as soon as a route exists. In modes
-with no footer there is nothing to render, so neither the ask nor the status is
-shown.
+configured`) holds the state, and clears as soon as a route exists. The rail
+gauge is empty at the same time — no route names a rail, so there is nothing to
+show. In modes with no footer there is nothing to render, so neither the ask nor
+the status is shown.
 
 `/quota-dispatch` still works while unconfigured: it prints one line per rail,
 which is the diagnostic you want when the quotas are what you came for. It is
@@ -168,8 +169,9 @@ The notice fires whether or not the layers below the skipped one still manage
 agents: a route that quietly is not the one you wrote looks the same from the
 outside as a route you pinned, which is why a model this pi cannot spawn is
 surfaced the same way (see [below](#a-model-this-pi-does-not-know)). It is not a
-footer state — the footer line holds the two states that persist silently across
-`resume` and `fork` — so the standing record is the warning tail of
+footer state — the warning footer line holds the two states that persist
+silently across `resume` and `fork`, and the [rail gauge](#the-rail-gauge) has a
+footer key of its own — so the standing record is the warning tail of
 `/quota-dispatch`, where the skipped file is named whether or not a notification
 was ever seen.
 
@@ -215,6 +217,64 @@ log, never a replacement for it: each miss is still written to `console.error`,
 `/quota-dispatch config` repeats them at the end of its provenance block — which
 stays the durable record. More in
 [0009](docs/adr/0009-unknown-models-at-startup.md).
+
+## The rail gauge
+
+One footer line, kept between reports, showing how much of each budget is used on
+the rails this install actually routes on:
+
+```
+claude 13/91↻4d │ codex 74↻2h/41 │ ag-argon –/62
+```
+
+Each rail is `label session/weekly`, each budget a whole percent used, and the
+rails are separated by ` │ `. The rails are exactly the **capped** rails some
+effective route names — the ones the dispatcher reads a budget for — so a route
+table that never names Claude never shows Claude, and a **metered** rail is left
+out because it has no budget at all. Labels are fixed and short: `claude`,
+`codex`, `ag-3p`, `ag-gemini`, `ag-argon`.
+
+Rails are ordered **most-used first**: the sort key is the rail's highest budget
+percentage, compared before rounding, so two rails that both print `74` still
+order by what they really used. Ties keep the fixed order above, a stale rail
+sorts by its last good reading, and a rail with no number at all goes last.
+
+| What the slot shows | Meaning |
+|---|---|
+| `62` | Whole percent used. Every character except a tight slot is dim. |
+| `–` | A budget this rail does not have. Argon has no session cap, so `ag-argon –/62` |
+| `?` in a slot | The rail has that budget and the read did not report it — a partial reading, not a free budget |
+| `<74↻2h>` (warning color shown as `<…>`) | **Tight**: at or above `sessionSwitchAt` (session) or `weeklySwitchAt` (weekly), so it is drawn in the warning color with the time left until it resets — `45m`, `3h`, `4d` |
+| `74/41?` | The latest read failed, so the **last good reading** is shown, dimmed throughout with a trailing `?` |
+| `ag-3p ?` | Nothing has ever been read for this rail |
+
+A tight budget whose reset the vendor did not report — or one of whose tight
+windows has none — is shown in the warning color **without** a `↻`. Inventing a
+duration would be a lie about the one thing a tight budget makes you want to
+know, and a budget stays tight until the last of its tight windows has reset, so
+one unknown window is enough to make the whole countdown unknown.
+
+A stale rail is shown, never judged: the policy **holds** on a rail whose read
+failed, so there is no decision to display and its numbers are dim even when they
+are past a threshold.
+
+The gauge draws only readings the evaluation already holds. It never causes a
+request of its own, so it costs nothing to keep on screen. It is redrawn after
+every completed evaluation — session start, each `pollMs` tick, and the plain,
+`refresh` and `apply` forms, plus `generate` — and, like every other footer line,
+it appears only where there is a UI to draw on.
+
+pi puts **every** extension's status on one physical footer line, sorted by key
+and cut to the terminal width. The gauge has a footer key of its own, so the
+warning lines above stay visible beside it rather than instead of it — the
+warning normally comes first, though a line too narrow for both is truncated. If
+the footer cannot be drawn at all, `/quota-dispatch` says so in its warning tail.
+
+Set `railGauge` to `false` and `/reload` (or generate a layer that sets it): the
+line is cleared and not drawn again. The value is read once per extension load
+like every other key, so an edit takes effect on the next `/reload`, not on the
+next evaluation.
+The glossary term is in [CONTEXT.md](CONTEXT.md).
 
 ## Commands
 
@@ -516,6 +576,7 @@ for a one-element list.
 | `margin` | `10` | An alternate must be **more than** this many points healthier, on the budget that triggered the move |
 | `sessionAlwaysSwitchAt` | unset — off | At or above it the primary's **session** margin is set aside and the first alternate, **in the order you listed**, whose session budget is strictly below it is chosen. Must be at least `sessionSwitchAt`; 0–100, fractional allowed. An invalid ordering in the final merged config warns and disables this override alone. |
 | `ttlMs` | `180000` | How long a quota reading is reused |
+| `railGauge` | `true` | Show the [rail gauge](#the-rail-gauge) in the footer. `false` clears it. |
 | `pollMs` | `300000` | How often to re-evaluate while a session is open |
 | `claudeRefresh` | `off` | Whether an expired Claude token is refreshed by running Claude Code once — see [Keeping the Claude token fresh](#keeping-the-claude-token-fresh) |
 

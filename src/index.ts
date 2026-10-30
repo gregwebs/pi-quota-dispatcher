@@ -259,6 +259,21 @@ export type {
   RefreshPlan,
 } from "./refresh.ts";
 
+import {
+  type BudgetGauge,
+  type GaugeEntry,
+  type GaugeStyle,
+  type StaleBudgetGauge,
+  GAUGE_ORDER,
+  renderRailGauge,
+} from "./rail-gauge.ts";
+
+// The rail-gauge module is where the footer line is rendered; re-exported here
+// for the same reason as the config module, so a consumer (and a test) reaches
+// the renderer through the extension's one import path.
+export { GAUGE_LABELS, GAUGE_ORDER, renderRailGauge, resetText } from "./rail-gauge.ts";
+export type { BudgetGauge, GaugeEntry, GaugeStyle, StaleBudgetGauge } from "./rail-gauge.ts";
+
 // ---------------------------------------------------------------- types
 
 /**
@@ -1003,6 +1018,113 @@ function budgetSummary(reading: RailReading): string {
       return `${b} ${used === undefined ? "unreported" : pct(used)}`;
     })
     .join(", ");
+}
+
+// ---------------------------------------------------------------- rail gauge
+
+/**
+ * The capped rails some route names, in the gauge's fixed order.
+ *
+ * The gauge shows what the dispatcher reads, and it reads a rail because a route
+ * names it. A rail no route names would be a number the user cannot act on, and a
+ * metered rail has no budgets to show at all — `GAUGE_ORDER` holds only capped
+ * rails, so filtering it is the whole exclusion.
+ */
+function gaugedRails(cfg: DispatcherConfig): VendorRail[] {
+  const named = new Set<Rail>();
+  for (const [, route] of validatedEntries(cfg.agents)) {
+    named.add(route.primary.rail);
+    for (const candidate of route.alternates) named.add(candidate.rail);
+  }
+  return GAUGE_ORDER.filter((rail) => named.has(rail));
+}
+
+/**
+ * One budget of a fresh reading as the gauge draws it.
+ *
+ * Tightness is the policy's own test (`used >= thresholdFor`) on the same raw
+ * number, so a budget the policy calls tight cannot print as comfortable.
+ */
+function freshBudget(
+  reading: GoodReading,
+  budget: Budget,
+  context: { cfg: DispatcherConfig; now: number },
+): BudgetGauge {
+  if (!carries(reading.rail, budget)) return { kind: "uncarried" };
+  const used = budgetUsed(reading, budget);
+  if (used === undefined) return { kind: "unreported" };
+  const threshold = thresholdFor(budget, context.cfg);
+  if (used < threshold) return { kind: "used", used };
+  // The budget stays tight until every window holding it at or past the
+  // threshold has reset, so the latest such reset is the honest one — and one
+  // tight window with no reset makes the whole budget's reset unknown: the other
+  // windows' countdowns say nothing about when that one clears.
+  const tight = reading.windows.filter((window) => window.budget === budget && window.used >= threshold);
+  const resets = tight.map((window) => window.resetsAt);
+  const resetInMs = resets.every((at): at is number => at !== undefined)
+    ? Math.max(...resets) - context.now
+    : undefined;
+  return { kind: "tight", used, resetInMs };
+}
+
+/** A stale reading's budget: a number, or the reason there is none. Never a judgment. */
+function staleBudget(reading: GoodReading, budget: Budget): StaleBudgetGauge {
+  if (!carries(reading.rail, budget)) return { kind: "uncarried" };
+  const used = budgetUsed(reading, budget);
+  return used === undefined ? { kind: "unreported" } : { kind: "used", used };
+}
+
+/**
+ * The readings an evaluation already holds, projected onto what the gauge draws.
+ *
+ * One entry per gauged rail. A rail whose latest read failed is drawn from its
+ * last good reading when there is one, marked stale; the policy holds on that
+ * rail, so the numbers are for the eye and decide nothing.
+ */
+export function railGaugeEntries(input: {
+  readings: ReadonlyMap<Rail, RailReadings>;
+  cfg: DispatcherConfig;
+  now: number;
+}): GaugeEntry[] {
+  return gaugedRails(input.cfg).map((rail): GaugeEntry => {
+    const held = input.readings.get(rail);
+    const latest = held?.latest;
+    // A missing entry cannot happen through `allReadings`, which returns one per
+    // rail — but reading it as "no reading" is the honest answer, and it needs
+    // no assertion to say so.
+    if (latest === undefined || latest.metered) return { rail, kind: "unread" };
+    if (latest.ok) {
+      return {
+        rail,
+        kind: "fresh",
+        session: freshBudget(latest, "session", input),
+        weekly: freshBudget(latest, "weekly", input),
+      };
+    }
+    const good = held?.lastGood;
+    if (good === undefined) return { rail, kind: "unread" };
+    return {
+      rail,
+      kind: "stale",
+      session: staleBudget(good, "session"),
+      weekly: staleBudget(good, "weekly"),
+    };
+  });
+}
+
+/**
+ * The footer's rail gauge, or `undefined` when no route names a capped rail.
+ *
+ * The one seam a caller needs: readings it already took, the config they were
+ * decided under, a clock, and how to color. Nothing here can read a vendor.
+ */
+export function railGauge(input: {
+  readings: ReadonlyMap<Rail, RailReadings>;
+  cfg: DispatcherConfig;
+  now: number;
+  style: GaugeStyle;
+}): string | undefined {
+  return renderRailGauge(railGaugeEntries(input), input.style);
 }
 
 /**
@@ -2892,6 +3014,35 @@ export interface DispatcherDeps {
    * preference.
    */
   providerTokenTimeoutMs?: number;
+  /**
+   * An observer of each pass: handed every rail's readings once per `evaluate`
+   * and `report` — the same map the pass decided on, `lastGood` included — so a
+   * display such as the footer's rail gauge draws what this pass read rather
+   * than reading again.
+   *
+   * Called last, after every decision and agent-file write of the pass has
+   * settled, and not awaited: an observer can neither hold up nor veto the
+   * policy. It must not throw — the extension's `publishGauge` is the display's
+   * own top-level handler — so a throw here is a bug, and it surfaces as the
+   * pass's rejection only after its writes are made.
+   */
+  onReadings?: (pass: PassReadings) => void;
+}
+
+/**
+ * One pass's readings as an observer sees them.
+ *
+ * `seq` rises by one per pass and is taken when the pass's readings are in hand,
+ * so it orders the passes by when their readings completed rather than by when
+ * the pass finishes: a poll that waited on an agent-file lock finishes after a
+ * forced refresh it read before, and must not repaint the footer with older
+ * numbers. `now` is this dispatcher's clock, sampled as the pass hands over, so
+ * an observer never needs a second clock to say how long a reset has left.
+ */
+export interface PassReadings {
+  readonly readings: ReadonlyMap<Rail, RailReadings>;
+  readonly seq: number;
+  readonly now: number;
 }
 
 export interface Dispatcher {
@@ -3645,6 +3796,25 @@ export function createDispatcher(
     };
   }
 
+  /**
+   * The number of the pass now being made, taken once it has its readings.
+   *
+   * A number, not a timestamp: two passes can read within the same millisecond,
+   * and only the order of the reads matters here.
+   */
+  let pass = 0;
+
+  /**
+   * Hand one pass's readings to the observer, numbered and clocked.
+   *
+   * The number is stamped here rather than at the call site so no pass can be
+   * published without one, which is what lets the display drop a snapshot that
+   * is older than the one already on screen.
+   */
+  function observe(all: ReadonlyMap<Rail, RailReadings>, seq: number): void {
+    deps.onReadings?.({ readings: all, seq, now: now() });
+  }
+
   async function decideAll(
     rails: Map<Rail, RailReading>,
     dry: boolean,
@@ -3713,7 +3883,16 @@ export function createDispatcher(
     opts: { force?: boolean; dry?: boolean } = {},
   ): Promise<Array<{ decision: Decision; outcome: Outcome }>> {
     const directory = await readAgentDirectory(cfg.agentDir);
-    return decideAll(latestReadings(await allReadings(opts.force)), opts.dry ?? false, directory);
+    const all = await allReadings(opts.force);
+    // Taken before the decisions: this is the moment the pass knows what it is
+    // speaking about, and the order of those moments is the order a display may
+    // follow it in.
+    const seq = ++pass;
+    const rows = await decideAll(latestReadings(all), opts.dry ?? false, directory);
+    // After the writes, so an observer of the readings cannot affect or hold up
+    // the policy this pass just applied.
+    observe(all, seq);
+    return rows;
   }
 
   /**
@@ -3733,7 +3912,11 @@ export function createDispatcher(
    * Antigravity pools answered by a single request.
    */
   async function report(opts: { force?: boolean } = {}): Promise<string[]> {
-    const rails = latestReadings(await allReadings(opts.force));
+    const all = await allReadings(opts.force);
+    // Stamped at the same point as `evaluate`'s: both are passes over the same
+    // readings, and the display orders them the same way.
+    const seq = ++pass;
+    const rails = latestReadings(all);
     // Read before the decisions, and shared with them and with the unmanaged
     // list below, so the pass makes one read of the agent dir rather than two
     // that could disagree.
@@ -3752,6 +3935,10 @@ export function createDispatcher(
       }
     }
     const decisions = await decideAll(rails, true, directory);
+    // The same observer `evaluate` hands its readings to, called at the same
+    // point: after the policy work, never before it. The decisions here are a
+    // dry run, but the ordering is what a display may rely on.
+    observe(all, seq);
     // No separator without decisions: an unconfigured install has nothing
     // between the rail lines and whatever the caller appends.
     if (decisions.length) lines.push("");
@@ -3804,6 +3991,14 @@ export function createDispatcher(
 /** Footer status key, so the line can be replaced and later cleared. */
 const STATUS_KEY = "quota-dispatch";
 
+/**
+ * The rail gauge's own footer key. Separate from STATUS_KEY so the standing
+ * warnings and the gauge are both visible: pi joins every key's text on one
+ * line sorted by key, and this key sorts after STATUS_KEY — so the warning
+ * normally comes first, though another extension's key may sort between them.
+ */
+const GAUGE_STATUS_KEY = "quota-dispatch-gauge";
+
 /** The footer line an unconfigured install carries until its table is filled. */
 const STATUS_TEXT = "quota-dispatcher: no agents configured";
 
@@ -3834,6 +4029,30 @@ function managesNothing(cfg: DispatcherConfig): boolean {
 function setFooterStatus(ctx: ExtensionContext, text: string | undefined): void {
   if (!ctx.hasUI) return;
   ctx.ui.setStatus(STATUS_KEY, text);
+}
+
+/**
+ * The gauge's two tones, taken from pi's theme.
+ *
+ * Read only through a context that has a UI: a headless context has no theme to
+ * ask, and the gauge is never drawn for one.
+ */
+function themeStyle(theme: ExtensionContext["ui"]["theme"]): GaugeStyle {
+  return {
+    dim: (text) => theme.fg("dim", text),
+    warning: (text) => theme.fg("warning", text),
+  };
+}
+
+/**
+ * A drawing failure, in the words the log and the report's warning tail use.
+ *
+ * The gauge is a display, so a footer that cannot be drawn is not a failure of
+ * the pass that read the numbers — but staying silent about it would leave a
+ * missing line unexplained.
+ */
+function gaugeFaultText(fault: { message: string }): string {
+  return `quota-dispatcher: the rail gauge could not be drawn (${fault.message})`;
 }
 
 /**
@@ -4062,6 +4281,22 @@ export function fencedEvaluation<T, R>(
   }, options);
 }
 
+/**
+ * One configuration's live handles: what it loaded, the dispatcher that
+ * evaluates it, the model occurrences it could not use, and the token that says
+ * whether it is still the configuration speaking for the session.
+ *
+ * `bootFrom` builds one; `bootOnce` and a generation swap the whole thing at
+ * once, so the active config and the active owner cannot disagree.
+ */
+interface Runtime {
+  readonly loaded: LoadedConfig;
+  readonly dispatcher: Dispatcher;
+  readonly misses: ModelMiss[];
+  /** Identity only: never printed, never compared for anything but "is this still the active one". */
+  readonly owner: symbol;
+}
+
 export default function (pi: ExtensionAPI) {
   /**
    * Config is resolved once per extension load, and the command reports which
@@ -4097,9 +4332,100 @@ export default function (pi: ExtensionAPI) {
    * way, so the cache is warm by then; a tick with no cached boot at all is a
    * no-op rather than a ctx-less boot.
    */
-  let boot:
-    | Promise<{ loaded: LoadedConfig; dispatcher: Dispatcher; misses: ModelMiss[] }>
-    | undefined;
+  let boot: Promise<Runtime> | undefined;
+
+  /**
+   * The context the gauge draws on. A poll tick has none of its own, so the
+   * session's is held from `session_start` (or the latest command) until
+   * `session_shutdown` — after which pi invalidates it. Read at publish time,
+   * never captured by a pass, so a pass still running across a shutdown draws
+   * nothing.
+   */
+  let footer: ExtensionContext | undefined;
+
+  /**
+   * The runtime allowed to publish. `report` runs outside the evaluation fence,
+   * so a pass begun on a runtime a generation has since replaced can finish
+   * late; its readings and config describe a policy that no longer applies, and
+   * the footer is the one piece of shared state such a pass would otherwise move.
+   */
+  let activeOwner: symbol | undefined;
+
+  /**
+   * The newest pass that has published, and the runtime it belongs to.
+   *
+   * The owner token separates configurations; it does not order the passes of
+   * one of them. `report` and a poll tick overlap on the same dispatcher, and the
+   * one that read first is not the one that finishes first: a poll waiting on an
+   * agent-file lock can publish after a forced refresh whose read failed, and
+   * erase the `?` that failure earned. Every pass carries its own number, so a
+   * snapshot older than the one on screen is dropped.
+   */
+  let published: { readonly owner: symbol; readonly seq: number } | undefined;
+
+  /** The last display failure, held for the report until a draw succeeds. */
+  let gaugeFault: { readonly message: string } | undefined;
+
+  /**
+   * The gauge's one write on a live context, and its error boundary.
+   *
+   * The text is a thunk because reading the theme is fallible too: pi throws
+   * from a context's getters once its session has been replaced, and a clear
+   * must not have to ask. Every call site is inside this handler — a pass's
+   * redraw, and the explicit clears at session start, on a generation and at
+   * shutdown — so a footer sink that throws is recorded where warnings go (the
+   * log and the report's warning tail) instead of becoming the failure of the
+   * pass or the lifecycle event that happened to draw.
+   */
+  const drawGauge = (ctx: ExtensionContext, text: () => string | undefined): void => {
+    try {
+      // `hasUI` first: a headless context's `ui` and `theme` are never touched.
+      if (!ctx.hasUI) return;
+      ctx.ui.setStatus(GAUGE_STATUS_KEY, text());
+      gaugeFault = undefined;
+    } catch (err) {
+      gaugeFault = { message: errorText(err) };
+      console.error(gaugeFaultText(gaugeFault));
+    }
+  };
+
+  /** A clear is a drawing of nothing, so it is guarded exactly like one. */
+  const clearGauge = (ctx: ExtensionContext): void => drawGauge(ctx, () => undefined);
+
+  /**
+   * Clear the gauge through the context passes draw on, not through the context
+   * of the command that asked for it.
+   *
+   * A generation outlives the command that started it, so it can finish after a
+   * `session_shutdown`. Drawing the clear on that command's context would ask pi
+   * for a session it has already dropped, and log a fault for a line that is
+   * already gone.
+   */
+  const clearLiveGauge = (): void => {
+    const ctx = footer;
+    if (ctx !== undefined) clearGauge(ctx);
+  };
+
+  /**
+   * Draw the footer's rail gauge from a pass's readings, or drop the attempt.
+   *
+   * Three guards, each for a way the footer could otherwise be written by
+   * something that no longer speaks for the session: only the active runtime may
+   * publish, only a snapshot newer than the one on screen, and only while a live
+   * context exists.
+   */
+  const publishGauge = (owner: symbol, cfg: DispatcherConfig, pass: PassReadings): void => {
+    if (owner !== activeOwner) return;
+    if (published !== undefined && published.owner === owner && pass.seq < published.seq) return;
+    published = { owner, seq: pass.seq };
+    const ctx = footer;
+    if (ctx === undefined) return;
+    drawGauge(ctx, () =>
+      cfg.railGauge
+        ? railGauge({ readings: pass.readings, cfg, now: pass.now, style: themeStyle(ctx.ui.theme) })
+        : undefined,
+    );
+  };
 
   /**
    * Build the runtime a validated configuration implies: read the agent dir,
@@ -4111,10 +4437,11 @@ export default function (pi: ExtensionAPI) {
    * for the caches to swap in once the file has moved. It writes neither the
    * config file nor an agent file.
    */
-  const bootFrom = async (
-    base: LoadedConfig,
-    ctx: ExtensionContext,
-  ): Promise<{ loaded: LoadedConfig; dispatcher: Dispatcher; misses: ModelMiss[] }> => {
+  const bootFrom = async (base: LoadedConfig, ctx: ExtensionContext): Promise<Runtime> => {
+    // Each runtime draws with its own config's routes, thresholds and switch —
+    // but only while its owner is the active one, so a pass that outlived a
+    // generation cannot repaint the footer with a policy that no longer applies.
+    const owner = Symbol("runtime");
     const directory = await readAgentDirectory(base.config.agentDir);
     // Both checks join the load warnings, so the log, the report's warning
     // tail and `describeConfig` carry them: the agent-file check first, in the
@@ -4134,6 +4461,10 @@ export default function (pi: ExtensionAPI) {
       dispatcher: createDispatcher(checked.config, {
         held: checked.held,
         droppedAlternates: checked.droppedAlternates,
+        // The one place a pass's readings reach the footer. Handed after the
+        // pass's decisions and writes, so the gauge observes the policy rather
+        // than taking part in it.
+        onReadings: (pass) => publishGauge(owner, checked.config, pass),
         // Feature-detected, and never called at boot: an expired Antigravity
         // token is the only thing that reaches it. Both the initial dispatcher
         // and one built after a generation are made here, so both get it.
@@ -4143,10 +4474,26 @@ export default function (pi: ExtensionAPI) {
       // surface. Rendered lines would have to be read back apart to be listed
       // as a warning, which is the work `checkModels` already did.
       misses: checked.misses,
+      owner,
     };
   };
 
-  const bootOnce = (ctx: ExtensionContext) => (boot ??= loadedOnce().then((base) => bootFrom(base, ctx)));
+  const bootOnce = (ctx: ExtensionContext) => {
+    if (boot === undefined) {
+      const pending = loadedOnce()
+        .then((base) => bootFrom(base, ctx))
+        .then((runtime) => {
+          // `runGenerate` awaits this boot through its generator's `input`
+          // callback before it can swap, so today this always holds. It guards a
+          // future caller that swaps the runtime without awaiting the boot:
+          // only the boot that is still current may own the footer.
+          if (boot === pending) activeOwner = runtime.owner;
+          return runtime;
+        });
+      boot = pending;
+    }
+    return boot;
+  };
 
   let timer: ReturnType<typeof setInterval> | undefined;
   let stopped = false;
@@ -4248,8 +4595,19 @@ export default function (pi: ExtensionAPI) {
       // that work is done — or once it fails.
       loadedPromise = Promise.resolve(result.loaded);
       boot = Promise.resolve(result.prepared);
+      // Activated before the new evaluation, so that evaluation — and only it —
+      // is what draws the footer from here on.
+      activeOwner = result.prepared.owner;
       try {
         cadenceFromGeneration = true;
+        // Only a layer that can never draw takes the old line down here: one that
+        // can draw replaces it from its first pass, and clearing first would
+        // blank the footer for the length of that pass. "Never" covers both ways
+        // a layer draws nothing — the gauge off, and an empty table whose
+        // evaluation is skipped, so no pass publishes at all.
+        if (!result.prepared.loaded.config.railGauge || managesNothing(result.prepared.loaded.config)) {
+          clearLiveGauge();
+        }
         scheduleTimer(result.prepared.loaded.config);
         // The footer is a statement about the install, and generation can change
         // it: the table may now be configured, or a model this pi does not know
@@ -4276,6 +4634,11 @@ export default function (pi: ExtensionAPI) {
             : await result.prepared.dispatcher.evaluate();
           lines.push(...rows.flatMap((r) => describeDecisionLines(r.decision, r.outcome)));
         } catch (err) {
+          // A failed pass publishes nothing, so the superseded drawing is still
+          // there with nothing coming to replace it: retract it. Unless the new
+          // runtime has already published — an unfenced `report` under the new
+          // owner can draw a line this layer does describe.
+          if (published?.owner !== result.prepared.owner) clearLiveGauge();
           // The file moved and the caches swapped; a failure here cannot undo
           // that, so it is reported as a note rather than as an unchanged state.
           note = `the configuration was activated, but evaluating it once failed (${errorText(err)})`;
@@ -4309,6 +4672,11 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(unknownFormNotice(invocation.arg).join("\n"), "warning");
         return;
       }
+
+      // The context the gauge draws on for every form below. Set after the typo
+      // return, so a typo changes nothing at all: an unknown form reads no
+      // config, boots nothing and touches no footer.
+      footer = ctx;
 
       // Generation runs the declared command and replaces one file, so it is
       // answered before the ordinary boot: it prepares its *own* runtime from the
@@ -4353,11 +4721,15 @@ export default function (pi: ExtensionAPI) {
         // and `config` is the form that answers it. The warnings stay because a
         // config that is not doing what the user meant has to say so on the run
         // that read it, whichever form that was.
+        const report = await dispatcher.report({ force: invocation.force });
         lines = [
-          ...(await dispatcher.report({ force: invocation.force })),
+          ...report,
           "",
           describeConfigLayers(loaded),
           ...describeConfigWarnings(loaded),
+          // The report's own pass published first, so this reflects the latest
+          // drawing attempt; a successful one clears the fault again.
+          ...(gaugeFault === undefined ? [] : [`  warning: ${gaugeFaultText(gaugeFault)}`]),
         ];
       }
 
@@ -4385,12 +4757,15 @@ export default function (pi: ExtensionAPI) {
   // what keeps this handler's promise: unlike a poll tick, the session's first
   // spawn is held on this evaluation.
   pi.on("session_start", async (event, ctx) => {
+    footer = ctx;
     await fencedEvaluation(
       fence,
       () => bootOnce(ctx),
       async ({ loaded, misses, dispatcher }) => {
         if (managesNothing(loaded.config)) {
+          // Nothing is routed, so no capped rail is named and the gauge is empty.
           await announceUnconfigured(loaded, ctx, event.reason);
+          clearGauge(ctx);
           return;
         }
 
@@ -4433,7 +4808,16 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event, ctx) => {
     stopped = true;
     if (timer) clearInterval(timer);
-    setFooterStatus(ctx, undefined);
+    // Dropped before any fallible UI call: pi throws from a context's getters
+    // once the session it belongs to has been replaced, so a pass still in
+    // flight must find no context to draw on whatever the sinks below do.
+    footer = undefined;
+    try {
+      setFooterStatus(ctx, undefined);
+    } finally {
+      // In a `finally`, so a warning sink that throws still clears the gauge.
+      clearGauge(ctx);
+    }
   });
 
   // An explicit `/skill:<name>` applies its binding before pi expands the skill:

@@ -96,6 +96,7 @@ function base(): ConfigBase {
     sessionSwitchAt: 75,
     weeklySwitchAt: 90,
     margin: 10,
+    railGauge: true,
     models: {},
     skills: {},
     agents: {
@@ -135,6 +136,7 @@ test("defaultConfig documents the scalar defaults", () => {
   assert.equal(c.sessionSwitchAt, 75);
   assert.equal(c.weeklySwitchAt, 90);
   assert.equal(c.margin, 10);
+  assert.equal(c.railGauge, true);
 });
 
 // No agent is managed until the configuration names it, so a fresh install
@@ -669,6 +671,39 @@ test("mergeConfig warns and keeps the previous value for a wrong-typed scalar", 
   assert.equal(r.config.sessionSwitchAt, 75);
   assert.equal(r.sources.sessionSwitchAt, "built-in");
   assert.ok(r.warnings.some((w) => w.includes("sessionSwitchAt")), r.warnings.join("\n"));
+});
+
+// The gauge is the one scalar that is on/off rather than a number or a name, so
+// it is validated as a boolean and printed as one line of provenance.
+test("railGauge ships on and is shown in provenance", async () => {
+  assert.equal(base().railGauge, true);
+  const loaded = await loadConfig({ agentDir: AGENT_DIR, cwd: CWD, readFile: fakeFs({}).readFile, warn: () => {} });
+  assert.ok(
+    describeConfig(loaded).includes("  railGauge = true  [built-in]"),
+    describeConfig(loaded).join("\n"),
+  );
+});
+
+test("a project file can turn the rail gauge off over a global on", () => {
+  const r = mergeConfig(base(), [
+    { source: "global", data: { railGauge: true } },
+    { source: "project", data: { railGauge: false } },
+  ]);
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.config.railGauge, false);
+  assert.equal(r.sources.railGauge, "project");
+});
+
+test("a railGauge that is not a boolean warns and keeps the lower value", () => {
+  for (const wrong of ["yes", 1, null]) {
+    const r = mergeConfig(base(), [{ source: "project", data: { railGauge: wrong } }]);
+    assert.equal(r.config.railGauge, true, `for ${String(wrong)}`);
+    assert.equal(r.sources.railGauge, "built-in", `for ${String(wrong)}`);
+    assert.ok(
+      r.warnings.some((w) => w.includes('"railGauge" must be true or false')),
+      `for ${String(wrong)}: ${r.warnings.join("\n")}`,
+    );
+  }
 });
 
 test("mergeConfig applies claudeCredsPath but rejects the agent-dir-owned path scalars", () => {
