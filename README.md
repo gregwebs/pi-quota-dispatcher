@@ -224,15 +224,16 @@ One footer line, kept between reports, showing how much of each budget is used o
 the rails this install actually routes on:
 
 ```
-claude 13/91↻4d │ codex 74↻2h/41 │ ag-argon –/62
+claude 13,2h/91,4d │ codex 74,2h/41 │ ag-argon –/62,6d
 ```
 
-Each rail is `label session/weekly`, each budget a whole percent used, and the
-rails are separated by ` │ `. The rails are exactly the **capped** rails some
-effective route names — the ones the dispatcher reads a budget for — so a route
-table that never names Claude never shows Claude, and a **metered** rail is left
-out because it has no budget at all. Labels are fixed and short: `claude`,
-`codex`, `ag-3p`, `ag-gemini`, `ag-argon`.
+Each rail is `label session/weekly`, each budget a whole percent used followed by
+the time left until it resets — `45m`, `3h`, `4d`, or `now` once the vendor's
+reset instant has passed. The rails are separated by ` │ `. The rails
+are exactly the **capped** rails some effective route names — the ones the
+dispatcher reads a budget for — so a route table that never names Claude never
+shows Claude, and a **metered** rail is left out because it has no budget at all.
+Labels are fixed and short: `claude`, `codex`, `ag-3p`, `ag-gemini`, `ag-argon`.
 
 Rails are ordered **most-used first**: the sort key is the rail's highest budget
 percentage, compared before rounding, so two rails that both print `74` still
@@ -241,22 +242,28 @@ sorts by its last good reading, and a rail with no number at all goes last.
 
 | What the slot shows | Meaning |
 |---|---|
-| `62` | Whole percent used. Every character except a tight slot is dim. |
-| `–` | A budget this rail does not have. Argon has no session cap, so `ag-argon –/62` |
+| `62,6d` | Whole percent used, and the time left until it resets. Every character except a tight slot is dim. |
+| `62` | The vendor reported no reset for the window carrying that figure, so there is no countdown. |
+| `–` | A budget this rail does not have. Argon has no session cap, so `ag-argon –/62,6d` |
 | `?` in a slot | The rail has that budget and the read did not report it — a partial reading, not a free budget |
-| `<74↻2h>` (warning color shown as `<…>`) | **Tight**: at or above `sessionSwitchAt` (session) or `weeklySwitchAt` (weekly), so it is drawn in the warning color with the time left until it resets — `45m`, `3h`, `4d` |
-| `74/41?` | The latest read failed, so the **last good reading** is shown, dimmed throughout with a trailing `?` |
+| `<74,2h>` (warning color shown as `<…>`) | **Tight**: at or above `sessionSwitchAt` (session) or `weeklySwitchAt` (weekly), so figure and countdown are drawn in the warning color |
+| `74/41?` | The latest read failed, so the **last good reading** is shown, dimmed throughout with a trailing `?` and with no countdowns |
 | `ag-3p ?` | Nothing has ever been read for this rail |
 
-A tight budget whose reset the vendor did not report — or one of whose tight
-windows has none — is shown in the warning color **without** a `↻`. Inventing a
-duration would be a lie about the one thing a tight budget makes you want to
-know, and a budget stays tight until the last of its tight windows has reset, so
-one unknown window is enough to make the whole countdown unknown.
+The countdown answers two slightly different questions, because that is what the
+two cases ask. On a comfortable budget it is when the figure **drops**, which is
+when the window holding the highest percentage resets — the latest of them, if
+several windows hold it. On a tight budget it is when the budget **stops being
+tight**, which is the latest reset among the windows that crossed the threshold.
+A countdown the vendor did not report — a window with no reset instant, or one of
+several such windows on a budget — is dropped rather than guessed: inventing a
+duration would be a lie about the one thing the figure makes you want to know.
 
 A stale rail is shown, never judged: the policy **holds** on a rail whose read
 failed, so there is no decision to display and its numbers are dim even when they
-are past a threshold.
+are past a threshold. It also carries no countdown — its last good reading's
+reset instant counts from a moment that has passed, so a duration computed from
+it would look fresh about a figure that is not.
 
 The gauge draws only readings the evaluation already holds. It never causes a
 request of its own, so it costs nothing to keep on screen. It is redrawn after

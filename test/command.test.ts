@@ -143,13 +143,25 @@ const DEFAULT_READINGS: RailReadings = {
 /**
  * The reset instants the stub's Antigravity body reports.
  *
- * Fixed rather than computed from `Date.now()`, because a test asserts the pool's
- * projected `resetsAt` exactly: an instant derived at response time can land a
- * millisecond after the reading's own `readAt`, which would make the assertion
- * depend on how long the fetch took rather than on the projection being right.
+ * Offsets from the clock rather than calendar dates, because the gauge prints how
+ * long is left, so a fixed date would make these tests read differently every
+ * day — `6d` today, `1d` next week, `now` next month. The offset is taken once at
+ * load rather than at response time: an instant derived per response can land a
+ * millisecond after the reading's own `readAt`, which would make the exact
+ * assertion below depend on how long the fetch took rather than on the
+ * projection being right. Taken here, it is the same instant for the whole run
+ * and both sides of that assertion read it.
+ *
+ * Six days is the middle of the `6d` bucket — a coarsest-unit figure rounds to
+ * the nearest day, so the same string comes out anywhere from 5½ to 6½ days, and
+ * twelve hours of slack is what keeps a suspended test process from turning this
+ * into `5d`. The stub's other countdowns are centred the same way: Codex's 432000
+ * seconds is exactly five days, 400000 would have sat three hours from the edge.
  */
-const ANTIGRAVITY_WEEKLY_RESET = "2026-11-05T16:46:22Z";
-const ANTIGRAVITY_SESSION_RESET = "2026-10-29T21:46:22Z";
+const ANTIGRAVITY_WEEKLY_RESET = new Date(Date.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+/** Already past, so the gauge prints `now`: the vendor's own answer for a window
+ * it says has rolled over. */
+const ANTIGRAVITY_SESSION_RESET = new Date(Date.now() - 60 * 60 * 1000).toISOString();
 
 /**
  * One `retrieveUserQuotaSummary` body for those readings: three pools, told
@@ -212,7 +224,7 @@ function stubFetch(overrides: Partial<RailReadings> = {}): typeof fetch {
           rate_limit: {
             limit_reached: false,
             primary_window: { used_percent: r.codexSession, limit_window_seconds: 18000, reset_after_seconds: 3600 },
-            secondary_window: { used_percent: r.codexWeekly, limit_window_seconds: 604800, reset_after_seconds: 400000 },
+            secondary_window: { used_percent: r.codexWeekly, limit_window_seconds: 604800, reset_after_seconds: 432000 },
           },
         }),
       };
@@ -1325,7 +1337,7 @@ test("a generator reading stdin receives every rail's reading in the documented 
   assert.equal(new Date(readAt).toISOString(), codex.readAt, "readAt must be ISO 8601 UTC");
   assert.ok(before <= readAt && readAt <= after, `readAt ${codex.readAt} is not the time of this run's read`);
   assert.equal(Date.parse(codex.windows[0].resetsAt) - readAt, 3_600_000);
-  assert.equal(Date.parse(codex.windows[1].resetsAt) - readAt, 400_000_000);
+  assert.equal(Date.parse(codex.windows[1].resetsAt) - readAt, 432_000_000);
   assert.equal(codex.raw.rate_limit.primary_window.used_percent, 10);
   assert.ok(!("latestFailure" in codex));
 
@@ -1725,7 +1737,7 @@ test("refresh forces a re-fetch while the plain form reuses the cache", async ()
           rate_limit: {
             limit_reached: false,
             primary_window: { used_percent: codexSession, limit_window_seconds: 18000, reset_after_seconds: 3600 },
-            secondary_window: { used_percent: 0, limit_window_seconds: 604800, reset_after_seconds: 400000 },
+            secondary_window: { used_percent: 0, limit_window_seconds: 604800, reset_after_seconds: 432000 },
           },
         }),
       };
@@ -3642,7 +3654,8 @@ const ALL_RAILS_AGENTS = {
  * That table names `deepseek` as well, so the absence of the metered rail is part
  * of this expected text rather than a separate assertion about the constant.
  */
-const ALL_RAILS_GAUGE = "claude <90>/0 │ ag-3p 30/0 │ ag-gemini 20/0 │ codex 10/0 │ ag-argon –/0";
+const ALL_RAILS_GAUGE =
+  "claude <90>/0 │ ag-3p 30,now/0,6d │ ag-gemini 20,now/0,6d │ codex 10,1h/0,5d │ ag-argon –/0,6d";
 
 test("the rail gauge is drawn at session start, most-used first", async () => {
   const fx = await fixture(MAX_POLL_MS, ALL_RAILS_AGENTS);
@@ -3663,7 +3676,7 @@ test("a tight codex session shows its reset duration", async () => {
       await sessionStart("startup");
       // The stub reports `reset_after_seconds: 3600` relative to the read, so the
       // duration is pinned without pinning the instant it was read at.
-      assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex <80↻1h>/0");
+      assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex <80,1h>/0,5d");
     },
     () => stubFetch({ codexSession: 80 }),
   );
@@ -3743,12 +3756,12 @@ test("generate redraws the gauge from the new configuration, and never blanks it
     // One draw for each layer: the start's, and the new runtime's own pass.
     assert.equal(drawn().length, 2, JSON.stringify(statuses));
     // The generated layer routes on codex and claude, so both are named.
-    assert.equal(drawn().at(-1)?.text, "claude <90>/0 │ codex 10/0");
+    assert.equal(drawn().at(-1)?.text, "claude <90>/0 │ codex 10,1h/0,5d");
     // This layer can draw, so the swap owes it no clear: a blank status here is the
     // footer going empty until the new runtime's first pass publishes.
     assert.deepEqual(
       gaugeStatuses(statuses.slice(mark)),
-      [{ key: GAUGE_KEY, text: "claude <90>/0 │ codex 10/0" }],
+      [{ key: GAUGE_KEY, text: "claude <90>/0 │ codex 10,1h/0,5d" }],
       JSON.stringify(statuses.slice(mark)),
     );
   });
@@ -3823,7 +3836,7 @@ test("a poll tick redraws the gauge, and shutdown clears it", async (t) => {
 // footer is the one piece of shared state such a pass could move, and the owner
 // token is what stops it.
 for (const [label, layer, expected] of [
-  ["a layer routing only on codex", { agents: { planner: { primary: { model: "openai-codex/gpt-6-sol", rail: "codex" } } } }, "codex 10/0"],
+  ["a layer routing only on codex", { agents: { planner: { primary: { model: "openai-codex/gpt-6-sol", rail: "codex" } } } }, "codex 10,1h/0,5d"],
   ["a layer that turns the gauge off", { railGauge: false, agents: GENERATED_LAYER.agents }, undefined],
   ["a layer that empties the table", { agents: {} }, undefined],
 ] as const) {
@@ -3835,7 +3848,7 @@ for (const [label, layer, expected] of [
       fx,
       async ({ invoke, run, statuses, sessionStart }) => {
         await sessionStart("startup");
-        assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex 10/0");
+        assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex 10,1h/0,5d");
 
         // Hold the old runtime's forced Claude read in flight, so it is
         // guaranteed to finish after the generation below.
@@ -4062,7 +4075,7 @@ test("a warning sink that throws at shutdown still clears the gauge, and the rel
     fx,
     async ({ statuses, sessionStart, shutdown }) => {
       await sessionStart("startup");
-      assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex 10/0");
+      assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex 10,1h/0,5d");
 
       gate.arm();
       const resumed = sessionStart("resume");
@@ -4144,7 +4157,7 @@ test("a pass that read earlier cannot publish over a later failed read", async (
     fx,
     async ({ invoke, statuses, sessionStart }) => {
       await sessionStart("startup");
-      assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex 10/0");
+      assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex 10,1h/0,5d");
 
       // Back to the primary for both, so this pass decides a switch for each.
       await writeFile(fx.plannerFile, TEMPLATE("planner", "claude-bridge/claude-opus-5-5"), "utf8");
@@ -4177,7 +4190,7 @@ test("a pass that read earlier cannot publish over a later failed read", async (
         await invoke("refresh");
         assert.equal(
           gaugeStatuses(statuses).at(-1)?.text,
-          "claude 90/0? │ codex 10/0",
+          "claude 90/0? │ codex 10,1h/0,5d",
           "the failed read is drawn stale",
         );
       } finally {
@@ -4190,7 +4203,7 @@ test("a pass that read earlier cannot publish over a later failed read", async (
       // ...and its older snapshot did not erase the stale marker.
       assert.equal(
         gaugeStatuses(statuses).at(-1)?.text,
-        "claude 90/0? │ codex 10/0",
+        "claude 90/0? │ codex 10,1h/0,5d",
         JSON.stringify(statuses),
       );
     },
@@ -4229,7 +4242,7 @@ for (const [label, layer] of [
 
     await withExtension(fx, async ({ run, sessionStart, statuses }) => {
       await sessionStart("startup");
-      assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex 10/0");
+      assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex 10,1h/0,5d");
 
       // Back to the primary, so the new layer's first pass has a write to make.
       await writeFile(fx.plannerFile, TEMPLATE("planner", "claude-bridge/claude-opus-5-5"), "utf8");
