@@ -232,11 +232,12 @@ _Avoid_: output, status, summary, dump
 
 **Rail gauge**:
 The one line the footer holds between **reports**: each capped rail some route
-names, with how much of each of its budgets is used, a **tight** budget marked,
-with its reset when the vendor reports one. It shows readings and tightness,
-never decisions, and is drawn from the readings an evaluation already made — it
-never causes a read. A rail whose latest read failed shows its **last good
-reading** marked stale. A **metered** rail has no budgets and is left out.
+names, with how much of each of its budgets is used and how long is left until
+it resets, a **tight** budget marked in the warning color. It shows
+readings and tightness, never decisions, and is drawn from the readings an
+evaluation already made — it never causes a read. A rail whose latest read
+failed shows its **last good reading** marked stale, and no countdown for it. A
+**metered** rail has no budgets and is left out.
 _Avoid_: status line, footer status, usage widget, quota bar
 
 **Provenance**:

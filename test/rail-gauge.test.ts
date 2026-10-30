@@ -116,7 +116,7 @@ test("renders the spec's example line", () => {
     ["antigravity-argon", ok(good("antigravity-argon", [weekly(62)]))],
     ["deepseek", { latest: { rail: "deepseek", ok: true, metered: true, windows: [], note: "metered" } }],
   );
-  assert.equal(gauge(map), "claude 13/<91↻4d> │ codex <74↻2h>/41 │ ag-argon –/62");
+  assert.equal(gauge(map), "claude 13/<91,4d> │ codex <74,2h>/41 │ ag-argon –/62");
 });
 
 test("orders most-used first", () => {
@@ -173,10 +173,46 @@ test("orders on the raw figure and prints the rounded one", () => {
 test("the threshold is tight at equality and not one hundredth below it", () => {
   const cfg = { ...cfgNaming(["claude"]), sessionSwitchAt: 70 };
   const at = readings(["claude", ok(good("claude", [session(70, NOW + HOUR), weekly(0)]))]);
-  assert.equal(gauge(at, cfg), "claude <70↻1h>/0");
+  assert.equal(gauge(at, cfg), "claude <70,1h>/0");
 
+  // The same figure one hundredth below the threshold is not tight, and still
+  // carries the countdown: the tone says how alarming it is, the countdown says
+  // when it moves, and the second is worth as much at 69% as at 70%.
   const below = readings(["claude", ok(good("claude", [session(69.99, NOW + HOUR), weekly(0)]))]);
-  assert.equal(gauge(below, cfg), "claude 70/0");
+  assert.equal(gauge(below, cfg), "claude 70,1h/0");
+});
+
+test("a comfortable budget shows when its figure drops", () => {
+  const cfg = cfgNaming(["claude"]);
+  const map = readings(["claude", ok(good("claude", [session(42, NOW + 3 * HOUR), weekly(11, NOW + 6 * DAY)]))]);
+  assert.equal(gauge(map, cfg), "claude 42,3h/11,6d");
+});
+
+test("a comfortable budget spread over windows moves when the last maximum does", () => {
+  // The figure printed is the highest of the windows, so it drops when the
+  // window holding that maximum resets — not when a lower one does, and not
+  // when the earliest of two equal maxima does.
+  const cfg = cfgNaming(["claude"]);
+  const map = readings([
+    "claude",
+    ok(
+      good("claude", [
+        weekly(30, NOW + 30 * MINUTE),
+        weekly(42, NOW + 2 * DAY),
+        weekly(42, NOW + 4 * DAY),
+      ]),
+    ),
+  ]);
+  assert.equal(gauge(map, cfg), "claude ?/42,4d");
+});
+
+test("one maximum-holding window with no reset leaves the countdown unknown", () => {
+  const cfg = cfgNaming(["claude"]);
+  const map = readings([
+    "claude",
+    ok(good("claude", [session(0), weekly(42, NOW + 2 * DAY), weekly(42)])),
+  ]);
+  assert.equal(gauge(map, cfg), "claude 0/42");
 });
 
 test("a tight budget with no reported reset is colored and carries no arrow", () => {
@@ -200,7 +236,21 @@ test("a budget's reset is the latest among its tight windows", () => {
       ]),
     ),
   ]);
-  assert.equal(gauge(map, cfg), "claude 0/<95↻4d>");
+  assert.equal(gauge(map, cfg), "claude 0/<95,4d>");
+});
+
+test("a tight budget counts down to its last tight window, not to its highest", () => {
+  // The tight rule is about the decision, and the decision stays made until the
+  // *last* window above the threshold resets. A comfortable budget's rule is
+  // about the figure, which moves when the highest window does. The two are
+  // deliberately different, and a shared helper once collapsed them: this pins
+  // the case where the highest window resets first.
+  const cfg = { ...cfgNaming(["claude"]), weeklySwitchAt: 90 };
+  const map = readings([
+    "claude",
+    ok(good("claude", [session(0), weekly(92, NOW + 6 * DAY), weekly(95, NOW + 2 * DAY)])),
+  ]);
+  assert.equal(gauge(map, cfg), "claude 0/<95,6d>");
 });
 
 test("one tight window with no reset makes the whole budget's reset unknown", () => {
@@ -223,7 +273,11 @@ test("a budget the rail does not carry reads as absent, one it did not report as
 
 test("a failed read with a last good reading is drawn stale, dim and unjudged", () => {
   const cfg = { ...cfgNaming(["codex"]), sessionSwitchAt: 70 };
-  const good61 = good("codex", [session(74), weekly(41)]);
+  // The last good reading knows both its resets: they are the ones the countdown
+  // would print, and they are deliberately not printed. They count from a moment
+  // that has passed, so a duration computed from them is a fresh-looking number
+  // about a reading that is no longer fresh — the `?` is the whole truth here.
+  const good61 = good("codex", [session(74, NOW + 2 * HOUR), weekly(41, NOW + 5 * DAY)]);
   const map = readings(["codex", { latest: failed("codex"), lastGood: good61 }]);
   // 74 is past the threshold, and yet nothing is colored or given a reset: the
   // policy holds on this rail, so there is no judgment to draw.
@@ -243,7 +297,7 @@ test("a tie between a stale rail and a fresh one keeps the fixed order", () => {
   // The sort key is a number either way, so a stale rail that ties a fresh one
   // must fall back to the fixed order rather than being pushed behind every
   // fresh rail. Observed in a live session before this was pinned: a stale
-  // `codex 95/97?` printed before a fresh `ag-3p 97↻5h/51`. The stale rail's
+  // `codex 95/97?` printed before a fresh `ag-3p 97,5h/51`. The stale rail's
   // numbers are past both thresholds here and still print uncolored, which is
   // the same rule from the other side.
   const cfg = cfgNaming(["codex", "antigravity-3p"]);
@@ -307,7 +361,7 @@ test("the tie order does not depend on the order the entries arrive in", () => {
   const entry = (rail: VendorRail): GaugeEntry => ({
     rail,
     kind: "fresh",
-    session: { kind: "used", used: 50 },
+    session: { kind: "used", used: 50, resetInMs: undefined },
     weekly: { kind: "unreported" },
   });
   const fixed: VendorRail[] = ["claude", "codex", "antigravity-3p", "antigravity-gemini", "antigravity-argon"];
@@ -408,7 +462,7 @@ test("every character outside a tight slot is dim, merged into one run per tone 
   );
   assert.equal(
     gauge(map, EXAMPLE_CFG, TAGGED),
-    "(claude 13/)<91↻4d>( │ codex )<74↻2h>(/41 │ ag-argon –/62)",
+    "(claude 13/)<91,4d>( │ codex )<74,2h>(/41 │ ag-argon –/62)",
   );
 });
 

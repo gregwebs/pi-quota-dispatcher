@@ -48,11 +48,15 @@ export const GAUGE_LABELS: Record<VendorRail, string> = {
  * Argon has no session budget, while a rail that carries one and did not report
  * it told us nothing. Collapsing them would print a missing reading as a free
  * budget — the error `budgetUsed` exists to prevent.
+ *
+ * `resetInMs` is required even when unknown, so a producer has to decide about
+ * the countdown rather than forget it: `undefined` means the vendor reported no
+ * reset for the window carrying the figure, and the slot prints its number alone.
  */
 export type BudgetGauge =
   | { readonly kind: "uncarried" }
   | { readonly kind: "unreported" }
-  | { readonly kind: "used"; readonly used: number }
+  | { readonly kind: "used"; readonly used: number; readonly resetInMs: number | undefined }
   | { readonly kind: "tight"; readonly used: number; readonly resetInMs: number | undefined };
 
 /**
@@ -61,8 +65,17 @@ export type BudgetGauge =
  * The policy holds on a rail whose latest read failed, so there is no judgment to
  * display — and coloring a number that no longer decides anything as tight would
  * suggest one.
+ *
+ * It has no countdown arm either, spelled out rather than derived. A stale
+ * reading's `resetsAt` came from a read that is already old, so subtracting the
+ * clock from it yields a duration that looks fresh about a figure that is not;
+ * leaving the countdown out of the type is what makes that unrepresentable here,
+ * rather than a rule the renderer has to remember.
  */
-export type StaleBudgetGauge = Exclude<BudgetGauge, { kind: "tight" }>;
+export type StaleBudgetGauge =
+  | { readonly kind: "uncarried" }
+  | { readonly kind: "unreported" }
+  | { readonly kind: "used"; readonly used: number };
 
 /** One rail as the gauge draws it. `unread` is a rail with no number at all. */
 export type GaugeEntry =
@@ -90,8 +103,14 @@ export interface GaugeStyle {
 const GAUGE_SEPARATOR = " │ ";
 /** U+2013, a budget the rail does not have. */
 const ABSENT = "–";
-/** U+21BB, "resets": the time left until the tight budget clears. */
-const RESET = "↻";
+/**
+ * What stands between a budget's figure and the time left until it resets.
+ *
+ * A comma rather than an arrow because the figure is now always followed by its
+ * countdown, and an arrow on every slot is a glyph repeated five times a line —
+ * noise where the line should be numbers.
+ */
+const RESET_DELIMITER = ",";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -172,33 +191,45 @@ function budgetTokens(budget: StaleBudgetGauge): Token[] {
 }
 
 /**
- * One budget slot's tokens: the number, and for a tight one the reset it clears
- * at. `↻` is dropped rather than guessed when the vendor reported no reset — a
- * made-up duration would be a lie about the one thing a tight budget makes the
- * reader want to know.
+ * One budget slot's tokens: the figure, and the time left until it resets.
+ *
+ * The countdown is dropped rather than guessed when the vendor reported no reset
+ * — a made-up duration would be a lie about the one thing the figure makes the
+ * reader want to know — and a tight slot draws figure and countdown together in
+ * the warning color, so "when does this clear" is answered without the eye
+ * hunting for a second figure.
  */
 function slotTokens(budget: BudgetGauge): Token[] {
   switch (budget.kind) {
     case "tight":
-      return [
-        {
-          text: budget.resetInMs === undefined ? whole(budget.used) : `${whole(budget.used)}${RESET}${resetText(budget.resetInMs)}`,
-          tone: "warning",
-        },
-      ];
+      return [{ text: figure(budget), tone: "warning" }];
+    case "used":
+      return [{ text: figure(budget), tone: "dim" }];
     default:
       return budgetTokens(budget);
   }
 }
 
+/** A reported figure and, when one is known, its countdown: `74`, or `74,2h`. */
+function figure(budget: { readonly used: number; readonly resetInMs: number | undefined }): string {
+  const countdown = budget.resetInMs === undefined ? "" : `${RESET_DELIMITER}${resetText(budget.resetInMs)}`;
+  return `${whole(budget.used)}${countdown}`;
+}
+
 function entryTokens(entry: GaugeEntry): Token[] {
   const label = GAUGE_LABELS[entry.rail];
   if (entry.kind === "unread") return [{ text: `${label} ?`, tone: "dim" }];
+  // A stale entry is drawn through `budgetTokens`, which has no countdown arm to
+  // reach for: its budgets are of the type that cannot carry one.
+  const [session, weekly] =
+    entry.kind === "stale"
+      ? [budgetTokens(entry.session), budgetTokens(entry.weekly)]
+      : [slotTokens(entry.session), slotTokens(entry.weekly)];
   const tokens: Token[] = [
     { text: `${label} `, tone: "dim" },
-    ...slotTokens(entry.session),
+    ...session,
     { text: "/", tone: "dim" },
-    ...slotTokens(entry.weekly),
+    ...weekly,
   ];
   if (entry.kind === "stale") tokens.push({ text: "?", tone: "dim" });
   return tokens;

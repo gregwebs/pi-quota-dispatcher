@@ -1044,6 +1044,15 @@ function gaugedRails(cfg: DispatcherConfig): VendorRail[] {
  *
  * Tightness is the policy's own test (`used >= thresholdFor`) on the same raw
  * number, so a budget the policy calls tight cannot print as comfortable.
+ *
+ * Both arms carry a countdown, because the footer answers "how much" and "for
+ * how long" for every figure it prints, not only the alarming ones. The two ask
+ * different questions, though, which is why each selects its own windows: a
+ * comfortable budget's countdown is when its figure *drops*, which is when the
+ * window holding the maximum resets, while a tight budget's is when the budget
+ * *stops being tight*, which is the latest reset among the windows that crossed
+ * the threshold — a 92% window clearing in six days keeps the budget tight for
+ * six days even when a 95% window above it clears in two.
  */
 function freshBudget(
   reading: GoodReading,
@@ -1054,20 +1063,41 @@ function freshBudget(
   const used = budgetUsed(reading, budget);
   if (used === undefined) return { kind: "unreported" };
   const threshold = thresholdFor(budget, context.cfg);
-  if (used < threshold) return { kind: "used", used };
+  const windows = reading.windows.filter((window) => window.budget === budget);
+  if (used < threshold) {
+    const holders = windows.filter((window) => window.used === used);
+    return { kind: "used", used, resetInMs: latestResetIn(holders, context.now) };
+  }
   // The budget stays tight until every window holding it at or past the
   // threshold has reset, so the latest such reset is the honest one — and one
   // tight window with no reset makes the whole budget's reset unknown: the other
   // windows' countdowns say nothing about when that one clears.
-  const tight = reading.windows.filter((window) => window.budget === budget && window.used >= threshold);
-  const resets = tight.map((window) => window.resetsAt);
-  const resetInMs = resets.every((at): at is number => at !== undefined)
-    ? Math.max(...resets) - context.now
-    : undefined;
-  return { kind: "tight", used, resetInMs };
+  const tight = windows.filter((window) => window.used >= threshold);
+  return { kind: "tight", used, resetInMs: latestResetIn(tight, context.now) };
 }
 
-/** A stale reading's budget: a number, or the reason there is none. Never a judgment. */
+/**
+ * The latest reset among `windows`, or `undefined` when that cannot be known.
+ *
+ * What the windows mean is the caller's business: this only answers "when is the
+ * last of these done", and the two callers select different sets for their
+ * different questions. One window with no reset instant makes the whole answer
+ * unknown — the others' countdowns say nothing about when that one clears — and
+ * an empty set is unknown too, since there is nothing to count down.
+ */
+function latestResetIn(windows: readonly RailWindow[], now: number): number | undefined {
+  const resets = windows.map((window) => window.resetsAt);
+  if (!resets.length || !resets.every((at): at is number => at !== undefined)) return undefined;
+  return Math.max(...resets) - now;
+}
+
+/**
+ * A stale reading's budget: a number, or the reason there is none. Never a judgment,
+ * and never a countdown: `resetsAt` was read at a moment now past, so subtracting
+ * the clock from it would print a duration for a window whose figure is already
+ * old, and one that looks fresh. `?` says the reading is stale; a countdown would
+ * argue with it.
+ */
 function staleBudget(reading: GoodReading, budget: Budget): StaleBudgetGauge {
   if (!carries(reading.rail, budget)) return { kind: "uncarried" };
   const used = budgetUsed(reading, budget);
