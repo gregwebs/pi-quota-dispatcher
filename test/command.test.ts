@@ -698,14 +698,7 @@ function tokenRegistry(calls: string[]) {
  */
 test("bootFrom wires pi's provider-token resolver into every dispatcher, and calls it for nothing", async () => {
   const fx = await generateFixture(GENERATED_LAYER);
-  // A generated layer replaces the config file, so it has to name the fixture's
-  // Claude credential itself — otherwise the post-generation evaluation would
-  // read the developer's own `~/.claude`.
-  await writeFile(
-    fx.layerPath,
-    JSON.stringify({ ...GENERATED_LAYER, claudeCredsPath: join(dirname(fx.agentDir), "claude-credentials.json") }),
-    "utf8",
-  );
+  await layerNamesFixtureCredential(fx, GENERATED_LAYER);
   const calls: string[] = [];
   const WIRED = "the pi auth file is not the default one";
   const UNWIRED = "no provider token resolver is available";
@@ -961,6 +954,19 @@ async function generateFixture(
     layerPath,
     marker: join(root, "ran"),
   };
+}
+
+/**
+ * Rewrite the fixture's layer so it names the fixture's Claude credential.
+ *
+ * A generated layer replaces the config file, `claudeCredsPath` included, so a
+ * layer that does not name it sends the post-generation evaluation to the
+ * developer's own `~/.claude` — present on a workstation, absent on CI, and a
+ * test that passes only where it is.
+ */
+async function layerNamesFixtureCredential(fx: GenerateFixture, layer: object): Promise<void> {
+  const claudeCredsPath = join(dirname(fx.agentDir), "claude-credentials.json");
+  await writeFile(fx.layerPath, JSON.stringify({ ...layer, claudeCredsPath }), "utf8");
 }
 
 /** The ordinary config an existing ``/quota-dispatch generate`` invocation produces. */
@@ -3703,6 +3709,7 @@ test("every completed evaluation redraws the gauge", async () => {
 
 test("generate redraws the gauge from the new configuration, and never blanks it in between", async () => {
   const fx = await generateFixture(GENERATED_LAYER);
+  await layerNamesFixtureCredential(fx, GENERATED_LAYER);
 
   await withExtension(fx, async ({ run, sessionStart, statuses }) => {
     const drawn = () => gaugeStatuses(statuses).filter((status) => status.text !== undefined);
@@ -4199,6 +4206,7 @@ for (const [label, layer] of [
       return;
     }
     const fx = await generateFixture(layer);
+    await layerNamesFixtureCredential(fx, layer);
     const agentsDir = join(fx.agentDir, "agents");
 
     await withExtension(fx, async ({ run, sessionStart, statuses }) => {
