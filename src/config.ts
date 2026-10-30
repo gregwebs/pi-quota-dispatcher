@@ -296,6 +296,12 @@ export interface DispatcherConfig {
    */
   sessionAlwaysSwitchAt?: number;
   /**
+   * Whether the footer carries the rail gauge. A boolean rather than a list of
+   * rails: which rails are shown is already decided by the routes, so the only
+   * independent choice is whether to show it at all.
+   */
+  railGauge: boolean;
+  /**
    * Per-model defaults, keyed by `provider/modelId`.
    *
    * A model is named here so that every candidate using it inherits its rail
@@ -405,6 +411,7 @@ const SCALAR_KEYS = [
   "weeklySwitchAt",
   "margin",
   "sessionAlwaysSwitchAt",
+  "railGauge",
 ] as const;
 
 type ScalarKey = (typeof SCALAR_KEYS)[number];
@@ -466,6 +473,16 @@ const ENUM_SCALARS: ReadonlyMap<
   ScalarKey,
   { is: (value: unknown) => value is string; list: string }
 > = new Map([["claudeRefresh", { is: isClaudeRefreshMode, list: CLAUDE_REFRESH_MODE_LIST }]]);
+
+/**
+ * Scalars that are an on/off switch rather than a string or a number.
+ *
+ * A set, and a branch of its own in the merge, because the generic fallback
+ * refuses everything that is not a string: without this, `railGauge: true` would
+ * be rejected with the wording for a mistyped path. The rejection states the two
+ * values, as the skip flags' own does.
+ */
+const BOOLEAN_SCALARS: ReadonlySet<ScalarKey> = new Set(["railGauge"]);
 
 /** The characters a name — an agent's or a skill's — may be spelled with
  * inside a `sources` key unquoted. */
@@ -761,6 +778,7 @@ function mismatchedRail(model: string, rail: Rail): Rail | undefined {
  *   sessionSwitchAt  75
  *   weeklySwitchAt   90
  *   margin           10
+ *   railGauge        true
  *   models           {}
  *   skills           {}
  *
@@ -786,6 +804,7 @@ export function defaultConfig(agentDir: string = getAgentDir()): DispatcherConfi
     sessionSwitchAt: 75,
     weeklySwitchAt: 90,
     margin: 10,
+    railGauge: true,
     models: {},
     skills: {},
     agents: {},
@@ -1670,7 +1689,7 @@ export function mergeConfig(
     (binding) => bindSkill(skills, binding),
   );
   const config: DispatcherConfig = { ...base, models, skills, agents };
-  const scalarTarget = config as unknown as Record<ScalarKey, string | number>;
+  const scalarTarget = config as unknown as Record<ScalarKey, string | number | boolean>;
 
   const sources: Record<string, ConfigSource> = {};
   const setSource = (key: string, source: ConfigSource) => {
@@ -2172,11 +2191,16 @@ export function mergeConfig(
           warn(`"${key}" must be one of ${accepted.list}`);
           continue;
         }
+      } else if (BOOLEAN_SCALARS.has(scalar)) {
+        if (typeof value !== "boolean") {
+          warn(`"${key}" must be true or false`);
+          continue;
+        }
       } else if (typeof value !== "string") {
         warn(`"${key}" must be a string`);
         continue;
       }
-      scalarTarget[scalar] = value as string | number;
+      scalarTarget[scalar] = value as string | number | boolean;
       setSource(scalar, source);
       scalarLabels.set(scalar, labelOf(layer));
     }
@@ -2396,7 +2420,7 @@ export function describeConfig(loaded: LoadedConfig): string[] {
  * and for `sessionAlwaysSwitchAt` that state is "the override is off" — the
  * thing a reader asking about it needs to see.
  */
-function scalarText(value: string | number | undefined): string {
+function scalarText(value: string | number | boolean | undefined): string {
   // The `disabled` spelling is the same one an agent removed with `disable`
   // gets, because it is the same fact: the key names no effective value. For
   // the override that is either omission or the cross-field conflict, and a

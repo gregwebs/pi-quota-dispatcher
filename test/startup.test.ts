@@ -441,8 +441,16 @@ interface Ctx {
   ui: {
     notify: (text: string, level?: string) => void;
     setStatus: (key: string, text?: string) => void;
+    /** The gauge colors through pi's theme; a configured fixture now draws. */
+    theme: { fg: (color: string, text: string) => string };
   };
 }
+
+/** The gauge's footer key, kept here so a filter cannot misspell it. */
+const GAUGE_KEY = "quota-dispatch-gauge";
+/** The warning key's statuses, so a gauge entry can neither satisfy nor break them. */
+const warningStatuses = (statuses: Array<{ key: string; text: string | undefined }>) =>
+  statuses.filter((status) => status.key !== GAUGE_KEY);
 
 type SessionStartHandler = (event: { reason: string }, ctx: Ctx) => Promise<void>;
 
@@ -501,6 +509,7 @@ async function withExtension(
     ui: {
       notify: (text, level) => notify.push({ text, level: level ?? "" }),
       setStatus: (key, text) => statuses.push({ key, text }),
+      theme: { fg: (color, text) => (color === "warning" ? `<${text}>` : text) },
     },
   });
 
@@ -526,13 +535,19 @@ async function withExtension(
       intervals: () => intervals.length,
     });
   } finally {
-    await handlers.session_shutdown?.({ reason: "shutdown" }, makeCtx());
-    globalThis.fetch = previousFetch;
-    globalThis.setInterval = previousSetInterval;
-    globalThis.clearInterval = previousClearInterval;
-    if (previousEnv === undefined) delete process.env[ENV_AGENT_DIR];
-    else process.env[ENV_AGENT_DIR] = previousEnv;
-    process.chdir(previousCwd);
+    // Nested so a throwing shutdown — or a failed assertion above — still
+    // restores the globals every later test depends on, and the original
+    // failure is the one reported.
+    try {
+      await handlers.session_shutdown?.({ reason: "shutdown" }, makeCtx());
+    } finally {
+      globalThis.fetch = previousFetch;
+      globalThis.setInterval = previousSetInterval;
+      globalThis.clearInterval = previousClearInterval;
+      if (previousEnv === undefined) delete process.env[ENV_AGENT_DIR];
+      else process.env[ENV_AGENT_DIR] = previousEnv;
+      process.chdir(previousCwd);
+    }
   }
 }
 
@@ -608,7 +623,7 @@ for (const reason of ["resume", "fork"]) {
       // The footer describes the install, not the reason, so it still reports
       // the unconfigured state even when the ask is suppressed.
       assert.ok(
-        h.statuses.some((s) => s.text !== undefined && s.text.length > 0),
+        warningStatuses(h.statuses).some((s) => s.text !== undefined && s.text.length > 0),
         `the unconfigured footer must still be set on ${reason}: ${JSON.stringify(h.statuses)}`,
       );
     });
@@ -641,7 +656,7 @@ test("an unparseable config file is reported instead of the unconfigured ask", a
     // The table is empty either way, so the footer is still the unconfigured one:
     // the notice has said why, and the ask's status is the standing fact.
     assert.ok(
-      h.statuses.some((s) => s.text !== undefined && s.text.includes("no agents configured")),
+      warningStatuses(h.statuses).some((s) => s.text !== undefined && s.text.includes("no agents configured")),
       `expected the unconfigured footer: ${JSON.stringify(h.statuses)}`,
     );
   });
@@ -709,8 +724,14 @@ test("the footer status is set while the table is empty", async () => {
   await withExtension(fx, async (h) => {
     await h.start("startup");
     assert.ok(
-      h.statuses.some((s) => s.text !== undefined && s.text.length > 0),
+      warningStatuses(h.statuses).some((s) => s.text !== undefined && s.text.length > 0),
       `an unconfigured install must set a footer status: ${JSON.stringify(h.statuses)}`,
+    );
+    // The gauge is empty while nothing is configured: no route names a rail.
+    assert.deepEqual(
+      h.statuses.filter((s) => s.key === GAUGE_KEY),
+      [{ key: GAUGE_KEY, text: undefined }],
+      JSON.stringify(h.statuses),
     );
   });
 });
@@ -733,7 +754,7 @@ test("once the table is non-empty the footer is cleared, not left showing unconf
       // `some`, not `every`: an install that issued no status call at all must
       // not pass on a vacuous quantification — the clear has to actually happen.
       assert.ok(
-        h.statuses.some((s) => s.text === undefined),
+        warningStatuses(h.statuses).some((s) => s.text === undefined),
         `a configured session_start must actually clear the footer: ${JSON.stringify(h.statuses)}`,
       );
     },
@@ -764,7 +785,7 @@ test("a configured install clears the footer an unconfigured one set", async () 
     await h.start("startup");
     // Asserted inside the body, before shutdown: everything appended here is the
     // configured session_start's own status calls.
-    const clear = shared.slice(before).find((s) => s.text === undefined);
+    const clear = warningStatuses(shared.slice(before)).find((s) => s.text === undefined);
     assert.ok(
       clear,
       `the configured install must clear the footer: ${JSON.stringify(shared.slice(before))}`,

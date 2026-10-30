@@ -325,6 +325,7 @@ test("any invalid top-level or nested value rejects the whole output", async () 
     ["models entry not an object", { models: { "claude-bridge/x": 5 } }],
     ["skill binding not a string", { skills: { "code-review": 5 } }],
     ["null primary", { agents: { planner: { ...VALID_ROUTE, primary: null } } }],
+    ["railGauge that is not a boolean", { railGauge: "yes" }],
   ];
   for (const [label, layer] of cases) {
     const result = await replaceGlobal(layer);

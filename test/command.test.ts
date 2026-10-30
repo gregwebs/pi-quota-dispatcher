@@ -227,6 +227,8 @@ function stubFetch(overrides: Partial<RailReadings> = {}): typeof fetch {
 interface Ui {
   notify: (text: string, level?: string) => void;
   setStatus: (key: string, text?: string) => void;
+  /** pi's theme; the gauge colors through it, so a test can read the tone off the text. */
+  theme: { fg: (color: string, text: string) => string };
 }
 
 /** The one piece of the real `ExtensionContext` this extension reads. */
@@ -369,6 +371,12 @@ interface Harness {
   sessionStart: (reason?: string) => Promise<void>;
   /** Fire the registered `input` handler with typed text and return what it returned. */
   input: (text: string) => Promise<unknown>;
+  /**
+   * Fire `session_shutdown` and then make every context handed out so far
+   * stale, the way pi's runner does once a session is replaced. Idempotent, so a
+   * test may call it and the `finally` block will not call it a second time.
+   */
+  shutdown: () => Promise<void>;
   /** The events the extension registered a handler for, in registration order. */
   events: string[];
   /** Everything the extension pushed to the UI, in order. */
@@ -387,7 +395,14 @@ async function withExtension(
   fx: Fixture,
   body: (h: Harness) => Promise<void>,
   fetchFactory: () => typeof fetch = stubFetch,
-  opts: { hasUI?: boolean; modelRegistry?: ModelRegistryLike; session?: FakeSession; notifyThrows?: boolean } = {},
+  opts: {
+    hasUI?: boolean;
+    modelRegistry?: ModelRegistryLike;
+    session?: FakeSession;
+    notifyThrows?: boolean;
+    /** A footer sink that refuses one key, for the gauge's failure handler. */
+    statusThrows?: (key: string) => boolean;
+  } = {},
 ): Promise<void> {
   const previousEnv = process.env[ENV_AGENT_DIR];
   const previousCwd = process.cwd();
@@ -407,18 +422,41 @@ async function withExtension(
   const events: string[] = [];
   const session = opts.session;
 
+  // pi invalidates the contexts of a replaced session: their getters throw from
+  // then on. Nothing here may be read after `shutdown`.
+  let invalidated = false;
+  const assertLive = () => {
+    if (invalidated) throw new Error("stale ctx");
+  };
+
   const makeCtx = (): Ctx => {
-    const ctx: Ctx = {
-      hasUI,
-      ui: {
-        notify: (text: string, level?: string) => {
-          notifications.push({ text, level: level ?? "" });
-          if (opts.notifyThrows) throw new Error("notify failed");
-        },
-        setStatus: (key: string, text?: string) => statuses.push({ key, text }),
+    const ui: Ui = {
+      notify: (text: string, level?: string) => {
+        notifications.push({ text, level: level ?? "" });
+        if (opts.notifyThrows) throw new Error("notify failed");
       },
-      ...(opts.modelRegistry ? { modelRegistry: opts.modelRegistry } : {}),
+      setStatus: (key: string, text?: string) => {
+        if (opts.statusThrows?.(key)) throw new Error("status sink failed");
+        statuses.push({ key, text });
+      },
+      // Dim is the identity so an expected gauge string reads like the plain
+      // text; the warning tone keeps its marker.
+      theme: { fg: (color: string, text: string) => (color === "warning" ? `<${text}>` : text) },
     };
+    const ctx = {
+      ...(opts.modelRegistry ? { modelRegistry: opts.modelRegistry } : {}),
+    } as Ctx;
+    // pi's runner throws from these getters once the session has been replaced,
+    // which is what makes "a pass in flight across a shutdown draws nothing" a
+    // testable property rather than a hope.
+    Object.defineProperty(ctx, "hasUI", {
+      enumerable: true,
+      get: () => {
+        assertLive();
+        return hasUI;
+      },
+    });
+    Object.defineProperty(ctx, "ui", { enumerable: true, get: () => (assertLive(), ui) });
     if (session) {
       Object.defineProperty(ctx, "model", {
         enumerable: true,
@@ -456,6 +494,20 @@ async function withExtension(
         }),
   } as unknown as ExtensionAPI;
 
+  let shutDown = false;
+  const shutdown = async (): Promise<void> => {
+    if (shutDown) return;
+    shutDown = true;
+    try {
+      await eventHandlers.session_shutdown?.({ type: "session_shutdown", reason: "shutdown" }, makeCtx());
+    } finally {
+      // pi invalidates the contexts of a replaced session whether or not the
+      // handler threw, so the harness does too — a failure here must not leave a
+      // later assertion reading a context that should be dead.
+      invalidated = true;
+    }
+  };
+
   try {
     extension(api);
     const handler = command;
@@ -465,6 +517,7 @@ async function withExtension(
       notifications,
       statuses,
       description,
+      shutdown,
       run: async (args: string) => {
         notifications.length = 0;
         await handler(args, makeCtx());
@@ -492,15 +545,32 @@ async function withExtension(
 
     await body(harness);
   } finally {
-    await eventHandlers.session_shutdown?.({ type: "session_shutdown", reason: "shutdown" }, makeCtx());
-    globalThis.fetch = previousFetch;
-    if (previousEnv === undefined) delete process.env[ENV_AGENT_DIR];
-    else process.env[ENV_AGENT_DIR] = previousEnv;
-    process.chdir(previousCwd);
+    // Nested so a throwing shutdown — or a failed assertion above that left a
+    // sink armed — still restores the process globals every later test depends
+    // on, and the original failure is the one reported.
+    try {
+      await shutdown();
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousEnv === undefined) delete process.env[ENV_AGENT_DIR];
+      else process.env[ENV_AGENT_DIR] = previousEnv;
+      process.chdir(previousCwd);
+    }
   }
 }
 
 // ---------------------------------------------------------------- commands
+
+/** The gauge's footer key, kept here so a filter cannot misspell it. */
+const GAUGE_KEY = "quota-dispatch-gauge";
+/** The warning footer's key, for the one test that makes that sink refuse it. */
+const WARNING_KEY = "quota-dispatch";
+/** The warning key's statuses, so a gauge entry can neither satisfy nor break them. */
+const warningStatuses = (statuses: Array<{ key: string; text: string | undefined }>) =>
+  statuses.filter((status) => status.key !== GAUGE_KEY);
+/** The gauge's statuses, for the assertions that are about the gauge itself. */
+const gaugeStatuses = (statuses: Array<{ key: string; text: string | undefined }>) =>
+  statuses.filter((status) => status.key === GAUGE_KEY);
 
 /**
  * The per-value provenance lines the report must never carry. `sessionSwitchAt`
@@ -917,8 +987,11 @@ test("generate publishes the printed layer and activates it without a reload", a
     assert.ok(text.startsWith(`[generated] ${fx.globalPath}`), text);
 
     // The footer follows the prepared runtime: a configured install with no
-    // unknown models carries no footer line.
-    assert.deepEqual(statuses.at(-1), { key: "quota-dispatch", text: undefined });
+    // unknown models carries no warning line.
+    assert.deepEqual(warningStatuses(statuses).at(-1), { key: "quota-dispatch", text: undefined });
+    // ...and the generated config's own routes were drawn, so the gauge followed
+    // the swap rather than describing the config the run replaced.
+    assert.equal(typeof gaugeStatuses(statuses).at(-1)?.text, "string");
 
     // The file now holds the printed layer with its declaration preserved.
     const written = JSON.parse(await readFile(fx.globalPath, "utf8"));
@@ -1688,6 +1761,62 @@ test("refresh forces a re-fetch while the plain form reuses the cache", async ()
 const PRIMARY = TEMPLATE("planner", "claude-bridge/claude-opus-5-5");
 
 /**
+ * Pump the real event loop until `predicate` holds, or a bounded number of turns
+ * elapse and the test fails by name.
+ *
+ * Every test that starts background work waits on that work's *observed* result
+ * before returning, so nothing is left in flight when the harness restores its
+ * globals. The bound is why a broken extension body fails the assertion instead
+ * of hanging.
+ */
+async function waitFor(predicate: () => boolean | Promise<boolean>, what: string, turns = 500): Promise<void> {
+  for (let i = 0; i < turns; i++) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail(`timed out waiting for ${what}`);
+}
+
+/**
+ * Wrap a fetch implementation so one matched request can be held in flight.
+ *
+ * A race between two evaluations is only pinned if the first read is provably
+ * still in flight when the second runs, and a settled promise is not. `arm()`
+ * makes the next matching request resolve `entered` and wait for `release()`
+ * before delegating, which gives the test both an arrival signal and control of
+ * the moment the read finishes.
+ */
+function gatedFetch(inner: typeof fetch, match: (url: string) => boolean) {
+  let armed = false;
+  let arrive: (() => void) | undefined;
+  let open: (() => void) | undefined;
+  let entered = Promise.resolve();
+  let gate = Promise.resolve();
+  const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+    if (armed && match(String(url))) {
+      armed = false;
+      arrive?.();
+      await gate;
+    }
+    return inner(url, init);
+  }) as unknown as typeof fetch;
+  return {
+    fetch: fetchImpl,
+    arm() {
+      armed = true;
+      entered = new Promise<void>((done) => (arrive = done));
+      gate = new Promise<void>((done) => (open = done));
+    },
+    get entered(): Promise<void> {
+      return entered;
+    },
+    release() {
+      open?.();
+    },
+  };
+}
+
+/**
  * Pump the real event loop until `planner.md` stops matching `original`, or a
  * bounded number of turns elapse. `tick` only *starts* the interval's
  * fire-and-forget `evaluate()`, which then does async file I/O; this waits for
@@ -2074,11 +2203,17 @@ for (const reason of ["startup", "new", "reload"]) {
         // notify's own headline: the interruption and the standing fact are one
         // sentence, so a surface that disagrees cannot pass by accident.
         assert.deepEqual(
-          statuses,
+          warningStatuses(statuses),
           [{ key: "quota-dispatch", text: "quota-dispatcher: a configured model is unknown to this pi." }],
           `the footer must hold the unknown model on ${reason}: ${JSON.stringify(statuses)}`,
         );
-        assert.equal(lines[0], statuses[0].text, "the warning's headline and the footer are the same words");
+        assert.equal(
+          lines[0],
+          warningStatuses(statuses)[0].text,
+          "the warning's headline and the footer are the same words",
+        );
+        // The gauge has its own key, so the warning does not stand in its place.
+        assert.equal(typeof gaugeStatuses(statuses).at(-1)?.text, "string", JSON.stringify(statuses));
       },
       stubFetch,
       { modelRegistry: TWO_UNKNOWN_REGISTRY },
@@ -2099,10 +2234,11 @@ for (const reason of ["resume", "fork"]) {
         // The footer describes the install, not the reason, so it still reports
         // the state — which on `resume` is the only place the state is said.
         assert.deepEqual(
-          statuses,
+          warningStatuses(statuses),
           [{ key: "quota-dispatch", text: "quota-dispatcher: a configured model is unknown to this pi." }],
           `the footer must carry the unknown model on ${reason}: ${JSON.stringify(statuses)}`,
         );
+        assert.equal(typeof gaugeStatuses(statuses).at(-1)?.text, "string", JSON.stringify(statuses));
       },
       stubFetch,
       { modelRegistry: TWO_UNKNOWN_REGISTRY },
@@ -2127,7 +2263,12 @@ test("a clean config notifies nothing and clears the footer", async () => {
       await sessionStart("startup");
 
       assert.equal(notifications.length, 0, "a usable config must not be interrupted");
-      assert.deepEqual(statuses, [{ key: "quota-dispatch", text: undefined }], JSON.stringify(statuses));
+      assert.deepEqual(
+        warningStatuses(statuses),
+        [{ key: "quota-dispatch", text: undefined }],
+        JSON.stringify(statuses),
+      );
+      assert.equal(typeof gaugeStatuses(statuses).at(-1)?.text, "string", JSON.stringify(statuses));
     },
     stubFetch,
     { modelRegistry: TWO_UNKNOWN_REGISTRY },
@@ -2144,7 +2285,12 @@ test("a registryless context notifies nothing, even for ids nothing could resolv
     await sessionStart("startup");
 
     assert.equal(notifications.length, 0, "a check that did not run reports nothing");
-    assert.deepEqual(statuses, [{ key: "quota-dispatch", text: undefined }], JSON.stringify(statuses));
+    assert.deepEqual(
+      warningStatuses(statuses),
+      [{ key: "quota-dispatch", text: undefined }],
+      JSON.stringify(statuses),
+    );
+    assert.equal(typeof gaugeStatuses(statuses).at(-1)?.text, "string", JSON.stringify(statuses));
   });
 });
 
@@ -3450,3 +3596,632 @@ test("the skill name is split exactly as pi splits it", async () => {
     assert.deepEqual(notifications, []);
   });
 });
+
+// ---------------------------------------------------------------- the rail gauge
+
+/** Routes naming every capped rail plus the metered one, so the gauge's whole surface is covered. */
+const ALL_RAILS_AGENTS = {
+  planner: {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [{ model: "deepseek/deepseek-flash", rail: "deepseek" }],
+  },
+  gemini: { primary: { model: "antigravity-gemini/gemini-4-pro", rail: "antigravity-gemini" } },
+  third: { primary: { model: "antigravity-3p/claude-and-gpt", rail: "antigravity-3p" } },
+  argon: { primary: { model: "antigravity-claude/argon", rail: "antigravity-argon" } },
+  coder: { primary: { model: "openai-codex/gpt-6-sol", rail: "codex" } },
+};
+
+/**
+ * The gauge line the default stub produces for `ALL_RAILS_AGENTS`.
+ *
+ * That table names `deepseek` as well, so the absence of the metered rail is part
+ * of this expected text rather than a separate assertion about the constant.
+ */
+const ALL_RAILS_GAUGE = "claude <90>/0 │ ag-3p 30/0 │ ag-gemini 20/0 │ codex 10/0 │ ag-argon –/0";
+
+test("the rail gauge is drawn at session start, most-used first", async () => {
+  const fx = await fixture(MAX_POLL_MS, ALL_RAILS_AGENTS);
+
+  await withExtension(fx, async ({ statuses, sessionStart }) => {
+    await sessionStart("startup");
+
+    assert.equal(gaugeStatuses(statuses).at(-1)?.text, ALL_RAILS_GAUGE, JSON.stringify(statuses));
+  });
+});
+
+test("a tight codex session shows its reset duration", async () => {
+  const fx = await fixture(MAX_POLL_MS, CONFIGURED_AGENTS);
+
+  await withExtension(
+    fx,
+    async ({ statuses, sessionStart }) => {
+      await sessionStart("startup");
+      // The stub reports `reset_after_seconds: 3600` relative to the read, so the
+      // duration is pinned without pinning the instant it was read at.
+      assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex <80↻1h>/0");
+    },
+    () => stubFetch({ codexSession: 80 }),
+  );
+});
+
+test("the warning footer and the gauge are both visible at once", async () => {
+  const fx = await fixture(MAX_POLL_MS, TWO_UNKNOWN_AGENTS);
+
+  await withExtension(
+    fx,
+    async ({ statuses, sessionStart }) => {
+      await sessionStart("startup");
+      const byKey = (key: string) => statuses.filter((status) => status.key === key).at(-1);
+      assert.equal(
+        byKey("quota-dispatch")?.text,
+        "quota-dispatcher: a configured model is unknown to this pi.",
+        JSON.stringify(statuses),
+      );
+      // The unknown primary is held, but its rail is still named by the route.
+      assert.equal(typeof byKey(GAUGE_KEY)?.text, "string", JSON.stringify(statuses));
+    },
+    stubFetch,
+    { modelRegistry: TWO_UNKNOWN_REGISTRY },
+  );
+});
+
+test("railGauge: false clears the gauge and keeps it clear, and shows in provenance", async () => {
+  const fx = await fixture(MAX_POLL_MS, CONFIGURED_AGENTS);
+  await writeFile(
+    join(fx.projectDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME),
+    JSON.stringify({ margin: 10, railGauge: false }),
+    "utf8",
+  );
+
+  await withExtension(fx, async ({ run, statuses, sessionStart }) => {
+    await sessionStart("startup");
+    await run("refresh");
+
+    const drawn = gaugeStatuses(statuses);
+    assert.ok(drawn.length > 0, "the gauge key is written, so the clear is observable");
+    assert.deepEqual(drawn.filter((status) => status.text !== undefined), [], JSON.stringify(drawn));
+
+    const config = await run("config");
+    assert.ok(config.split("\n").includes("  railGauge = false  [project]"), config);
+  });
+});
+
+test("every completed evaluation redraws the gauge", async () => {
+  const fx = await fixture(MAX_POLL_MS, CONFIGURED_AGENTS);
+
+  await withExtension(fx, async ({ run, statuses, sessionStart }) => {
+    await sessionStart("startup");
+    const drawnCount = () => gaugeStatuses(statuses).filter((status) => status.text !== undefined).length;
+
+    for (const form of ["", "refresh", "apply"]) {
+      const before = drawnCount();
+      await run(form);
+      assert.equal(drawnCount(), before + 1, `${form || "(plain)"} must redraw exactly once`);
+    }
+  });
+});
+
+test("generate redraws the gauge from the new configuration, and never blanks it in between", async () => {
+  const fx = await generateFixture(GENERATED_LAYER);
+
+  await withExtension(fx, async ({ run, sessionStart, statuses }) => {
+    const drawn = () => gaugeStatuses(statuses).filter((status) => status.text !== undefined);
+    // A line for the swap to replace: without one, a clear in between has nothing
+    // to blank and the assertion below would pass for the wrong reason.
+    await sessionStart("startup");
+    assert.equal(drawn().length, 1, JSON.stringify(statuses));
+    const mark = statuses.length;
+
+    await run("generate");
+
+    // One draw for each layer: the start's, and the new runtime's own pass.
+    assert.equal(drawn().length, 2, JSON.stringify(statuses));
+    // The generated layer routes on codex and claude, so both are named.
+    assert.equal(drawn().at(-1)?.text, "claude <90>/0 │ codex 10/0");
+    // This layer can draw, so the swap owes it no clear: a blank status here is the
+    // footer going empty until the new runtime's first pass publishes.
+    assert.deepEqual(
+      gaugeStatuses(statuses.slice(mark)),
+      [{ key: GAUGE_KEY, text: "claude <90>/0 │ codex 10/0" }],
+      JSON.stringify(statuses.slice(mark)),
+    );
+  });
+});
+
+test("drawing the gauge costs no vendor request", async () => {
+  const counted = () => {
+    const inner = stubFetch();
+    let calls = 0;
+    const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+      calls++;
+      return inner(url, init);
+    }) as unknown as typeof fetch;
+    return { fetchImpl, calls: () => calls };
+  };
+
+  // Two separate installs, so the shared readings file a first run warms cannot
+  // make the second one look cheaper.
+  for (const railGauge of [true, false]) {
+    const fx = await fixture(MAX_POLL_MS, CONFIGURED_AGENTS);
+    await writeFile(
+      join(fx.projectDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME),
+      JSON.stringify({ margin: 10, railGauge }),
+      "utf8",
+    );
+    const counter = counted();
+    await withExtension(
+      fx,
+      async ({ statuses, sessionStart }) => {
+        await sessionStart("startup");
+        assert.equal(gaugeStatuses(statuses).length, 1, JSON.stringify(statuses));
+      },
+      () => counter.fetchImpl,
+    );
+    // Both installs draw through the same pass: claude, codex and the one
+    // Antigravity summary, whether or not the line is rendered.
+    assert.equal(counter.calls(), 3, `railGauge: ${railGauge}`);
+  }
+});
+
+test("an unconfigured install clears the gauge", async () => {
+  const fx = await fixture(MAX_POLL_MS, {});
+
+  await withExtension(fx, async ({ statuses, sessionStart }) => {
+    await sessionStart("startup");
+    assert.deepEqual(gaugeStatuses(statuses), [{ key: GAUGE_KEY, text: undefined }], JSON.stringify(statuses));
+  });
+});
+
+test("a poll tick redraws the gauge, and shutdown clears it", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const fx = await fixture(50, CONFIGURED_AGENTS);
+
+  await withExtension(fx, async ({ statuses, sessionStart, shutdown }) => {
+    await sessionStart("startup");
+    const drawnCount = () => gaugeStatuses(statuses).filter((status) => status.text !== undefined).length;
+    const before = drawnCount();
+    assert.equal(before, 1, JSON.stringify(statuses));
+
+    t.mock.timers.tick(50);
+    // The draw is the last step of the tick's evaluation, so observing it is the
+    // deterministic signal that the tick's work has finished.
+    await waitFor(() => drawnCount() > before, "the tick's gauge draw");
+
+    await shutdown();
+    assert.equal(gaugeStatuses(statuses).at(-1)?.text, undefined, JSON.stringify(statuses));
+  });
+});
+
+// A `report` runs outside the evaluation fence, so it can finish after a
+// generation has already published and evaluated a different configuration. The
+// footer is the one piece of shared state such a pass could move, and the owner
+// token is what stops it.
+for (const [label, layer, expected] of [
+  ["a layer routing only on codex", { agents: { planner: { primary: { model: "openai-codex/gpt-6-sol", rail: "codex" } } } }, "codex 10/0"],
+  ["a layer that turns the gauge off", { railGauge: false, agents: GENERATED_LAYER.agents }, undefined],
+  ["a layer that empties the table", { agents: {} }, undefined],
+] as const) {
+  test(`a superseded refresh cannot repaint the gauge: ${label}`, async () => {
+    const fx = await generateFixture(layer as unknown, undefined, MAX_POLL_MS);
+    const gate = gatedFetch(stubFetch(), (url) => url.includes("anthropic.com"));
+
+    await withExtension(
+      fx,
+      async ({ invoke, run, statuses, sessionStart }) => {
+        await sessionStart("startup");
+        assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex 10/0");
+
+        // Hold the old runtime's forced Claude read in flight, so it is
+        // guaranteed to finish after the generation below.
+        gate.arm();
+        const refreshing = invoke("refresh");
+        await gate.entered;
+
+        await run("generate");
+        const mark = statuses.length;
+
+        gate.release();
+        await refreshing;
+
+        assert.deepEqual(
+          statuses.slice(mark).filter((status) => status.key === GAUGE_KEY),
+          [],
+          `a superseded pass must not touch the footer: ${JSON.stringify(statuses.slice(mark))}`,
+        );
+        assert.equal(gaugeStatuses(statuses).at(-1)?.text, expected, JSON.stringify(statuses));
+      },
+      () => gate.fetch,
+    );
+  });
+}
+
+test("a gauge that cannot be drawn does not veto the pass, and is reported", async (t) => {
+  const errors = t.mock.method(console, "error");
+  let failing = true;
+  const fx = await fixture(MAX_POLL_MS, CONFIGURED_AGENTS);
+
+  await withExtension(
+    fx,
+    async ({ run, statuses, sessionStart }) => {
+      await sessionStart("startup");
+
+      // The pass still ran: claude's session is tight in the stub, so the file
+      // was written.
+      assert.match(await readFile(fx.plannerFile, "utf8"), /^model: "openai-codex\/gpt-6-sol"$/m);
+      assert.ok(
+        errors.mock.calls.some((call) =>
+          String(call.arguments[0]).includes("the rail gauge could not be drawn (status sink failed)"),
+        ),
+        JSON.stringify(errors.mock.calls),
+      );
+
+      const text = await run("");
+      assert.ok(text.includes("claude: 5h 90%"), text);
+      assert.ok(
+        text.includes("  warning: quota-dispatcher: the rail gauge could not be drawn (status sink failed)"),
+        text,
+      );
+
+      // A later draw that works clears the fault.
+      failing = false;
+      const healed = await run("");
+      assert.ok(!healed.includes("the rail gauge could not be drawn"), healed);
+      assert.equal(typeof gaugeStatuses(statuses).at(-1)?.text, "string", JSON.stringify(statuses));
+    },
+    stubFetch,
+    { statusThrows: (key) => failing && key === GAUGE_KEY },
+  );
+});
+
+test("a pass still in flight at shutdown draws nothing, and writes anyway", async (t) => {
+  const errors = t.mock.method(console, "error");
+  const fx = await fixture(MAX_POLL_MS, CONFIGURED_AGENTS, { ttlMs: 1 });
+  const gate = gatedFetch(stubFetch(), (url) => url.includes("anthropic.com"));
+
+  await withExtension(
+    fx,
+    async ({ statuses, sessionStart, shutdown }) => {
+      await sessionStart("startup");
+
+      // Back to the primary, so the pass below is the one that has to write: the
+      // first start already switched it, and an assertion that only held because
+      // of that earlier write would say nothing about this pass.
+      await writeFile(fx.plannerFile, TEMPLATE("planner", "claude-bridge/claude-opus-5-5"), "utf8");
+
+      gate.arm();
+      const resumed = sessionStart("resume");
+      await gate.entered;
+      // In flight, and nothing written yet: the file is still the primary.
+      assert.match(await readFile(fx.plannerFile, "utf8"), /^model: "claude-bridge\/claude-opus-5-5"$/m);
+
+      await shutdown();
+      const mark = statuses.length;
+
+      gate.release();
+      // Session start awaits its evaluation, observer included, so awaiting the
+      // handler is the deterministic signal that the pass is done.
+      await resumed;
+
+      assert.deepEqual(
+        statuses.slice(mark),
+        [],
+        `a pass across a shutdown must not draw: ${JSON.stringify(statuses.slice(mark))}`,
+      );
+      // The policy still ran: the released pass wrote the switched model.
+      assert.match(await readFile(fx.plannerFile, "utf8"), /^model: "openai-codex\/gpt-6-sol"$/m);
+      // No stale getter was touched: the publisher read `footer` and found none.
+      assert.ok(
+        !errors.mock.calls.some((call) => String(call.arguments[0]).includes("could not be drawn")),
+        JSON.stringify(errors.mock.calls),
+      );
+    },
+    () => gate.fetch,
+  );
+});
+
+// ---------------------------------------------------------------- gauge clears and pass order
+
+/** The fault text the display's handler logs, as the report's warning tail words it. */
+const DRAW_FAILED = "the rail gauge could not be drawn (status sink failed)";
+
+test("a gauge sink that throws cannot veto an unconfigured session start, and is reported", async (t) => {
+  const errors = t.mock.method(console, "error");
+  const fx = await fixture(MAX_POLL_MS, {});
+
+  await withExtension(
+    fx,
+    async ({ run, sessionStart, statuses }) => {
+      // The clear at an unconfigured start goes through the display's handler, so
+      // a footer that refuses the key is a fault rather than a rejection.
+      await sessionStart("startup");
+
+      assert.equal(
+        warningStatuses(statuses).at(-1)?.text,
+        "quota-dispatcher: no agents configured",
+        JSON.stringify(statuses),
+      );
+      assert.ok(
+        errors.mock.calls.some((call) => String(call.arguments[0]).includes(DRAW_FAILED)),
+        JSON.stringify(errors.mock.calls),
+      );
+
+      const text = await run("");
+      assert.ok(text.includes(`  warning: quota-dispatcher: ${DRAW_FAILED}`), text);
+    },
+    stubFetch,
+    { statusThrows: (key) => key === GAUGE_KEY },
+  );
+});
+
+test("a gauge sink that throws cannot abort a generation that empties the table", async (t) => {
+  const errors = t.mock.method(console, "error");
+  const fx = await generateFixture({ agents: {} });
+
+  await withExtension(
+    fx,
+    async ({ run, statuses }) => {
+      const text = await run("generate");
+
+      assert.ok(text.startsWith(`[generated] ${fx.globalPath}`), text);
+      assert.equal(
+        warningStatuses(statuses).at(-1)?.text,
+        "quota-dispatcher: no agents configured",
+        JSON.stringify(statuses),
+      );
+      assert.ok(
+        errors.mock.calls.some((call) => String(call.arguments[0]).includes(DRAW_FAILED)),
+        JSON.stringify(errors.mock.calls),
+      );
+    },
+    stubFetch,
+    { statusThrows: (key) => key === GAUGE_KEY },
+  );
+});
+
+test("a gauge sink that throws at shutdown still lets the context go, and draws nothing after", async (t) => {
+  const errors = t.mock.method(console, "error");
+  const fx = await fixture(MAX_POLL_MS, CONFIGURED_AGENTS, { ttlMs: 1 });
+  const gate = gatedFetch(stubFetch(), (url) => url.includes("anthropic.com"));
+
+  await withExtension(
+    fx,
+    async ({ statuses, sessionStart, shutdown }) => {
+      await sessionStart("startup");
+
+      gate.arm();
+      const resumed = sessionStart("resume");
+      await gate.entered;
+
+      // The clear the handler runs at shutdown is the one that throws here.
+      await shutdown();
+      const mark = statuses.length;
+      assert.ok(
+        errors.mock.calls.some((call) => String(call.arguments[0]).includes(DRAW_FAILED)),
+        JSON.stringify(errors.mock.calls),
+      );
+
+      gate.release();
+      await resumed;
+      assert.deepEqual(
+        statuses.slice(mark),
+        [],
+        `a pass across a shutdown must not draw: ${JSON.stringify(statuses.slice(mark))}`,
+      );
+    },
+    () => gate.fetch,
+    { statusThrows: (key) => key === GAUGE_KEY },
+  );
+});
+
+/**
+ * A shutdown refuses the *warning* sink, not the gauge's: the gauge's own key
+ * cannot throw any more (every clear goes through the display's handler), so this
+ * is the only sink that can still interrupt the two clears the handler makes.
+ *
+ * It pins both halves of the handler's order. The gauge is cleared in a `finally`,
+ * so the rejection a refusing warning sink causes must not cost the clear. And
+ * `footer` is dropped before either call, so the pass released afterwards finds no
+ * context at all — it neither writes a status nor reports a fault against the dead
+ * one that is still in the command's hands.
+ */
+test("a warning sink that throws at shutdown still clears the gauge, and the released pass finds no footer", async (t) => {
+  const errors = t.mock.method(console, "error");
+  const fx = await fixture(MAX_POLL_MS, CONFIGURED_AGENTS, { ttlMs: 1 });
+  const gate = gatedFetch(stubFetch(), (url) => url.includes("anthropic.com"));
+  // Armed only for the shutdown: a start-time warning write would otherwise
+  // refuse its key and fail the session start this test needs.
+  let refusing = false;
+
+  await withExtension(
+    fx,
+    async ({ statuses, sessionStart, shutdown }) => {
+      await sessionStart("startup");
+      assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex 10/0");
+
+      gate.arm();
+      const resumed = sessionStart("resume");
+      await gate.entered;
+
+      refusing = true;
+      await assert.rejects(shutdown(), /status sink failed/);
+
+      // The warning write threw, and the gauge was still cleared.
+      assert.equal(
+        gaugeStatuses(statuses).at(-1)?.text,
+        undefined,
+        `a refusing warning sink must not leave the gauge on screen: ${JSON.stringify(statuses)}`,
+      );
+
+      const mark = statuses.length;
+      const faults = errors.mock.calls.length;
+      gate.release();
+      await resumed;
+
+      assert.deepEqual(
+        statuses.slice(mark),
+        [],
+        `a pass across a shutdown must not draw: ${JSON.stringify(statuses.slice(mark))}`,
+      );
+      assert.equal(
+        errors.mock.calls.length,
+        faults,
+        `the released pass must find no footer at all, not a dead one: ${JSON.stringify(errors.mock.calls.slice(faults))}`,
+      );
+    },
+    () => gate.fetch,
+    { statusThrows: (key) => refusing && key === WARNING_KEY },
+  );
+});
+
+/** Two agents on one route, so one pass has two writes to make. */
+const TWO_SWITCHING_AGENTS = {
+  planner: {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
+  },
+  reviewer: {
+    primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+    alternates: [{ model: "openai-codex/gpt-6-astra", rail: "codex" }],
+  },
+};
+
+/**
+ * The same-runtime race the pass number exists for. Owner tokens separate
+ * configurations; they do not order two passes of one runtime, and a pass that
+ * read earlier can finish later.
+ *
+ * The park is a foreign lock on one of the two files the pass has to write, so
+ * the pass is provably *inside* its decisions — its other write is on disk —
+ * while the forced refresh reads, fails and publishes. Releasing the lock lets
+ * the older pass finish; its numbers must not replace the `?` that failure
+ * earned.
+ */
+test("a pass that read earlier cannot publish over a later failed read", async () => {
+  const fx = await fixture(MAX_POLL_MS, TWO_SWITCHING_AGENTS);
+  const reviewerFile = join(dirname(fx.plannerFile), "reviewer.md");
+  await writeFile(reviewerFile, TEMPLATE("reviewer", "claude-bridge/claude-opus-5-5"), "utf8");
+  // The lock is keyed off the *resolved* file, and a temp dir is reached through
+  // a link on macOS: a path built from the fixture's own name would name a lock
+  // nothing waits on.
+  const lockPath = join(await realpath(dirname(fx.plannerFile)), ".reviewer.md.lock");
+
+  // A stub whose claude read can be made to fail after the older pass has read.
+  let claudeFails = false;
+  const fetchImpl = (async (url: string | URL) => {
+    if (claudeFails && String(url).includes("anthropic.com")) {
+      return { ok: false, status: 429, json: async () => ({}) };
+    }
+    return stubFetch()(url);
+  }) as unknown as typeof fetch;
+
+  await withExtension(
+    fx,
+    async ({ invoke, statuses, sessionStart }) => {
+      await sessionStart("startup");
+      assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex 10/0");
+
+      // Back to the primary for both, so this pass decides a switch for each.
+      await writeFile(fx.plannerFile, TEMPLATE("planner", "claude-bridge/claude-opus-5-5"), "utf8");
+      await writeFile(reviewerFile, TEMPLATE("reviewer", "claude-bridge/claude-opus-5-5"), "utf8");
+      // Planted now, so the *startup* pass above does not park on it.
+      await writeFile(lockPath, JSON.stringify({ pid: process.pid, hostname: hostname(), at: Date.now() }), "utf8");
+
+      const older = sessionStart("resume");
+      try {
+        // The planner write is observable, and the pass cannot finish while the
+        // reviewer file's lock is held: so this is the pass's state *after* it
+        // read and decided, and before it published. A bound far above the
+        // default, because every turn here is a file read and a loaded machine
+        // needs many of them to get through a store read, the agent-dir read and
+        // a lock acquire — still far inside the lock's own patience, so a pass
+        // that never parks fails by name rather than by timing out.
+        await waitFor(
+          async () => (await readFile(fx.plannerFile, "utf8")).includes("openai-codex/gpt-6-sol"),
+          "the parked pass's planner write",
+          5000,
+        );
+        // Parked: the reviewer write cannot happen while its lock is held, and
+        // the pass publishes only once every write has settled.
+        assert.match(
+          await readFile(reviewerFile, "utf8"),
+          /^model: "claude-bridge\/claude-opus-5-5"$/m,
+          "the pass must still be inside its decisions",
+        );
+
+        claudeFails = true;
+        await invoke("refresh");
+        assert.equal(
+          gaugeStatuses(statuses).at(-1)?.text,
+          "claude 90/0? │ codex 10/0",
+          "the failed read is drawn stale",
+        );
+      } finally {
+        await rm(lockPath, { force: true });
+        await older;
+      }
+
+      // The older pass completed — it wrote the file it was parked on...
+      assert.match(await readFile(reviewerFile, "utf8"), /^model: "openai-codex\/gpt-6-astra"$/m);
+      // ...and its older snapshot did not erase the stale marker.
+      assert.equal(
+        gaugeStatuses(statuses).at(-1)?.text,
+        "claude 90/0? │ codex 10/0",
+        JSON.stringify(statuses),
+      );
+    },
+    () => fetchImpl,
+  );
+});
+
+/** A layer that turns the gauge off. The test forces its first pass to write, then blocks that write. */
+const LAYER_TURNING_THE_GAUGE_OFF = {
+  railGauge: false,
+  agents: {
+    planner: {
+      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+      alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
+    },
+  },
+};
+
+/** The same, with routes the superseded line does not describe at all. */
+const LAYER_ON_OTHER_ROUTES = {
+  agents: { planner: { primary: { model: "openai-codex/gpt-6-sol", rail: "codex" } } },
+};
+
+for (const [label, layer] of [
+  ["a layer that turns the gauge off", LAYER_TURNING_THE_GAUGE_OFF],
+  ["a layer on other routes", LAYER_ON_OTHER_ROUTES],
+] as const) {
+  test(`a generation whose first pass fails clears the superseded gauge: ${label}`, async (t) => {
+    if (process.getuid?.() === 0) {
+      t.skip("root can write a read-only directory");
+      return;
+    }
+    const fx = await generateFixture(layer);
+    const agentsDir = join(fx.agentDir, "agents");
+
+    await withExtension(fx, async ({ run, sessionStart, statuses }) => {
+      await sessionStart("startup");
+      assert.equal(gaugeStatuses(statuses).at(-1)?.text, "claude <90>/0 │ codex 10/0");
+
+      // Back to the primary, so the new layer's first pass has a write to make.
+      await writeFile(fx.plannerFile, TEMPLATE("planner", "claude-bridge/claude-opus-5-5"), "utf8");
+      // A directory that can be read and not added to: the pass reads the file,
+      // decides a switch, and then cannot take the write's lock.
+      await chmod(agentsDir, 0o500);
+      t.after(() => chmod(agentsDir, 0o755));
+
+      const text = await run("generate");
+      assert.ok(
+        text.includes("the configuration was activated, but evaluating it once failed"),
+        text,
+      );
+      assert.equal(
+        gaugeStatuses(statuses).at(-1)?.text,
+        undefined,
+        `the superseded gauge must not survive the swap: ${JSON.stringify(statuses)}`,
+      );
+    });
+  });
+}
