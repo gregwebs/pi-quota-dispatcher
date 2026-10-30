@@ -1767,16 +1767,27 @@ test("refresh forces a re-fetch while the plain form reuses the cache", async ()
 const PRIMARY = TEMPLATE("planner", "claude-bridge/claude-opus-5-5");
 
 /**
- * Pump the real event loop until `predicate` holds, or a bounded number of turns
- * elapse and the test fails by name.
+ * Pump the real event loop until `predicate` holds, or a bounded time elapses
+ * and the test fails by name.
  *
  * Every test that starts background work waits on that work's *observed* result
  * before returning, so nothing is left in flight when the harness restores its
  * globals. The bound is why a broken extension body fails the assertion instead
  * of hanging.
+ *
+ * The bound is wall-clock, not a turn count: the work being waited on is real
+ * file and socket I/O, which takes time rather than turns, and a turn-count
+ * bound expires on a loaded CI runner while the I/O it is waiting for is still
+ * perfectly on its way. Ten seconds is orders of magnitude above what the work
+ * needs and still far below a hung suite.
  */
-async function waitFor(predicate: () => boolean | Promise<boolean>, what: string, turns = 500): Promise<void> {
-  for (let i = 0; i < turns; i++) {
+async function waitFor(
+  predicate: () => boolean | Promise<boolean>,
+  what: string,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
     if (await predicate()) return;
     await new Promise((resolve) => setImmediate(resolve));
   }
@@ -1824,17 +1835,25 @@ function gatedFetch(inner: typeof fetch, match: (url: string) => boolean) {
 
 /**
  * Pump the real event loop until `planner.md` stops matching `original`, or a
- * bounded number of turns elapse. `tick` only *starts* the interval's
- * fire-and-forget `evaluate()`, which then does async file I/O; this waits for
- * that to land without a wall-clock sleep. `setInterval` is mocked but
- * `setImmediate` is real, and the bound means a broken interval body fails the
- * assertion instead of hanging the test.
+ * bounded time elapses. `tick` only *starts* the interval's fire-and-forget
+ * `evaluate()`, which then does async file I/O; this waits for that to land
+ * without a wall-clock sleep. `setInterval` is mocked but `setImmediate` is
+ * real, and the bound means a broken interval body fails the assertion instead
+ * of hanging the test.
+ *
+ * The bound is wall-clock for the same reason `waitFor`'s is: the work being
+ * awaited is real file I/O, so it takes time rather than turns, and a turn-count
+ * bound expires on a loaded runner while the write is still on its way. Returns
+ * whether the file moved, so a caller that must not fail on a timeout can ignore
+ * it and one that must can assert on it.
  */
-async function settle(read: () => Promise<string>, original: string, turns = 500): Promise<void> {
-  for (let i = 0; i < turns; i++) {
-    if ((await read()) !== original) return;
+async function settle(read: () => Promise<string>, original: string, timeoutMs = 10_000): Promise<boolean> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    if ((await read()) !== original) return true;
     await new Promise((resolve) => setImmediate(resolve));
   }
+  return false;
 }
 
 /**
@@ -1855,7 +1874,7 @@ test("the poll timer re-evaluates and writes the switch it decides", async (t) =
     assert.equal(await readFile(fx.plannerFile, "utf8"), PRIMARY, "the boot report must not write");
 
     t.mock.timers.tick(50);
-    await settle(() => readFile(fx.plannerFile, "utf8"), PRIMARY);
+    assert.ok(await settle(() => readFile(fx.plannerFile, "utf8"), PRIMARY), "the tick's switch never landed");
 
     assert.match(await readFile(fx.plannerFile, "utf8"), /^model: "openai-codex\/gpt-6-sol"$/m);
   });
@@ -4137,15 +4156,14 @@ test("a pass that read earlier cannot publish over a later failed read", async (
       try {
         // The planner write is observable, and the pass cannot finish while the
         // reviewer file's lock is held: so this is the pass's state *after* it
-        // read and decided, and before it published. A bound far above the
-        // default, because every turn here is a file read and a loaded machine
-        // needs many of them to get through a store read, the agent-dir read and
-        // a lock acquire — still far inside the lock's own patience, so a pass
-        // that never parks fails by name rather than by timing out.
+        // read and decided, and before it published. Bound generously, because
+        // the wait covers a store read, the agent-dir read and a lock acquire —
+        // still inside the lock's own patience, so a pass that never parks fails
+        // by name rather than by timing out.
         await waitFor(
           async () => (await readFile(fx.plannerFile, "utf8")).includes("openai-codex/gpt-6-sol"),
           "the parked pass's planner write",
-          5000,
+          2_000,
         );
         // Parked: the reviewer write cannot happen while its lock is held, and
         // the pass publishes only once every write has settled.
