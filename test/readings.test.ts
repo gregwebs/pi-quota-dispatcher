@@ -9,16 +9,17 @@ import {
   DEFAULT_CONFIG,
   READINGS_FILE_VERSION,
   createDispatcher,
+  type PassReadings,
+  railGauge,
+} from "../src/index.ts";
+import {
   parseClaudeUsage,
   parseCodexUsage,
   type GoodReading,
   type MeteredReading,
-  type PassReadings,
-  type Rail,
   type RailReading,
   type RailReadings,
-  railGauge,
-} from "../src/index.ts";
+} from "../src/rail-reading.ts";
 
 import { agentTable, routeOf } from "./helpers/identifiers.ts";
 

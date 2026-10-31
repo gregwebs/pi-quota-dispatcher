@@ -10,9 +10,6 @@ import {
   type Candidate,
   type DispatcherConfig,
   type ModelLookup,
-  type Rail,
-  type RailReading,
-  type RailWindow,
   DEFAULT_CONFIG,
   checkModels,
   createDispatcher,
@@ -20,6 +17,8 @@ import {
   heldDecision,
   modelLookup,
 } from "../src/index.ts";
+import type { Rail } from "../src/rail.ts";
+import type { RailReading, RailWindow } from "../src/rail-reading.ts";
 
 import type { ModelId } from "../src/identifiers.ts";
 import { agentName, agentTable, modelId, modelTable } from "./helpers/identifiers.ts";

@@ -9,8 +9,8 @@ import {
   createSharedReadings,
   type AntigravityReadings,
   type SharedReadingsPacing,
-  type VendorReading,
 } from "../src/index.ts";
+import type { VendorReading } from "../src/rail-reading.ts";
 import { lockPathFor, withLockPath } from "../src/agent-file.ts";
 import { assertCleanExit, startHolder, waitUntil } from "./fixtures/agent-write-child.ts";
 import { spawnReadingsChild } from "./fixtures/readings-child.ts";
@@ -168,6 +168,25 @@ for (const [name, text] of [
   ["corrupt JSON", "{broken"],
   ["unknown version", JSON.stringify({ version: READINGS_FILE_VERSION + 1, entries: [] })],
   ["invalid entry", JSON.stringify({ version: READINGS_FILE_VERSION, entries: [{ rail: "claude", credential: "/c", at: 1, latest: { rail: "claude", ok: true, windows: [], readAt: 1 } }] })],
+  // `lastGood` is a *good* reading by construction: a failure replayed there
+  // would be a last known number the file's own failure note says it does not
+  // have. The decoder answers "which arm is this", so the caller must refuse the
+  // failed one rather than treat any reading as history.
+  [
+    "a failed reading stored as lastGood",
+    JSON.stringify({
+      version: READINGS_FILE_VERSION,
+      entries: [
+        {
+          rail: "claude",
+          credential: "/c",
+          at: 2,
+          latest: { rail: "claude", ok: true, windows: [], readAt: 2, raw: {} },
+          lastGood: { rail: "claude", ok: false, windows: [], readAt: 1, note: "HTTP 429" },
+        },
+      ],
+    }),
+  ],
 ] as const) {
   test(`${name} is empty, warns once, and is repaired by the next write`, async (t) => {
     const fx = await fixture(t); await writeFile(fx.path, text);

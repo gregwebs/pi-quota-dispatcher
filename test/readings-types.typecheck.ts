@@ -13,13 +13,8 @@
  * a required key of `KnownReadings`; a pool's readings are never the metered
  * arm; and the generator document carries all six rails.
  */
-import type {
-  AntigravityReadings,
-  KnownReadings,
-  MeteredRailReadings,
-  SharedReadings,
-  VendorRailReadings,
-} from "../src/index.ts";
+import type { AntigravityReadings, KnownReadings, SharedReadings } from "../src/index.ts";
+import type { MeteredRailReadings, VendorRailReadings } from "../src/rail-reading.ts";
 import { generatorInput } from "../src/index.ts";
 import type { GeneratorInput, GeneratorRailInput } from "../src/generator.ts";
 

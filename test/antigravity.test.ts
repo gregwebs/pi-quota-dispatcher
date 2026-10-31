@@ -11,10 +11,9 @@ import {
   DEFAULT_CONFIG,
   createDispatcher,
   parseAntigravityToken,
-  parseAntigravityUsage,
   providerTokenResolver,
 } from "../src/index.ts";
-import type { RailReadings } from "../src/index.ts";
+import { parseAntigravityUsage, type RailReadings } from "../src/rail-reading.ts";
 import { assertCleanExit, waitUntil } from "./fixtures/agent-write-child.ts";
 import { spawnAntigravityChild } from "./fixtures/antigravity-child.ts";
 import { agentTable } from "./helpers/identifiers.ts";

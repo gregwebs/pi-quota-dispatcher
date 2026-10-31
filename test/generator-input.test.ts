@@ -7,15 +7,14 @@ import {
   type GeneratorInputOutcome,
   type GeneratorReadingInput,
 } from "../src/generator.ts";
-import {
-  generatorInput,
-  type FailedReading,
-  type GoodReading,
-  type KnownReadings,
-  type MeteredReading,
-  type VendorRail,
-  type VendorRailReadings,
-} from "../src/index.ts";
+import { generatorInput, type KnownReadings } from "../src/index.ts";
+import type {
+  FailedReading,
+  GoodReading,
+  MeteredReading,
+  VendorRail,
+  VendorRailReadings,
+} from "../src/rail-reading.ts";
 
 // ---------------------------------------------------------------- readings
 

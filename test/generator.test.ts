@@ -23,16 +23,15 @@ import {
   generateConfig,
   runBash,
 } from "../src/generator.ts";
+import { generatorInput, type KnownReadings } from "../src/index.ts";
 import {
-  generatorInput,
   parseAntigravityUsage,
   parseClaudeUsage,
   parseCodexUsage,
   type FailedReading,
   type GoodReading,
-  type KnownReadings,
   type MeteredReading,
-} from "../src/index.ts";
+} from "../src/rail-reading.ts";
 
 import { agentName, routeOf } from "./helpers/identifiers.ts";
 

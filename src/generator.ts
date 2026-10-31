@@ -24,11 +24,12 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
+import type { Rail } from "./rail.ts";
+
 import {
   type ConfigFileFault,
   type GeneratorDeclaration,
   type LoadedConfig,
-  type Rail,
   DEFAULT_GENERATOR_TIMEOUT_MS,
   errorText,
   escapeInvisible,

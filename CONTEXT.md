@@ -93,7 +93,9 @@ the read failed. A rail does not have to carry both budgets: one whose pool has
 no **session budget** or no **weekly budget** simply reports no window for it,
 and only a budget the rail carries can be missing. A reading states facts only;
 whether a budget is **tight** is a judgment the policy makes about it, not part
-of it.
+of it. That judgment has one implementation, `isTight`, which the policy and the
+**rail gauge** both call: it takes the threshold as an argument, so a reading
+never learns a configuration value and no reading carries a judgment.
 _Avoid_: usage data, quota data, rail state, usage snapshot
 
 **Last good reading**:
@@ -132,7 +134,10 @@ _Avoid_: uncapped, unlimited, free
 
 **Tight**:
 At or above the threshold for its budget. Only ever said of a rail's budget, not
-of an agent.
+of an agent. It is evaluated on a **rail reading** with a threshold the caller
+supplies, so the policy and the **rail gauge** cannot disagree about it; a budget
+the vendor has capped outright is a separate, display-only judgment rather than a
+configured threshold.
 _Avoid_: hot, exhausted, blocked, over
 
 **Switch**:

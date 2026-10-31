@@ -28,6 +28,7 @@ import {
   type SkillName,
 } from "./identifiers.ts";
 import { validatedEntries, validatedKeys } from "./validated-keys.ts";
+import { RAILS, isRail, railFromModel, type Rail } from "./rail.ts";
 
 // The identifier rules live in `identifiers.ts`; these two names are the
 // compatibility surface other modules and the startup snippet already import,
@@ -36,39 +37,9 @@ export { agentNameRejection, modelIdRejection } from "./identifiers.ts";
 
 // ---------------------------------------------------------------- shape
 
-/**
- * The three quota pools Antigravity gives one account, each independently capped.
- *
- * They are separate rails rather than one account rail because the vendor caps
- * them separately: spending the Claude-and-GPT pool says nothing about the
- * Gemini one. They share a credential and a single vendor read, which is why the
- * dispatcher fetches them as a group — see
- * `docs/adr/0019-antigravity-pool-rails.md`.
- */
-export const ANTIGRAVITY_RAILS = ["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const;
-
-export type AntigravityRail = (typeof ANTIGRAVITY_RAILS)[number];
-
-/**
- * Every rail, in the order the report prints them: the two long-standing vendor
- * rails, then the three Antigravity pools as one account's group, then the
- * metered rail.
- *
- * One ordered list rather than a literal repeated at each reader, so the report
- * and the generator cannot disagree about which rails exist or how they read —
- * and the list is what the `Rail` type is derived from, so a rail cannot be
- * named in the type without being in the order.
- */
-export const RAILS = ["claude", "codex", ...ANTIGRAVITY_RAILS, "deepseek"] as const;
-
-/**
- * One independently capped quota pool that model calls draw on.
- *
- * A rail is per-pool, not per-provider or per-account: several model prefixes
- * can draw on one rail, and one account can back more than one. `deepseek` is
- * the metered one, billed per token rather than capped.
- */
-export type Rail = (typeof RAILS)[number];
+// The rail vocabulary lives in `rail.ts`; what stays here is this module's own
+// use of it — the list a rejection message words, and the checks a candidate's
+// rail goes through.
 
 /** The rails as a rejection words them, e.g. `"claude", "codex", ...`. */
 export const RAIL_LIST = RAILS.map((rail) => `"${rail}"`).join(", ");
@@ -704,44 +675,6 @@ function foldSkillEntries(
     }
     accept(parsed.binding);
   }
-}
-
-export function isRail(value: unknown): value is Rail {
-  return typeof value === "string" && (RAILS as readonly string[]).includes(value);
-}
-
-/**
- * Whether `value` is one of the three Antigravity pool rails.
- *
- * Exported because the readings store groups those three behind one fetch, and
- * the grouping is stated once here rather than re-derived from a prefix.
- */
-export function isAntigravityRail(value: unknown): value is AntigravityRail {
-  return typeof value === "string" && (ANTIGRAVITY_RAILS as readonly string[]).includes(value);
-}
-
-/**
- * The rail a model's prefix implies, or `undefined` for a prefix we do not
- * recognise. An unknown prefix is not evidence of a mistake, so it never warns.
- *
- * Exported because the startup snippet derives each candidate's `rail` from the
- * model an agent file already declares, and a second copy of these prefixes
- * would be free to drift from the one the loader validates against.
- */
-export function railFromModel(model: string): Rail | undefined {
-  if (model.startsWith("claude-bridge/") || model.startsWith("anthropic/")) return "claude";
-  if (model.startsWith("openai-codex/")) return "codex";
-  if (model.startsWith("deepseek/")) return "deepseek";
-  // Argon is checked before the general Gemini prefix: both pools serve Gemini
-  // models, and only the Argon one has its own weekly bucket. A suffix such as
-  // `gemini-4-argon-extra` is still Argon, because the vendor's own bucket ids
-  // for the pool all share that stem.
-  if (model.startsWith("antigravity/gemini-4-argon")) return "antigravity-argon";
-  if (model.startsWith("antigravity/gemini-")) return "antigravity-gemini";
-  if (model.startsWith("antigravity/claude-") || model.startsWith("antigravity/gpt-")) {
-    return "antigravity-3p";
-  }
-  return undefined;
 }
 
 /**
