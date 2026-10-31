@@ -84,17 +84,29 @@ export type StaleBudgetGauge =
   | { readonly kind: "disabled" }
   | { readonly kind: "used"; readonly used: number };
 
-/** One rail as the gauge draws it. `unread` is a rail with no number at all. */
+/**
+ * One rail as the gauge draws it. `unread` is a rail with no number at all.
+ *
+ * `spent` is the rail-level fact the sort needs and cannot derive from a peak:
+ * a weekly pool has reached the vendor's cap, so there is nothing left on this
+ * rail to spend for days. It is stated rather than recomputed here so that what
+ * makes a rail spent — the vendor's 100%, not a switch threshold — stays in the
+ * projection beside the `disabled` slot it also decides. An `unread` rail cannot
+ * state it: no reading means no evidence either way, and a rail that might still
+ * have headroom must not be sorted with the one that does not.
+ */
 export type GaugeEntry =
   | {
       readonly rail: VendorRail;
       readonly kind: "fresh";
+      readonly spent: boolean;
       readonly session: BudgetGauge;
       readonly weekly: BudgetGauge;
     }
   | {
       readonly rail: VendorRail;
       readonly kind: "stale";
+      readonly spent: boolean;
       readonly session: StaleBudgetGauge;
       readonly weekly: StaleBudgetGauge;
     }
@@ -175,15 +187,27 @@ function peak(entry: GaugeEntry): number | undefined {
 }
 
 /**
- * Most-used first, with the fixed order breaking ties and ordering rail with no
- * number at all last. Input order is deliberately irrelevant: the caller maps
- * over the rails it configures, and the sort is what makes that order not matter.
+ * Most-used first, with the fixed order breaking ties and a rail with no number
+ * at all last. Input order is deliberately irrelevant: the caller maps over the
+ * rails it configures, and the sort is what makes that order not matter.
+ *
+ * A rail whose week is spent sorts after even those: the peak of a maxed rail is
+ * 100 and would otherwise put it first, which is the wrong end of the line. Its
+ * figure is the least actionable thing the gauge can print — nothing can be sent
+ * there for days — so it goes last, while a rail with no number at all still
+ * goes ahead of it, because an unread rail may well have headroom.
  */
 function ordered(entries: readonly GaugeEntry[]): GaugeEntry[] {
   const rank = (entry: GaugeEntry) => GAUGE_ORDER.indexOf(entry.rail);
-  const keyed = entries.map((entry) => ({ entry, peak: peak(entry), rank: rank(entry) }));
+  const keyed = entries.map((entry) => ({
+    entry,
+    peak: peak(entry),
+    spent: entry.kind !== "unread" && entry.spent,
+    rank: rank(entry),
+  }));
   return keyed
     .sort((a, b) => {
+      if (a.spent !== b.spent) return a.spent ? 1 : -1;
       if (a.peak === undefined && b.peak !== undefined) return 1;
       if (b.peak === undefined && a.peak !== undefined) return -1;
       if (a.peak !== undefined && b.peak !== undefined && a.peak !== b.peak) return b.peak - a.peak;

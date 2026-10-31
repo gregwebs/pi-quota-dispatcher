@@ -241,6 +241,12 @@ percentage, compared before rounding, so two rails that both print `74` still
 order by what they really used. Ties keep the fixed order above, a stale rail
 sorts by its last good reading, and a rail with no number at all goes last.
 
+A rail whose week is spent — a weekly pool at 100%, the case a `x` session slot
+marks — goes after even those: its 100% would otherwise put it first, when it is
+the least useful thing on the line, with nothing to send there for days. A rail
+with no number still comes before it, because an unread rail may yet have
+headroom, so a spent rail is always the last one printed.
+
 | What the slot shows | Meaning |
 |---|---|
 | `62,6d` | Whole percent used, and the time left until it resets. Every character except a tight slot is dim. |

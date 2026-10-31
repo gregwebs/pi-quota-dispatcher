@@ -1048,15 +1048,18 @@ function gaugedRails(cfg: DispatcherConfig): VendorRail[] {
 const EXHAUSTED = 100;
 
 /**
- * Whether a spent week has switched this rail's session budget off.
+ * Whether a spent week has switched this rail's session budget off, and left it
+ * with nothing to spend.
  *
  * Antigravity says so in as many words — "You have hit your weekly limit, the
  * 5-hour limit does not currently apply" — and still reports a 5-hour window at
  * 0%, so the figure must be read against the week rather than taken at face
  * value. The week is the rail's worst pool, which is what `budgetUsed` returns:
  * one pool at its cap is enough, and the vendor turns the limit off for the
- * whole account. A rail with no session budget never asks this question, because
- * `freshBudget` and `staleBudget` answer `uncarried` first — Argon keeps its `–`.
+ * whole account. A rail with no session budget still answers here, because a
+ * spent week leaves it with nothing to spend either — only the `disabled` slot
+ * is out of its reach (`freshBudget` and `staleBudget` answer `uncarried` first,
+ * so Argon keeps its `–`).
  */
 function weekSpent(reading: RailReading): boolean {
   const week = budgetUsed(reading, "weekly");
@@ -1138,6 +1141,10 @@ function staleBudget(reading: GoodReading, budget: Budget): StaleBudgetGauge {
  * One entry per gauged rail. A rail whose latest read failed is drawn from its
  * last good reading when there is one, marked stale; the policy holds on that
  * rail, so the numbers are for the eye and decide nothing.
+ *
+ * `spent` is the same fact `freshBudget` turns into a `disabled` session slot,
+ * stated at the rail so the sort can put a maxed rail last without knowing what
+ * makes one maxed.
  */
 export function railGaugeEntries(input: {
   readings: ReadonlyMap<Rail, RailReadings>;
@@ -1155,6 +1162,7 @@ export function railGaugeEntries(input: {
       return {
         rail,
         kind: "fresh",
+        spent: weekSpent(latest),
         session: freshBudget(latest, "session", input),
         weekly: freshBudget(latest, "weekly", input),
       };
@@ -1164,6 +1172,7 @@ export function railGaugeEntries(input: {
     return {
       rail,
       kind: "stale",
+      spent: weekSpent(good),
       session: staleBudget(good, "session"),
       weekly: staleBudget(good, "weekly"),
     };

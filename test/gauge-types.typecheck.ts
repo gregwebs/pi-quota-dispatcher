@@ -33,6 +33,7 @@ const freshSilent: BudgetGauge = { kind: "used", used: 74 };
 const staleEntry: GaugeEntry = {
   rail: "codex",
   kind: "stale",
+  spent: false,
   session: noCountdown,
   weekly: { kind: "uncarried" },
 };

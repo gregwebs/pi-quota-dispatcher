@@ -119,6 +119,47 @@ test("renders the spec's example line", () => {
   assert.equal(gauge(map), "claude 13/<91,4d> │ codex <74,2h>/41 │ ag-argon –/62");
 });
 
+test("a maxed rail goes last however high its figure", () => {
+  const cfg = cfgNaming(["claude", "codex", "antigravity-3p", "antigravity-argon"]);
+  const map = readings(
+    ["claude", ok(good("claude", [session(20), weekly(10)]))],
+    ["codex", ok(good("codex", [session(74), weekly(41)]))],
+    ["antigravity-3p", ok(good("antigravity-3p", [session(0), weekly(100)]))],
+    ["antigravity-argon", ok(good("antigravity-argon", [weekly(100)]))],
+  );
+  // Both pools are at 100%, which is the most-used key and would put them first. They
+  // are the least useful instead: nothing can be sent to either for days. The tie
+  // between them still follows the fixed order.
+  assert.equal(gauge(map, cfg), "codex 74/41 │ claude 20/10 │ ag-3p x/<100> │ ag-argon –/<100>");
+});
+
+test("a spent rail sorts after a rail with no number at all", () => {
+  const cfg = cfgNaming(["claude", "codex", "antigravity-3p"]);
+  const map = readings(
+    ["claude", ok(good("claude", [session(0), weekly(0)]))],
+    // Nothing has ever been read for codex, so it may still have headroom — which
+    // the spent rail provably does not.
+    ["codex", { latest: failed("codex") }],
+    ["antigravity-3p", ok(good("antigravity-3p", [session(0), weekly(100)]))],
+  );
+  assert.equal(gauge(map, cfg), "claude 0/0 │ codex ? │ ag-3p x/<100>");
+});
+
+test("a stale rail whose last good week was spent sorts last too", () => {
+  const cfg = cfgNaming(["claude", "antigravity-3p"]);
+  const map = readings(
+    ["claude", ok(good("claude", [session(0), weekly(0)]))],
+    [
+      "antigravity-3p",
+      {
+        latest: failed("antigravity-3p"),
+        lastGood: good("antigravity-3p", [session(0), weekly(100)]),
+      },
+    ],
+  );
+  assert.equal(gauge(map, cfg), "claude 0/0 │ ag-3p x/100?");
+});
+
 test("orders most-used first", () => {
   const cfg = cfgNaming(["claude", "codex", "antigravity-gemini"]);
   const map = readings(
@@ -406,6 +447,7 @@ test("the tie order does not depend on the order the entries arrive in", () => {
   const entry = (rail: VendorRail): GaugeEntry => ({
     rail,
     kind: "fresh",
+    spent: false,
     session: { kind: "used", used: 50, resetInMs: undefined },
     weekly: { kind: "unreported" },
   });
