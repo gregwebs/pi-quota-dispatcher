@@ -13,13 +13,10 @@ import {
   type ConfigBase,
   type LoadedConfig,
   type MergeLayer,
-  type Rail,
   type SkipFlag,
   type ThinkingLevel,
-  ANTIGRAVITY_RAILS,
   CONFIG_FILE_NAME,
   DEFAULT_CONFIG,
-  RAILS,
   THINKING_LEVELS,
   configFilesFor,
   defaultConfig,
@@ -27,18 +24,23 @@ import {
   describeConfigLayers,
   describeConfigWarnings,
   globalConfigPath,
-  isAntigravityRail,
-  isRail,
   loadConfig,
   mergeConfig,
   modelIdRejection,
   notJsonFault,
   projectConfigPath,
-  railFromModel,
   skillKey,
   thinkingFor,
   unusableConfigFileLines,
 } from "../src/config.ts";
+import {
+  ANTIGRAVITY_RAILS,
+  RAILS,
+  isAntigravityRail,
+  isRail,
+  railFromModel,
+  type Rail,
+} from "../src/rail.ts";
 import { agentName, modelId, skillName, agentTable, modelTable, skillTable } from "./helpers/identifiers.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the

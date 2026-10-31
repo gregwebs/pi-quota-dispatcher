@@ -14,7 +14,8 @@
  * local, explicitly named bypass at the one test that exercises a violated
  * invariant.
  */
-import type { AgentRoute, Candidate, ModelDefault, Rail, ThinkingLevel } from "../../src/config.ts";
+import type { AgentRoute, Candidate, ModelDefault, ThinkingLevel } from "../../src/config.ts";
+import type { Rail } from "../../src/rail.ts";
 import type { AgentName, ModelId, Parsed, SkillName } from "../../src/identifiers.ts";
 import { parseAgentName, parseModelId, parseSkillName } from "../../src/identifiers.ts";
 

@@ -39,28 +39,24 @@
  * (an email, a metadata block) that the report deliberately never prints. A
  * cache is not worth publishing the vendor's own document in.
  *
- * The type-only import of the reading shape is what keeps this module free of a
- * runtime cycle: `index.ts` imports `createSharedReadings` from here, and this
- * module learns the reading types from `index.ts` in a form the compiler erases.
+ * The reading itself — its shape, its decoder, the judgments that can be made
+ * about it — is `rail-reading.ts`, imported rather than restated: what this file
+ * stores and what it replays are one definition, validated by one decoder. The
+ * entry envelope, the document version and the gates are this file's own.
  */
 import { createHash } from "node:crypto";
 import { open, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { errnoIs, lockPathFor, withLockPath, type FileWritePacing, type LockAttempt } from "./agent-file.ts";
+import { READINGS_FILE_NAME } from "./config.ts";
+import { ANTIGRAVITY_RAILS, isAntigravityRail, isRail, type AntigravityRail } from "./rail.ts";
 import {
-  ANTIGRAVITY_RAILS,
-  READINGS_FILE_NAME,
-  isAntigravityRail,
-  isRail,
-  type AntigravityRail,
-} from "./config.ts";
-import type {
-  FailedReading,
-  GoodReading,
-  RailWindow,
-  VendorRail,
-  VendorRailReadings,
-} from "./index.ts";
+  decodeReading,
+  type GoodReading,
+  type VendorRail,
+  type VendorRailReadings,
+  type VendorReading,
+} from "./rail-reading.ts";
 
 /**
  * The version this module writes.
@@ -131,9 +127,6 @@ export const DEFAULT_SHARED_READINGS: Omit<SharedReadingsPacing, "fetchWaitMs"> 
   pollMs: 25,
   staleMs: 10_000,
 };
-
-/** A reading that came from asking: every rail but the metered one, and the only kind the file holds. */
-export type VendorReading = GoodReading | FailedReading;
 
 /**
  * What one Antigravity fetch answers: all three pool rails, each correlated with
@@ -378,67 +371,6 @@ function tempPathFor(path: string): string {
 }
 
 /**
- * Whether `value` is a window the policy can weigh.
- *
- * Each field is the one a consumer reads: `label` and `used` are interpolated
- * straight into the report, so a missing one would print `undefined`, and
- * `budget` and `resetsAt` are optional exactly as `RailWindow` declares them.
- * A window that fails here fails its whole reading, because a reading is the
- * unit the policy decides on and half of one is not a reading.
- */
-function validWindow(value: unknown): value is RailWindow {
-  if (value === null || typeof value !== "object") return false;
-  const w = value as Record<string, unknown>;
-  if (typeof w.label !== "string") return false;
-  if (typeof w.used !== "number" || !Number.isFinite(w.used)) return false;
-  if (w.budget !== undefined && w.budget !== "session" && w.budget !== "weekly") return false;
-  if (w.resetsAt !== undefined && (typeof w.resetsAt !== "number" || !Number.isFinite(w.resetsAt))) {
-    return false;
-  }
-  return true;
-}
-
-/**
- * Whether `value` is a successful reading of `rail`, as the file's schema
- * states one.
- *
- * The `raw` key must be *present* rather than merely truthy: a generator reads
- * it, and an entry whose writer dropped it would be a reading a consumer cannot
- * use. `metered` is refused exactly where the union refuses it, so a hand-edited
- * file cannot smuggle the metered arm into a capped rail.
- */
-function goodReading(value: unknown, rail: VendorRail): GoodReading | undefined {
-  if (value === null || typeof value !== "object") return undefined;
-  const r = value as Record<string, unknown>;
-  if (r.rail !== rail) return undefined;
-  if (r.ok !== true) return undefined;
-  if (r.metered !== undefined) return undefined;
-  if (typeof r.readAt !== "number" || !Number.isFinite(r.readAt)) return undefined;
-  if (!Array.isArray(r.windows) || !r.windows.every(validWindow)) return undefined;
-  if (!Object.hasOwn(r, "raw")) return undefined;
-  if (r.note !== undefined && typeof r.note !== "string") return undefined;
-  return r as unknown as GoodReading;
-}
-
-/**
- * Whether `value` is a failed reading of `rail`, as the file's schema states
- * one. The empty `windows` is required rather than tolerated: a failure reports
- * no windows, and a decoded failure that carried some would give the policy
- * numbers the failure's own note says it does not have.
- */
-function failedReading(value: unknown, rail: VendorRail): FailedReading | undefined {
-  if (value === null || typeof value !== "object") return undefined;
-  const r = value as Record<string, unknown>;
-  if (r.rail !== rail) return undefined;
-  if (r.ok !== false) return undefined;
-  if (r.metered !== undefined) return undefined;
-  if (typeof r.readAt !== "number" || !Number.isFinite(r.readAt)) return undefined;
-  if (!Array.isArray(r.windows) || r.windows.length !== 0) return undefined;
-  if (typeof r.note !== "string") return undefined;
-  return r as unknown as FailedReading;
-}
-
-/**
  * The fault one entry fails on, named the way the report can point at it: by the
  * rail it claims when it claims a string, else by its position, because a
  * shapeless entry names no rail to point at.
@@ -474,12 +406,13 @@ function fileEntry(
   if (!readableRail(rail, version)) return { fault: entryFault(rail, index) };
   if (typeof e.credential !== "string" || e.credential === "") return { fault: entryFault(rail, index) };
   if (typeof e.at !== "number" || !Number.isFinite(e.at)) return { fault: entryFault(rail, index) };
-  const latest = goodReading(e.latest, rail) ?? failedReading(e.latest, rail);
+  const latest = decodeReading(e.latest, rail);
   if (latest === undefined) return { fault: entryFault(rail, index) };
   let lastGood: GoodReading | undefined;
   if (e.lastGood !== undefined) {
-    lastGood = goodReading(e.lastGood, rail);
-    if (lastGood === undefined) return { fault: entryFault(rail, index) };
+    const decoded = decodeReading(e.lastGood, rail);
+    if (decoded === undefined || !decoded.ok) return { fault: entryFault(rail, index) };
+    lastGood = decoded;
   }
   return {
     entry: {

@@ -11,11 +11,11 @@
  * context, no config, no clock — is reachable from here, which is what makes "a
  * drawing never causes a read" a property of the type rather than a promise.
  *
- * The type-only import of `VendorRail` back from index.ts follows the same
- * cycle-safe precedent as `readings-file.ts` and `refresh.ts`: types are erased,
- * so the runtime graph stays one-directional.
+ * The reading types are imported from `rail-reading.ts` and erased before the
+ * runtime graph is built, so a drawing depends on the reading's shape and on
+ * nothing else: no dispatcher, no configuration, no store.
  */
-import type { VendorRail } from "./index.ts";
+import type { VendorRail } from "./rail-reading.ts";
 
 /**
  * The tie order, and the order a rail with no number falls back to.

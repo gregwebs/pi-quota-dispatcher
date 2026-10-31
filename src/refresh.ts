@@ -4,8 +4,9 @@
  * docs/adr/0007-refresh-pings.md.
  *
  * The shared runner and default-profile predicate live here so index.ts can
- * call them without this module importing the extension at runtime. The types
- * coming back from index.ts are erased, as in readings-file.ts.
+ * call them without this module importing the extension at runtime. The
+ * credential types still come back from index.ts in a form the compiler erases;
+ * they are the last half of that cycle, and move with the credentials themselves.
  */
 import { execFile } from "node:child_process";
 import { createServer, type Server } from "node:http";

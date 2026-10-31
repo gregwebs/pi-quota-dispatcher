@@ -10,23 +10,25 @@ import {
   type Decision,
   type DispatcherConfig,
   type DroppedAlternate,
-  type Rail,
-  type RailReading,
-  type RailWindow,
   type QuotaReadPacing,
   type ThinkingLevel,
   DEFAULT_CONFIG,
   applyDecision,
-  budgetUsed,
   createDispatcher,
   decide,
   describeDecision,
   describeDecisionLines,
-  parseClaudeUsage,
-  parseCodexUsage,
   upsertModel,
   upsertThinking,
 } from "../src/index.ts";
+import type { Rail } from "../src/rail.ts";
+import {
+  budgetUsed,
+  parseClaudeUsage,
+  parseCodexUsage,
+  type RailReading,
+  type RailWindow,
+} from "../src/rail-reading.ts";
 import { agentName, modelId, routeOf, agentTable, modelTable } from "./helpers/identifiers.ts";
 import { startHolder } from "./fixtures/agent-write-child.ts";
 

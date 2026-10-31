@@ -45,18 +45,13 @@ import { userInfo } from "node:os";
 import { basename, delimiter, join, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import {
-  ANTIGRAVITY_RAILS,
   DEFAULT_CONFIG,
-  RAILS,
-  isAntigravityRail,
   type AgentRoute,
-  type AntigravityRail,
   type Candidate,
   type ConfigFile,
   type DispatcherConfig,
   type LoadedConfig,
   type ModelDefault,
-  type Rail,
   type ThinkingLevel,
   agentKey,
   configFilesFor,
@@ -67,10 +62,50 @@ import {
   globalConfigPath,
   loadConfig,
   projectConfigPath,
-  railFromModel,
   thinkingFor,
   unusableConfigFileLines,
 } from "./config.ts";
+
+// The rail vocabulary — identity, the guards over it, the model prefixes that
+// imply one — lives in `rail.ts`, because a configuration names a rail and does
+// not define what one is.
+import {
+  ANTIGRAVITY_RAILS,
+  OTHER_BUDGET,
+  RAIL_BUDGETS,
+  RAILS,
+  carries,
+  isAntigravityRail,
+  railFromModel,
+  type AntigravityRail,
+  type Budget,
+  type Rail,
+} from "./rail.ts";
+
+// The reading is the policy's only evidence: its shape, the parsers that build
+// it from a vendor's document and the judgments about it all live here, so the
+// policy, the gauge, the readings file and the generator share one definition.
+import {
+  absentBudgets,
+  budgetUsed,
+  isTight,
+  parseAntigravityUsage,
+  parseClaudeUsage,
+  parseCodexUsage,
+  weekSpent,
+  type FailedReading,
+  type GoodReading,
+  type MeteredRailReadings,
+  type MeteredReading,
+  type RailReading,
+  type RailReadings,
+  type RailWindow,
+  type VendorRail,
+  type VendorRailReadings,
+  type VendorReading,
+} from "./rail-reading.ts";
+
+import { jsonObject } from "./json.ts";
 
 // The generator module is where a declared command's output replaces one config
 // layer. Its orchestration is a call the command handler makes, not a public
@@ -87,15 +122,15 @@ import {
 } from "./generator.ts";
 
 // Config is a separate module because it is read from disk at run time; it is
-// re-exported here so `src/index.ts` remains the one import path for the
-// extension's whole surface.
+// re-exported here so the extension's runtime surface has one import path. The
+// rail and reading vocabulary is deliberately not part of that surface: `rail.ts`
+// and `rail-reading.ts` are imported directly by everything that needs them, so
+// the entry point cannot become the definition of a reading again.
 export {
-  ANTIGRAVITY_RAILS,
   CLAUDE_REFRESH_MODES,
   CONFIG_FILE_NAME,
   DEFAULT_CONFIG,
   DEFAULT_GENERATOR_TIMEOUT_MS,
-  RAILS,
   THINKING_LEVELS,
   agentKey,
   configFilesFor,
@@ -104,22 +139,18 @@ export {
   describeConfigLayers,
   describeConfigWarnings,
   globalConfigPath,
-  isAntigravityRail,
   isClaudeRefreshMode,
-  isRail,
   isThinkingLevel,
   loadConfig,
   mergeConfig,
   modelIdRejection,
   parseGeneratorDeclaration,
   projectConfigPath,
-  railFromModel,
   skillKey,
   thinkingFor,
 } from "./config.ts";
 export type {
   AgentRoute,
-  AntigravityRail,
   Candidate,
   ClaudeRefreshMode,
   ConfigFile,
@@ -134,7 +165,6 @@ export type {
   MergeLayer,
   MergeResult,
   ModelDefault,
-  Rail,
   SkipFlag,
   SkillBinding,
   ThinkingLevel,
@@ -177,13 +207,11 @@ import {
   type SharedReadingsPacing,
   type SingleFetchRail,
   type StickyHalt,
-  type VendorReading,
 } from "./readings-file.ts";
 
 // The readings module is where the rail cache lives and is shared across
 // processes; re-exported here for the same reason as the config and models
-// modules, so `src/index.ts` is the one import path for the extension's whole
-// surface.
+// modules.
 export {
   DEFAULT_SHARED_READINGS,
   READINGS_FILE_VERSION,
@@ -201,7 +229,6 @@ export type {
   SharedReadingsPacing,
   SingleFetchRail,
   StickyHalt,
-  VendorReading,
 } from "./readings-file.ts";
 
 // The models module is where a config's model ids are resolved against the pi
@@ -275,183 +302,6 @@ export { GAUGE_LABELS, GAUGE_ORDER, renderRailGauge, resetText } from "./rail-ga
 export type { BudgetGauge, GaugeEntry, GaugeStyle, StaleBudgetGauge } from "./rail-gauge.ts";
 
 // ---------------------------------------------------------------- types
-
-/**
- * The two budgets a rail imposes, which move on very different clocks.
- *
- * They have to be weighed separately. Collapsing them into one "worst window"
- * number let the weekly figure dominate every decision, because it is almost
- * always the larger of the two: a rail with a full session budget and a
- * comfortable week would be treated as tight purely on the week, and moving off
- * a weekly figure is close to one-way — it does not recover for days.
- */
-export type Budget = "session" | "weekly";
-
-export interface RailWindow {
-  readonly label: string;
-  /**
-   * How much of the window is used, in percent. This is the figure the policy
-   * weighs and the report prints, which on one path is not a transcription of
-   * the vendor's document: Codex's `limit_reached` path reports every window
-   * full (`100`) even where the response's own percentages say less (see
-   * `GoodReading.raw`). The windows and the raw body therefore come from the
-   * same response, but `used` is the policy-effective number rather than an
-   * arithmetic shadow of `raw`.
-   */
-  readonly used: number;
-  /**
-   * Set when this window belongs to a budget the policy weighs. Windows left
-   * unclassified are display-only: model-specific sub-caps and vendor windows
-   * we do not recognise.
-   */
-  readonly budget?: Budget;
-  /**
-   * When this window resets, in epoch milliseconds on the clock
-   * `DispatcherDeps.now` reads, when the vendor reports it.
-   *
-   * Absolute rather than "seconds from now" because a reading is consulted after
-   * it was taken — by a later report, by whoever reads the cache — and a relative
-   * figure is wrong by however long it sat. Codex states its reset relative to
-   * the response, so it is converted against the reading's `readAt`; Claude's is
-   * already absolute.
-   *
-   * Milliseconds rather than ISO text: every other time here is on that clock,
-   * so freshness is a subtraction, and Claude's own text beside a converted
-   * Codex instant would be two dialects of one field. Text is a choice for
-   * whoever writes a reading out.
-   */
-  readonly resetsAt?: number;
-}
-
-/**
- * A read the vendor answered with windows we could classify.
- *
- * `raw` is the document those windows were parsed from — the same response, not
- * a second request. It is kept whole and uninterpreted: it is for readers that
- * want what normalization leaves out, never for the policy, and never printed in
- * a report or a note, since a vendor's account document is not ours to echo.
- */
-export interface GoodReading {
-  readonly rail: Rail;
-  readonly ok: true;
-  /** Declared only so `reading.metered` narrows a `RailReading`: a rail that was read is not metered. */
-  readonly metered?: undefined;
-  /** Every window the endpoint reported, for display. Only some carry a budget. */
-  readonly windows: readonly RailWindow[];
-  /**
-   * When the read ended, on the `DispatcherDeps.now` clock. Codex's relative
-   * resets are converted against it; it is not the cache's TTL origin, which is
-   * stamped when the finished reading is stored.
-   */
-  readonly readAt: number;
-  /**
-   * The vendor's response body as it arrived — the document `windows` was parsed
-   * from, never a second request. It is what normalization leaves out. It does
-   * not promise that `windows[].used` can be recomputed from it: the Codex
-   * limiter reports `used: 100` over the vendor's own percentages (see
-   * `RailWindow.used`).
-   */
-  readonly raw: unknown;
-  /**
-   * A display-only qualifier — Codex's `limit_reached=true`, or the sticky
-   * refresh anomaly — that the report must still show on a healthy rail.
-   */
-  readonly note?: string;
-}
-
-/**
- * A read that left the rail without a usable reading: the endpoint refused or
- * never answered, answered with nothing we could classify, or there was no
- * credential to ask with. It reports no windows and no `raw` — not the last ones
- * seen — because a failure states only why it failed; what was last known is
- * the last good reading's job.
- */
-export interface FailedReading {
-  readonly rail: Rail;
-  readonly ok: false;
-  /** Declared only so `reading.metered` narrows a `RailReading`. */
-  readonly metered?: undefined;
-  readonly windows: readonly [];
-  /** When the read gave up, on the `DispatcherDeps.now` clock. */
-  readonly readAt: number;
-  /**
-   * Why the read failed. A failed read that was given up on says how many
-   * attempts it cost (`HTTP 500 after 2 attempts`); a failure another request
-   * would not have fixed is reported as that failure alone — see
-   * `afterAttempts`.
-   */
-  readonly note: string;
-}
-
-/**
- * A rail billed per token rather than quota-capped, so there is no budget to
- * read: `budgetUsed` reports 0 on both and the rail can never block a switch.
- * Distinct from reporting no windows, which for a capped rail is a partial
- * reading the policy must not guess at.
- *
- * It is never read, so it has no `readAt` and no `raw`: there is no instant it
- * was taken at and no response it came from.
- */
-export interface MeteredReading {
-  /** The one metered rail: `deepseekReading` is this reading's only producer. */
-  readonly rail: "deepseek";
-  readonly ok: true;
-  readonly metered: true;
-  readonly windows: readonly [];
-  readonly note?: string;
-}
-
-/**
- * What one quota read reports for one rail — the policy's only evidence. It
- * states facts; whether a budget is tight is the judgment `decide` makes about
- * it, not part of it.
- */
-export type RailReading = GoodReading | FailedReading | MeteredReading;
-
-/**
- * A rail's latest reading beside its last good one.
- *
- * They answer different questions, so neither stands in for the other. `latest`
- * is what the policy decides on: a failed latest read holds whatever an earlier
- * read said, because routing on numbers the latest read could not confirm is the
- * guess the hold exists to refuse (ADR 0006). `lastGood` is the vendor's last
- * word together with when it was said, for readers outside the policy, and it is
- * never routed on.
- *
- * The union proves the outcome correlation. A vendor success is paired with its
- * own last good reading — required, never `undefined`, and the *same object* — so
- * a consumer knows a success is also the last word; a failure may carry the good
- * reading left behind; a metered rail carries neither. It does not prove that
- * `latest` and `lastGood` are about the same rail: the variants do not name their
- * rails, though rail literals or a mapped type could correlate them if they did.
- * Nor does it prove a `lastGood` was really recorded before `latest` — object
- * identity and history are the writer's job. Two writers build this shape:
- * `asReadings` projects the shared store's cached vendor rails, and the
- * `deepseek` arm of `railReadings` builds the metered reading directly.
- *
- * The metered arm's `lastGood?: never` is deliberate. Without it, structural
- * typing lets the other arms' `lastGood` property through to a metered entry,
- * because a union's excess-property check accepts a key any arm declares.
- */
-export type RailReadings =
-  | { readonly latest: MeteredReading; readonly lastGood?: never }
-  | { readonly latest: FailedReading; readonly lastGood?: GoodReading }
-  | { readonly latest: GoodReading; readonly lastGood: GoodReading };
-
-/**
- * A vendor rail's readings: the arms of `RailReadings` the cache can produce,
- * with the metered arm — which only the metered rail can have — excluded.
- */
-export type VendorRailReadings = Exclude<RailReadings, { readonly latest: MeteredReading }>;
-
-/** The metered arm, which only the metered rail can have. */
-export type MeteredRailReadings = Extract<RailReadings, { readonly latest: MeteredReading }>;
-
-/**
- * A rail the dispatcher asks a vendor about: every rail but the metered one,
- * which has no endpoint to ask and no cache entry to hold.
- */
-export type VendorRail = Exclude<Rail, "deepseek">;
 
 /**
  * Every rail's readings as the dispatcher already holds them, keyed by the rail
@@ -658,240 +508,7 @@ export type Decision =
     })
   | { agent: AgentName; kind: "hold"; why: string };
 
-// ---------------------------------------------------------------- parsing
-
-function num(v: unknown): number | undefined {
-  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
-}
-
-/**
- * The largest instant a JavaScript `Date` can represent, in epoch milliseconds
- * (±100,000,000 days, `8.64e15`). Past it `new Date(ms)` is invalid and
- * `.toISOString()` throws, so a reading carrying one is not usable by the
- * serializer `generatorInput` builds — the same reason `instant` drops an
- * unparseable Claude reset.
- */
-const MAX_EPOCH_MS = 8.64e15;
-
-/**
- * Whether `ms` is an instant a `Date` can hold: finite and inside
- * `MAX_EPOCH_MS`. A derived reset that fails this is dropped like a malformed
- * absolute one, rather than reaching a reader as `Infinity` or an out-of-range
- * number.
- */
-function representableInstant(ms: number): boolean {
-  return Number.isFinite(ms) && Math.abs(ms) <= MAX_EPOCH_MS;
-}
-
-/**
- * An absolute time a vendor wrote as text, in epoch milliseconds — `undefined`
- * when it is absent or not a time at all, so a malformed value is dropped like a
- * missing one rather than reaching a reader as `NaN`.
- */
-function instant(v: unknown): number | undefined {
-  if (typeof v !== "string") return undefined;
-  const ms = Date.parse(v);
-  return Number.isFinite(ms) ? ms : undefined;
-}
-
-/**
- * Claude reports an account-wide session cap (`five_hour`) alongside weekly
- * caps: one account-wide plus per-model ones. Every weekly figure is classified
- * as the same budget, so the worst of them is what the weekly guard sees — a
- * Sonnet cap at 95% does block you, even when the account-wide week is
- * comfortable.
- *
- * Claude states each window's reset as absolute text (`resets_at`), taken as an
- * instant so a reading consulted later still says when the window clears.
- */
-export function parseClaudeUsage(data: any): RailWindow[] {
-  const keys: Array<[string, string, Budget | undefined]> = [
-    ["five_hour", "5h", "session"],
-    ["seven_day", "7d", "weekly"],
-    ["seven_day_sonnet", "7d Sonnet", "weekly"],
-    ["seven_day_opus", "7d Opus", "weekly"],
-    ["seven_day_omelette", "7d omelette", "weekly"],
-  ];
-  const windows: RailWindow[] = [];
-  for (const [key, label, budget] of keys) {
-    const used = num(data?.[key]?.utilization);
-    if (used !== undefined) {
-      const resetsAt = instant(data?.[key]?.resets_at);
-      windows.push({
-        label,
-        used,
-        ...(budget ? { budget } : {}),
-        ...(resetsAt !== undefined ? { resetsAt } : {}),
-      });
-    }
-  }
-  return windows;
-}
-
-/**
- * Label a window from its advertised length rather than assuming it, so the
- * display cannot quietly drift if the vendor changes a window.
- */
-function durationLabel(seconds: number | undefined, fallback: string): string {
-  if (seconds === undefined) return fallback;
-  if (seconds % 86400 === 0) return `${seconds / 86400}d`;
-  if (seconds % 3600 === 0) return `${seconds / 3600}h`;
-  return `${Math.round(seconds / 60)}m`;
-}
-
-/**
- * Codex reports a short "primary" window and a long "secondary" one. The
- * positions are the vendor's stable meaning; the labels come from the advertised
- * window length, and `reset_after_seconds` tells us when each recovers.
- *
- * `reset_after_seconds` is relative to the response, so it is converted against
- * `readAt`, the instant the read ended.
- */
-export function parseCodexUsage(
-  data: any,
-  { readAt }: { readAt: number },
-): {
-  windows: RailWindow[];
-  limited: boolean;
-} {
-  const rl = data?.rate_limit;
-  const windows: RailWindow[] = [];
-  const push = (key: string, budget: Budget, fallback: string) => {
-    const w = rl?.[key];
-    const used = num(w?.used_percent);
-    if (used === undefined) return;
-    const after = num(w?.reset_after_seconds);
-    const resetsAt = after === undefined ? undefined : readAt + after * 1000;
-    windows.push({
-      label: durationLabel(num(w?.limit_window_seconds), fallback),
-      used,
-      budget,
-      ...(resetsAt !== undefined && representableInstant(resetsAt) ? { resetsAt } : {}),
-    });
-  };
-  push("primary_window", "session", "5h");
-  push("secondary_window", "weekly", "7d");
-  return { windows, limited: rl?.limit_reached === true };
-}
-
-/**
- * `value` as a plain JSON object, or `undefined` when it is anything else.
- *
- * Antigravity's document arrives as parsed JSON, and every level of it is
- * untrusted: a summary endpoint that answers with a bare array, a `null` bucket
- * or a string where an object belongs must leave the parser with nothing rather
- * than reach a property read that throws.
- */
-function jsonObject(value: unknown): Record<string, unknown> | undefined {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
-  return value as Record<string, unknown>;
-}
-
-/**
- * Which pool owns a bucket, by the bucket id's own prefix.
- *
- * The vendor groups its buckets under display names, but the names and the group
- * order are presentation: what a bucket *is* comes from its id. Argon is matched
- * before the general `gemini-` prefix because the Argon pool's buckets are Gemini
- * buckets too (`gemini-argon-wtu-weekly`), and only the id distinguishes them.
- */
-function antigravityPoolFor(bucketId: string): AntigravityRail | undefined {
-  if (bucketId.startsWith("gemini-argon-")) return "antigravity-argon";
-  if (bucketId.startsWith("gemini-")) return "antigravity-gemini";
-  if (bucketId.startsWith("3p-")) return "antigravity-3p";
-  return undefined;
-}
-
-/**
- * The budget a bucket's window counts toward.
- *
- * Exact matches only: an unfamiliar window (a future `monthly`, a vendor rename)
- * is display-only rather than guessed into a budget, because a guess would make a
- * required budget look reported when it was not.
- */
-function antigravityBudget(window: unknown): Budget | undefined {
-  if (window === "5h") return "session";
-  if (window === "weekly") return "weekly";
-  return undefined;
-}
-
-/**
- * One `retrieveUserQuotaSummary` document partitioned across the three pools.
- *
- * A pool with no bucket of its own is an empty list, not an absent key: the
- * caller states the same three rails whatever the vendor said, and an empty list
- * is how "this response said nothing about that pool" is spelled. Everything the
- * parser cannot use — a bucket with no id, a fraction that is missing or not a
- * number, a bucket belonging to no pool — is dropped rather than repaired.
- *
- * `remainingFraction` is what the vendor reports, so `used` is its complement in
- * whole percent, clamped: a fraction outside `[0, 1]` would otherwise produce a
- * negative or impossible usage figure that the policy would weigh as real.
- */
-export function parseAntigravityUsage(data: unknown): Record<AntigravityRail, RailWindow[]> {
-  const windows: Record<AntigravityRail, RailWindow[]> = {
-    "antigravity-argon": [],
-    "antigravity-gemini": [],
-    "antigravity-3p": [],
-  };
-  const groups = jsonObject(data)?.groups;
-  if (!Array.isArray(groups)) return windows;
-  for (const group of groups) {
-    const buckets = jsonObject(group)?.buckets;
-    if (!Array.isArray(buckets)) continue;
-    for (const bucket of buckets) {
-      const fields = jsonObject(bucket);
-      if (fields === undefined) continue;
-      const bucketId = fields.bucketId;
-      if (typeof bucketId !== "string") continue;
-      const rail = antigravityPoolFor(bucketId);
-      if (rail === undefined) continue;
-      const remaining = num(fields.remainingFraction);
-      if (remaining === undefined) continue;
-      const budget = antigravityBudget(fields.window);
-      const resetsAt = instant(fields.resetTime);
-      windows[rail].push({
-        label: bucketId,
-        used: Math.round((1 - Math.min(1, Math.max(0, remaining))) * 100),
-        ...(budget === undefined ? {} : { budget }),
-        ...(resetsAt === undefined ? {} : { resetsAt }),
-      });
-    }
-  }
-  return windows;
-}
-
 // ---------------------------------------------------------------- policy
-
-/**
- * The budgets each rail actually carries, which is the difference between "no
- * cap here" and "this read did not say".
- *
- * A pool need not impose both caps: Antigravity's Argon pool has one weekly
- * bucket and no 5-hour window at all, and the metered rail has no cap of either
- * kind. Only a carried budget can be *missing* — an uncarried one is a budget the
- * rail cannot exceed, so its effective usage is zero and no threshold, not even
- * one configured as `0`, can make it tight. Reading the two cases alike is what
- * would hold every Argon primary for a session window the vendor never promised.
- *
- * Declared as one exhaustive record so a new rail cannot be added without
- * answering this question.
- */
-const RAIL_BUDGETS: Record<Rail, readonly Budget[]> = {
-  claude: ["session", "weekly"],
-  codex: ["session", "weekly"],
-  "antigravity-argon": ["weekly"],
-  "antigravity-gemini": ["session", "weekly"],
-  "antigravity-3p": ["session", "weekly"],
-  deepseek: [],
-};
-
-/** The budget a destination would still have to survive. */
-const OTHER_BUDGET: Record<Budget, Budget> = { session: "weekly", weekly: "session" };
-
-function carries(rail: Rail, budget: Budget): boolean {
-  return RAIL_BUDGETS[rail].includes(budget);
-}
 
 function thresholdFor(budget: Budget, cfg: DispatcherConfig): number {
   return budget === "session" ? cfg.sessionSwitchAt : cfg.weeklySwitchAt;
@@ -971,41 +588,6 @@ function pctExact(n: number): string {
   return `${Number(n.toFixed(6))}%`;
 }
 
-/**
- * Used-percent for one budget, or `undefined` when the rail carries the budget
- * and did not report it.
- *
- * `undefined` rather than 0 is the point, and applies to a budget the rail
- * carries. A missing 5-hour window on a rail that has one is not evidence that
- * the 5-hour budget is free, and reading it as free is exactly how a rail that
- * was blocked outright came to look like the roomiest place to send work.
- * Several windows can share a budget — Claude reports an account-wide week plus
- * per-model weeks, Antigravity reports one bucket per pool — so this takes the
- * worst of them.
- *
- * `0` is the answer for a budget the rail does not carry: a metered rail is
- * billed per token rather than capped, and Argon's pool has no session window, so
- * neither can ever be tight there. That is a different fact from "the read did
- * not say", and the two must not be spelled alike — see `RAIL_BUDGETS`.
- */
-export function budgetUsed(reading: RailReading, budget: Budget): number | undefined {
-  if (reading.metered || !carries(reading.rail, budget)) return 0;
-  const used = reading.windows.filter((w) => w.budget === budget).map((w) => w.used);
-  return used.length ? Math.max(...used) : undefined;
-}
-
-/**
- * The budgets a rail carries and failed to report.
- *
- * A budget the rail does not carry is never missing — it reads 0 through
- * `budgetUsed` — and unreadable rails are rejected before this is consulted, so
- * anything returned here is a partial reading of a cap the rail really has. The
- * policy holds rather than guessing: an unreported budget is not an idle one.
- */
-function absentBudgets(reading: RailReading): Budget[] {
-  return RAIL_BUDGETS[reading.rail].filter((b) => budgetUsed(reading, b) === undefined);
-}
-
 /** The budgets the rail carries, for the decision's `why`. */
 function budgetSummary(reading: RailReading): string {
   if (reading.metered) return reading.note ?? "metered";
@@ -1040,37 +622,10 @@ function gaugedRails(cfg: DispatcherConfig): VendorRail[] {
 }
 
 /**
- * Used-percent at which a budget has reached the vendor's own cap. Not a
- * threshold: the switch thresholds are configurable and this is the vendor's
- * hard limit, the one that changes how the vendor behaves rather than how the
- * dispatcher does.
- */
-const EXHAUSTED = 100;
-
-/**
- * Whether a spent week has switched this rail's session budget off, and left it
- * with nothing to spend.
- *
- * Antigravity says so in as many words — "You have hit your weekly limit, the
- * 5-hour limit does not currently apply" — and still reports a 5-hour window at
- * 0%, so the figure must be read against the week rather than taken at face
- * value. The week is the rail's worst pool, which is what `budgetUsed` returns:
- * one pool at its cap is enough, and the vendor turns the limit off for the
- * whole account. A rail with no session budget still answers here, because a
- * spent week leaves it with nothing to spend either — only the `disabled` slot
- * is out of its reach (`freshBudget` and `staleBudget` answer `uncarried` first,
- * so Argon keeps its `–`).
- */
-function weekSpent(reading: RailReading): boolean {
-  const week = budgetUsed(reading, "weekly");
-  return week !== undefined && week >= EXHAUSTED;
-}
-
-/**
  * One budget of a fresh reading as the gauge draws it.
  *
- * Tightness is the policy's own test (`used >= thresholdFor`) on the same raw
- * number, so a budget the policy calls tight cannot print as comfortable.
+ * Tightness is the judgment `isTight` makes — the same test the policy applies —
+ * so a budget the policy calls tight cannot print as comfortable.
  *
  * Both arms carry a countdown, because the footer answers "how much" and "for
  * how long" for every figure it prints, not only the alarming ones. The two ask
@@ -1092,7 +647,7 @@ function freshBudget(
   if (used === undefined) return { kind: "unreported" };
   const threshold = thresholdFor(budget, context.cfg);
   const windows = reading.windows.filter((window) => window.budget === budget);
-  if (used < threshold) {
+  if (!isTight(reading, budget, threshold)) {
     const holders = windows.filter((window) => window.used === used);
     return { kind: "used", used, resetInMs: latestResetIn(holders, context.now) };
   }
@@ -1336,8 +891,8 @@ export function decide(
   // been chosen, so an unreadable one is no reason to hold. Only the budgets the
   // primary's pool actually carries can be tight — a pool with no session cap is
   // never tight on one, whatever the threshold says.
-  const tightBudgets = RAIL_BUDGETS[primary.rail].filter(
-    (budget) => budgetUsed(primary, budget)! >= thresholdFor(budget, cfg),
+  const tightBudgets = RAIL_BUDGETS[primary.rail].filter((budget) =>
+    isTight(primary, budget, thresholdFor(budget, cfg)),
   );
   if (!tightBudgets.length) {
     return assign(route.primary, `${primary.rail} ok (${budgetSummary(primary)})`);
@@ -1393,7 +948,7 @@ export function decide(
       // reject every such destination for a cap it does not have.
       if (carries(state.rail, spare)) {
         const altSpare = budgetUsed(state, spare)!;
-        if (altSpare >= spareThreshold) {
+        if (isTight(state, spare, spareThreshold)) {
           // Named by model, not just rail: two alternates can share a rail, and a
           // rail alone cannot say which one was passed over.
           rejected.push(

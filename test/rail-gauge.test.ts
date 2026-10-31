@@ -3,13 +3,7 @@ import { test } from "node:test";
 
 import {
   type GaugeEntry,
-  type GoodReading,
   type GaugeStyle,
-  type Rail,
-  type RailReadings,
-  type RailWindow,
-  type VendorRail,
-  type FailedReading,
   DEFAULT_CONFIG,
   type DispatcherConfig,
   railGauge,
@@ -17,6 +11,14 @@ import {
   renderRailGauge,
   resetText,
 } from "../src/index.ts";
+import type { Rail } from "../src/rail.ts";
+import type {
+  FailedReading,
+  GoodReading,
+  RailReadings,
+  RailWindow,
+  VendorRail,
+} from "../src/rail-reading.ts";
 import { agentTable, routeOf } from "./helpers/identifiers.ts";
 import type { AgentRoute } from "../src/config.ts";
 
