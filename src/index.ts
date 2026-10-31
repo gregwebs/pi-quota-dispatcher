@@ -1040,6 +1040,30 @@ function gaugedRails(cfg: DispatcherConfig): VendorRail[] {
 }
 
 /**
+ * Used-percent at which a budget has reached the vendor's own cap. Not a
+ * threshold: the switch thresholds are configurable and this is the vendor's
+ * hard limit, the one that changes how the vendor behaves rather than how the
+ * dispatcher does.
+ */
+const EXHAUSTED = 100;
+
+/**
+ * Whether a spent week has switched this rail's session budget off.
+ *
+ * Antigravity says so in as many words — "You have hit your weekly limit, the
+ * 5-hour limit does not currently apply" — and still reports a 5-hour window at
+ * 0%, so the figure must be read against the week rather than taken at face
+ * value. The week is the rail's worst pool, which is what `budgetUsed` returns:
+ * one pool at its cap is enough, and the vendor turns the limit off for the
+ * whole account. A rail with no session budget never asks this question, because
+ * `freshBudget` and `staleBudget` answer `uncarried` first — Argon keeps its `–`.
+ */
+function weekSpent(reading: RailReading): boolean {
+  const week = budgetUsed(reading, "weekly");
+  return week !== undefined && week >= EXHAUSTED;
+}
+
+/**
  * One budget of a fresh reading as the gauge draws it.
  *
  * Tightness is the policy's own test (`used >= thresholdFor`) on the same raw
@@ -1060,6 +1084,7 @@ function freshBudget(
   context: { cfg: DispatcherConfig; now: number },
 ): BudgetGauge {
   if (!carries(reading.rail, budget)) return { kind: "uncarried" };
+  if (budget === "session" && weekSpent(reading)) return { kind: "disabled" };
   const used = budgetUsed(reading, budget);
   if (used === undefined) return { kind: "unreported" };
   const threshold = thresholdFor(budget, context.cfg);
@@ -1100,6 +1125,9 @@ function latestResetIn(windows: readonly RailWindow[], now: number): number | un
  */
 function staleBudget(reading: GoodReading, budget: Budget): StaleBudgetGauge {
   if (!carries(reading.rail, budget)) return { kind: "uncarried" };
+  // The week the last good reading saw was spent, and the vendor's switch-off
+  // came with it: a stale 0% session is as misleading as a fresh one.
+  if (budget === "session" && weekSpent(reading)) return { kind: "disabled" };
   const used = budgetUsed(reading, budget);
   return used === undefined ? { kind: "unreported" } : { kind: "used", used };
 }

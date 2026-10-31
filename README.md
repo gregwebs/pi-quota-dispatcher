@@ -229,7 +229,8 @@ claude 13,2h/91,4d │ codex 74,2h/41 │ ag-argon –/62,6d
 
 Each rail is `label session/weekly`, each budget a whole percent used followed by
 the time left until it resets — `45m`, `3h`, `4d`, or `now` once the vendor's
-reset instant has passed. The rails are separated by ` │ `. The rails
+reset instant has passed — or a short glyph where there is no figure to print
+(`–`, `x`, `?`, below). The rails are separated by ` │ `. The rails
 are exactly the **capped** rails some effective route names — the ones the
 dispatcher reads a budget for — so a route table that never names Claude never
 shows Claude, and a **metered** rail is left out because it has no budget at all.
@@ -245,6 +246,7 @@ sorts by its last good reading, and a rail with no number at all goes last.
 | `62,6d` | Whole percent used, and the time left until it resets. Every character except a tight slot is dim. |
 | `62` | The vendor reported no reset for the window carrying that figure, so there is no countdown. |
 | `–` | A budget this rail does not have. Argon has no session cap, so `ag-argon –/62,6d` |
+| `x` | A budget the vendor has switched off: a weekly pool is at 100%, so the 5-hour limit does not apply — `ag-3p x/100,5d`. The session window the vendor still reports at 0% is not a free budget, so the figure is not shown. Only rails that carry a session budget can show it, which is why a spent Argon week is still `ag-argon –/100,5d`. |
 | `?` in a slot | The rail has that budget and the read did not report it — a partial reading, not a free budget |
 | `<74,2h>` (warning color shown as `<…>`) | **Tight**: at or above `sessionSwitchAt` (session) or `weeklySwitchAt` (weekly), so figure and countdown are drawn in the warning color |
 | `74/41?` | The latest read failed, so the **last good reading** is shown, dimmed throughout with a trailing `?` and with no countdowns |

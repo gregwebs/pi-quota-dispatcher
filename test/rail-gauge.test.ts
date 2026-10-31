@@ -271,6 +271,51 @@ test("a budget the rail does not carry reads as absent, one it did not report as
   assert.equal(gauge(map, cfg), "ag-argon –/62 │ codex ?/41");
 });
 
+test("a spent week switches the session slot off and leaves every other slot alone", () => {
+  const cfg = cfgNaming(["antigravity-3p", "antigravity-argon"]);
+  const map = readings(
+    [
+      "antigravity-3p",
+      ok(good("antigravity-3p", [session(0, NOW + 5 * HOUR), weekly(100, NOW + 5 * DAY)])),
+    ],
+    // Argon's week is spent too, and a spent week is all it ever has.
+    ["antigravity-argon", ok(good("antigravity-argon", [weekly(100, NOW + 5 * DAY)]))],
+  );
+  // The vendor turns the 5-hour limit off once a weekly pool is spent and keeps
+  // reporting the 5-hour window at 0%, which would read as the roomiest figure
+  // on the account. Argon has no session budget to turn off, so it keeps `–`.
+  assert.equal(gauge(map, cfg), "ag-3p x/<100,5d> │ ag-argon –/<100,5d>");
+});
+
+test("the session slot is drawn until a pool reaches the vendor's own cap", () => {
+  const cfg = cfgNaming(["antigravity-3p"]);
+  const atWeek = (week: number) =>
+    gauge(
+      readings(["antigravity-3p", ok(good("antigravity-3p", [session(0), weekly(week)]))]),
+      cfg,
+    );
+  // 100 is the vendor's cap, not a switch threshold: a config that moves
+  // `weeklySwitchAt` changes the tone and nothing about the switch-off.
+  assert.equal(atWeek(99.9), "ag-3p 0/<100>");
+  assert.equal(atWeek(100), "ag-3p x/<100>");
+  assert.equal(atWeek(100.4), "ag-3p x/<100>");
+});
+
+test("a week the read did not report does not switch the session slot off", () => {
+  const cfg = cfgNaming(["antigravity-3p"]);
+  const map = readings(["antigravity-3p", ok(good("antigravity-3p", [session(0)]))]);
+  assert.equal(gauge(map, cfg), "ag-3p 0/?");
+});
+
+test("a stale rail whose last good week was spent still draws the session slot as off", () => {
+  const cfg = cfgNaming(["antigravity-3p"]);
+  const map = readings([
+    "antigravity-3p",
+    { latest: failed("antigravity-3p"), lastGood: good("antigravity-3p", [session(0), weekly(100)]) },
+  ]);
+  assert.equal(gauge(map, cfg), "ag-3p x/100?");
+});
+
 test("a failed read with a last good reading is drawn stale, dim and unjudged", () => {
   const cfg = { ...cfgNaming(["codex"]), sessionSwitchAt: 70 };
   // The last good reading knows both its resets: they are the ones the countdown

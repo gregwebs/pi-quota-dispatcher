@@ -52,10 +52,16 @@ export const GAUGE_LABELS: Record<VendorRail, string> = {
  * `resetInMs` is required even when unknown, so a producer has to decide about
  * the countdown rather than forget it: `undefined` means the vendor reported no
  * reset for the window carrying the figure, and the slot prints its number alone.
+ *
+ * `disabled` is the vendor's own statement that a budget does not currently
+ * apply — a spent week turns the 5-hour limit off — so it is neither a reading
+ * nor an absence: the window may well be reported at 0%, and printing that would
+ * claim a freedom the vendor has withdrawn.
  */
 export type BudgetGauge =
   | { readonly kind: "uncarried" }
   | { readonly kind: "unreported" }
+  | { readonly kind: "disabled" }
   | { readonly kind: "used"; readonly used: number; readonly resetInMs: number | undefined }
   | { readonly kind: "tight"; readonly used: number; readonly resetInMs: number | undefined };
 
@@ -75,6 +81,7 @@ export type BudgetGauge =
 export type StaleBudgetGauge =
   | { readonly kind: "uncarried" }
   | { readonly kind: "unreported" }
+  | { readonly kind: "disabled" }
   | { readonly kind: "used"; readonly used: number };
 
 /** One rail as the gauge draws it. `unread` is a rail with no number at all. */
@@ -103,6 +110,12 @@ export interface GaugeStyle {
 const GAUGE_SEPARATOR = " │ ";
 /** U+2013, a budget the rail does not have. */
 const ABSENT = "–";
+/**
+ * A budget the vendor has switched off, which is why it is not a figure: the
+ * reading may still carry one, and printing it would show 0% on a cap that is
+ * not merely free but suspended.
+ */
+const DISABLED = "x";
 /**
  * What stands between a budget's figure and the time left until it resets.
  *
@@ -185,6 +198,8 @@ function budgetTokens(budget: StaleBudgetGauge): Token[] {
       return [{ text: ABSENT, tone: "dim" }];
     case "unreported":
       return [{ text: "?", tone: "dim" }];
+    case "disabled":
+      return [{ text: DISABLED, tone: "dim" }];
     case "used":
       return [{ text: whole(budget.used), tone: "dim" }];
   }
