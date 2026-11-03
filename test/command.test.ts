@@ -10,6 +10,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ThinkingLevel } from "../src/config.ts";
 import { agentTable, candidateOf } from "./helpers/identifiers.ts";
 import extension, {
+  ANTIGRAVITY_QUOTA_URL,
+  CLAUDE_USAGE_URL,
+  CODEX_USAGE_URL,
   checkAgentFiles,
   DEFAULT_CONFIG,
   evaluationFence,
@@ -681,6 +684,41 @@ test("the config command prints where each value came from without reading a quo
 });
 
 /**
+ * The allow-list form answers from the endpoints table, so it must list every
+ * request a configured install can make and cost neither a quota read nor a
+ * write. That is what makes it usable on a machine whose firewall is the reason
+ * the vendors are unreachable in the first place.
+ */
+test("the urls command lists every outbound endpoint without reading a quota", async () => {
+  const fx = await fixture();
+  const before = await readFile(fx.plannerFile, "utf8");
+  let fetches = 0;
+  const refused = (async (url: string | URL) => {
+    fetches++;
+    throw new Error(`the urls form must not read a quota: ${String(url)}`);
+  }) as unknown as typeof fetch;
+
+  await withExtension(
+    fx,
+    async ({ run }) => {
+      const text = await run("urls");
+      for (const url of [CLAUDE_USAGE_URL, CODEX_USAGE_URL, ANTIGRAVITY_QUOTA_URL]) {
+        assert.ok(text.includes(url), text);
+      }
+      assert.match(text, /deepseek: .*no request/, text);
+      // Not the report: the form answers a question about the extension's own
+      // requests, so it prints no rail reading and no decision.
+      assert.ok(!text.includes("claude: 5h"), text);
+      assert.ok(!text.includes("planner -> "), text);
+    },
+    () => refused,
+  );
+
+  assert.equal(fetches, 0, "the urls form must fetch nothing");
+  assert.equal(await readFile(fx.plannerFile, "utf8"), before, "the urls form must not write");
+});
+
+/**
  * A registry that carries pi's provider-token method beside the model lookup.
  *
  * Nothing here is called unless the dispatcher decides a refresh is due — which
@@ -818,6 +856,7 @@ test("the argument is a whole form name, not a substring of one", () => {
   assert.deepEqual(parseInvocation("   "), { form: "report", force: false });
   assert.deepEqual(parseInvocation(" refresh "), { form: "report", force: true });
   assert.deepEqual(parseInvocation("config"), { form: "config" });
+  assert.deepEqual(parseInvocation("urls"), { form: "urls" });
   assert.deepEqual(parseInvocation("apply"), { form: "apply" });
 });
 
@@ -854,7 +893,7 @@ test("the registered description names every form", async () => {
   const fx = await fixture();
 
   await withExtension(fx, async ({ description }) => {
-    for (const form of ["refresh", "config", "apply", "generate"]) {
+    for (const form of ["refresh", "config", "urls", "apply", "generate"]) {
       assert.ok(description?.includes(form), `the description must name ${form}: ${description}`);
     }
   });
