@@ -225,7 +225,26 @@ export interface DispatcherConfig {
   agentDir: string;
   claudeCredsPath: string;
   claudeRefresh: ClaudeRefreshMode;
+  /**
+   * pi's own `auth.json`, which is the Antigravity credential's home and the
+   * default for `codexCredsPath`. Unsettable from a config file, because the
+   * Antigravity rails *write* through pi's provider refresh, so a JSON file
+   * pointing it elsewhere would refresh a profile nothing reads.
+   */
   piAuthPath: string;
+  /**
+   * The file the Codex rail reads its credential from, defaulting to pi's own
+   * `auth.json`.
+   *
+   * Settable, unlike `piAuthPath`, because nothing writes it: this rail never
+   * refreshes a Codex token, so naming any readable file here can only change
+   * which account's numbers are reported. Two document shapes are accepted —
+   * pi's `{"openai-codex": {"access", "accountId"}}` and the Codex CLI's own
+   * `{"tokens": {"access_token", "account_id"}}` — because a launcher that
+   * shields the host's credentials publishes the CLI's file, not pi's.
+   * See `docs/adr/0020-codex-credential-seam.md`.
+   */
+  codexCredsPath: string;
   /**
    * The file the rail readings are shared through, beside the global config and
    * pi's to own like `piAuthPath`: a config file pointing it elsewhere could only
@@ -376,6 +395,7 @@ const SCALAR_KEYS = [
   "claudeCredsPath",
   "claudeRefresh",
   "piAuthPath",
+  "codexCredsPath",
   "ttlMs",
   "pollMs",
   "sessionSwitchAt",
@@ -703,6 +723,7 @@ function mismatchedRail(model: string, rail: Rail): Rail | undefined {
  *
  *   agentDir         `<agentDir>/agents`
  *   piAuthPath       `<agentDir>/auth.json`
+ *   codexCredsPath   `<agentDir>/auth.json`  (pi's own, the same file)
  *   readingsPath     `<agentDir>/quota-dispatch-readings.json`
  *   claudeCredsPath  `~/.claude/.credentials.json`
  *   claudeRefresh    `off`
@@ -731,6 +752,7 @@ export function defaultConfig(agentDir: string = getAgentDir()): DispatcherConfi
     claudeCredsPath: join(homedir(), ".claude", ".credentials.json"),
     claudeRefresh: "off",
     piAuthPath: join(agentDir, "auth.json"),
+    codexCredsPath: join(agentDir, "auth.json"),
     readingsPath: join(agentDir, READINGS_FILE_NAME),
     ttlMs: 180_000,
     pollMs: 300_000,

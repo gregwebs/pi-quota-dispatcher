@@ -19,7 +19,7 @@ async function fixture(t: TestContext) {
   const claudeCredsPath = join(root, "claude.json");
   const piAuthPath = join(root, "auth.json");
   await writeFile(piAuthPath, JSON.stringify({ "openai-codex": { access: "test", accountId: "test" } }));
-  const cfg = { ...DEFAULT_CONFIG, agentDir, claudeCredsPath, piAuthPath,
+  const cfg = { ...DEFAULT_CONFIG, agentDir, claudeCredsPath, piAuthPath, codexCredsPath: piAuthPath,
     readingsPath: join(root, "readings.json"), claudeRefresh: "offline-ping" as const };
   const probe: { clock: number; refreshes: number; identity: ClaudeIdentity | undefined; fetches: string[] } = {
     clock: NOW, refreshes: 0, identity: { path: join(root, "bin", "claude"), mtimeMs: 100 }, fetches: [],

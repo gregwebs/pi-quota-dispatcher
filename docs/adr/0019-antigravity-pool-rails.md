@@ -152,7 +152,8 @@ keeps its existing callers by being narrowed to the rails that really have a
 request of their own. The in-flight record and the fetch lock are keyed by the
 **source** — `antigravity\0<credential>` — so two concurrent pool reads, or two
 processes asking for different pools, join one fetch. The group key lives in its
-own domain so Codex, which is configured from the same `auth.json`, is not swept
+own domain so Codex, which is configured from the same `auth.json` — and, since
+[0020](0020-codex-credential-seam.md), from a path of its own — is not swept
 into it.
 
 A complete group is three entries that exist and are fresh; a pool the vendor

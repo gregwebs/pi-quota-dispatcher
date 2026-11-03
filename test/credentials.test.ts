@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import {
@@ -13,6 +13,7 @@ import {
   isDefaultClaudeCredsPath,
   keychainReader,
   parseClaudeToken,
+  parseCodexCredential,
   readClaudeToken,
 } from "../src/index.ts";
 import { agentTable, routeOf } from "./helpers/identifiers.ts";
@@ -340,6 +341,7 @@ interface Fixture {
   agentDir: string;
   claudeCredsPath: string;
   piAuthPath: string;
+  codexCredsPath: string;
   readingsPath: string;
 }
 
@@ -362,7 +364,7 @@ async function fixture(models: Record<string, string>): Promise<Fixture> {
     JSON.stringify({ "openai-codex": { access: "test-token", accountId: "acct-test" } }),
     "utf8",
   );
-  return { agentDir, claudeCredsPath, piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
+  return { agentDir, claudeCredsPath, piAuthPath, codexCredsPath: piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
 }
 
 interface StubReadings {
@@ -370,12 +372,14 @@ interface StubReadings {
   codex?: { session?: number; weekly?: number };
 }
 
-/** The only network boundary; records the bearer token each call carried. */
-function stubFetch(opts: StubReadings = {}, seenAuth: string[] = []) {
+/** The only network boundary; records the bearer token and account each call carried. */
+function stubFetch(opts: StubReadings = {}, seenAuth: string[] = [], seenAccount: string[] = []) {
   return (async (url: string | URL, init?: { headers?: Record<string, string> }) => {
     const u = String(url);
     const auth = init?.headers?.Authorization;
     if (auth) seenAuth.push(auth);
+    const account = init?.headers?.["ChatGPT-Account-Id"];
+    if (account) seenAccount.push(account);
     if (u.includes("anthropic.com")) {
       return {
         ok: true,
@@ -474,4 +478,166 @@ test("with both stores failing the claude rail is unavailable and its agent is h
   assert.equal(planner.decision.kind, "hold", planner.decision.why);
   assert.equal(planner.outcome, "held");
   assert.equal(await readFile(path, "utf8"), before, "a held agent's file must not be rewritten");
+});
+
+// ---------------------------------------------------------------- the codex credential seam
+
+// The reported fault (issue #89): a shielded install publishes the Codex CLI's
+// own auth.json and may not publish pi's, so the rail needs a file it can be
+// pointed at, and the CLI's document shape has to be readable.
+test("the codex rail reads a file codexCredsPath names, in the Codex CLI's shape", async () => {
+  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+  await writeFile(
+    fx.claudeCredsPath,
+    cred({ accessToken: "live", expiresAt: Date.now() + 3_600_000 }),
+    "utf8",
+  );
+  const codexCredsPath = join(dirname(fx.piAuthPath), "codex-auth.json");
+  await writeFile(codexCredsPath, JSON.stringify({
+    OPENAI_API_KEY: null,
+    tokens: { access_token: "cli-token", account_id: "cli-account", refresh_token: "rotate-me" },
+  }), "utf8");
+
+  const seenAuth: string[] = [];
+  const seenAccount: string[] = [];
+  const d = createDispatcher(
+    { ...DEFAULT_CONFIG, ...fx, codexCredsPath, agents: AGENT_ROUTES },
+    { fetchImpl: stubFetch({ claude: { session: 5 }, codex: { session: 10 } }, seenAuth, seenAccount) },
+  );
+
+  const lines = await d.report({ force: true });
+  assert.ok(lines.some((l) => l.startsWith("codex: 5h 10%")), lines.join("\n"));
+  // The token and the account both came from that file: one without the other
+  // would read the wrong account's headroom or none.
+  assert.ok(seenAuth.includes("Bearer cli-token"), seenAuth.join(", "));
+  assert.ok(seenAccount.includes("cli-account"), seenAccount.join(", "));
+});
+
+// A named path is the whole answer: the pi auth file sitting beside it still
+// holds a usable `openai-codex` entry, and reading it anyway would report an
+// account the config did not name.
+test("an absent codexCredsPath file is the failure, even with a usable pi auth file beside it", async () => {
+  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+  await writeFile(
+    fx.claudeCredsPath,
+    cred({ accessToken: "live", expiresAt: Date.now() + 3_600_000 }),
+    "utf8",
+  );
+  const d = createDispatcher(
+    {
+      ...DEFAULT_CONFIG, ...fx, agents: AGENT_ROUTES,
+      codexCredsPath: join(dirname(fx.piAuthPath), "nothing-here.json"),
+    },
+    { fetchImpl: stubFetch({ codex: { session: 10 } }) },
+  );
+
+  const lines = await d.report({ force: true });
+  const line = lines.find((l) => l.startsWith("codex: unavailable"));
+  assert.ok(line, lines.join("\n"));
+  assert.equal(line, "codex: unavailable — no codex credential file");
+});
+
+// The document is a credential store: a read failure is reported by its errno
+// and a parse failure by fixed text, never by a message that quotes the file.
+test("a codex credential failure never quotes the document", async () => {
+  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+  await writeFile(
+    fx.claudeCredsPath,
+    cred({ accessToken: "live", expiresAt: Date.now() + 3_600_000 }),
+    "utf8",
+  );
+  const broken = join(dirname(fx.piAuthPath), "broken-codex-auth.json");
+  await writeFile(broken, '{"tokens": {"access_token": "sk-secret-', "utf8");
+  const d = createDispatcher(
+    { ...DEFAULT_CONFIG, ...fx, codexCredsPath: broken, agents: AGENT_ROUTES },
+    { fetchImpl: stubFetch({ claude: { session: 5 } }) },
+  );
+
+  const lines = await d.report({ force: true });
+  const line = lines.find((l) => l.startsWith("codex: unavailable"));
+  assert.ok(line, lines.join("\n"));
+  assert.equal(line, "codex: unavailable — codex credential is not valid JSON");
+  assert.ok(!lines.join("\n").includes("sk-secret"), lines.join("\n"));
+});
+
+// ---------------------------------------------------------------- parseCodexCredential
+
+// The seam the Codex rail was missing: two writers publish a credential, and
+// until both shapes were readable a sandbox that may publish only the Codex
+// CLI's file reported the rail unavailable (issue #89).
+
+test("parseCodexCredential reads pi's own auth.json shape", () => {
+  const text = JSON.stringify({ "openai-codex": { access: "tok", accountId: "acct" } });
+  assert.deepEqual(parseCodexCredential(text), { access: "tok", accountId: "acct" });
+});
+
+test("parseCodexCredential reads the Codex CLI's auth.json shape", () => {
+  const text = JSON.stringify({
+    OPENAI_API_KEY: null,
+    tokens: { id_token: "id", access_token: "tok", refresh_token: "refresh", account_id: "acct" },
+    last_refresh: "2026-11-03T00:00:00Z",
+  });
+  assert.deepEqual(parseCodexCredential(text), { access: "tok", accountId: "acct" });
+});
+
+// Both shapes in one document is not a conflict to refuse: pi's login is the
+// more specific statement, and either token is a credential the rail can use.
+test("parseCodexCredential prefers pi's shape when both are present", () => {
+  const text = JSON.stringify({
+    "openai-codex": { access: "pi-tok", accountId: "pi-acct" },
+    tokens: { access_token: "cli-tok", account_id: "cli-acct" },
+  });
+  assert.deepEqual(parseCodexCredential(text), { access: "pi-tok", accountId: "pi-acct" });
+});
+
+// The shapes are two spellings of one fact, so an unusable one cannot mask a
+// usable one: the rail is answerable, which is the whole point of accepting both.
+test("parseCodexCredential falls through to the CLI shape when pi's section is half-written", () => {
+  const text = JSON.stringify({
+    "openai-codex": { access: "tok" },
+    tokens: { access_token: "cli-tok", account_id: "cli-acct" },
+  });
+  assert.deepEqual(parseCodexCredential(text), { access: "cli-tok", accountId: "cli-acct" });
+});
+
+test("parseCodexCredential reports the field each shape was missing", () => {
+  assert.deepEqual(parseCodexCredential(JSON.stringify({ "openai-codex": { accountId: "acct" } })), {
+    error: "no openai-codex.access",
+  });
+  assert.deepEqual(parseCodexCredential(JSON.stringify({ "openai-codex": { access: "tok" } })), {
+    error: "no openai-codex.accountId",
+  });
+  // A blank credential is no credential, the rule every reader here holds to.
+  assert.deepEqual(parseCodexCredential(JSON.stringify({ "openai-codex": { access: "", accountId: "a" } })), {
+    error: "no openai-codex.access",
+  });
+  assert.deepEqual(parseCodexCredential(JSON.stringify({ tokens: { access_token: "tok" } })), {
+    error: "no tokens.account_id",
+  });
+});
+
+// The account id is required rather than defaulted: it selects whose usage is
+// asked about, so an invented one would report another account's headroom.
+test("parseCodexCredential rejects the CLI shape with no account id", () => {
+  assert.deepEqual(parseCodexCredential(JSON.stringify({ tokens: { access_token: "tok", account_id: "" } })), {
+    error: "no tokens.account_id",
+  });
+});
+
+// The note has to be actionable when the file is the wrong file: it names both
+// shapes, which is what tells a reader the seam looked and what it looked for.
+test("parseCodexCredential names both shapes when the document is neither", () => {
+  for (const text of [JSON.stringify({}), JSON.stringify({ claudeAiOauth: { accessToken: "t" } }), JSON.stringify([]), JSON.stringify("nope")]) {
+    assert.deepEqual(parseCodexCredential(text), {
+      error: "no openai-codex.access or tokens.access_token",
+    });
+  }
+});
+
+// The document is a credential store, so a parse failure may not echo it: the
+// engine's own syntax message quotes the text it could not parse.
+test("parseCodexCredential never quotes a malformed document", () => {
+  const out = parseCodexCredential('{"tokens": {"access_token": "sk-secret-');
+  assert.deepEqual(out, { error: "codex credential is not valid JSON" });
+  assert.ok(!JSON.stringify(out).includes("sk-secret"), JSON.stringify(out));
 });

@@ -689,6 +689,7 @@ interface Fixture {
   agentDir: string;
   claudeCredsPath: string;
   piAuthPath: string;
+  codexCredsPath: string;
   readingsPath: string;
 }
 
@@ -705,7 +706,7 @@ async function fixture(plannerModel = "claude-bridge/claude-opus-5-5"): Promise<
     JSON.stringify({ "openai-codex": { access: "test-token", accountId: "acct-test" } }),
     "utf8",
   );
-  return { agentDir, claudeCredsPath, piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
+  return { agentDir, claudeCredsPath, piAuthPath, codexCredsPath: piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
 }
 
 /** The only network boundary; records the bearer token each call carried. */

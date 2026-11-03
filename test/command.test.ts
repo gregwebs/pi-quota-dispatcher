@@ -1481,7 +1481,7 @@ test("a capped rail that was never read successfully refuses the run and changes
   await withExtension(fx, async ({ run, notifications }) => {
     const text = await run("generate");
     assert.equal(notifications[0].level, "warning", "a refusal is shown like any other generation failure");
-    assert.ok(text.includes("codex") && text.includes("no pi auth file"), text);
+    assert.ok(text.includes("codex") && text.includes("no codex credential file"), text);
     assert.ok(text.includes("This run did not change"), text);
     await assert.rejects(readFile(marker, "utf8"), "the generator must not have run");
 
@@ -2021,6 +2021,35 @@ test("an empty table still reports one line per rail and writes nothing", async 
   });
 
   assert.equal(await readFile(fx.plannerFile, "utf8"), before, "the diagnostic must be read-only");
+});
+
+/**
+ * The Codex credential seam through the real path: a config key, the loader, and
+ * a file the machine actually has. This is the shielded install of issue #89 —
+ * pi's own `auth.json` is absent from the guest and the only Codex credential it
+ * carries is the Codex CLI's own document, published elsewhere.
+ */
+test("a config points the codex rail at a Codex CLI auth file", async () => {
+  const fx = await fixture();
+  const cliAuth = join(dirname(fx.agentDir), "codex-auth.json");
+  await writeFile(cliAuth, JSON.stringify({
+    OPENAI_API_KEY: null,
+    tokens: { access_token: "cli-token", account_id: "cli-account" },
+  }), "utf8");
+  const globalPath = join(fx.agentDir, CONFIG_FILE_NAME);
+  const global = JSON.parse(await readFile(globalPath, "utf8"));
+  await writeFile(globalPath, JSON.stringify({ ...global, codexCredsPath: cliAuth }), "utf8");
+  // The file the default names, gone: nothing can read the rail by accident.
+  await rm(join(fx.agentDir, "auth.json"));
+
+  await withExtension(fx, async ({ run }) => {
+    const text = await run("");
+    assert.ok(text.includes("codex: 5h 10%"), text);
+    // And the seam is answerable in the provenance block, which is where "which
+    // account is this rail reading?" has to be answered from.
+    const config = await run("config");
+    assert.match(config, /codexCredsPath = .*codex-auth\.json\s+\[global\]/, config);
+  });
 });
 
 // ---------------------------------------------------------------- model registry (issue #14)

@@ -117,6 +117,18 @@ carries the warning, and the next successful write repairs it. See
 [docs/adr/0016](docs/adr/0016-shared-rail-readings.md).
 _Avoid_: cache file, quota file, shared store, readings cache
 
+**Credential file**:
+The file a rail's credential is read from, named by that rail's own path key.
+A credential path is **settable** exactly when nothing writes it: `claudeCredsPath`
+and `codexCredsPath` are read-only seams, while `piAuthPath` is not settable
+because pi's own provider rewrites it at this extension's request — pointing a
+read at another account changes whose headroom is reported and routed on, while
+pointing a write would rewrite a file nothing reads. A Codex credential file may
+hold pi's document or the Codex CLI's, so the account it names must be the one
+the configured models run on. See
+[docs/adr/0020](docs/adr/0020-codex-credential-seam.md).
+_Avoid_: credential store, auth file, secrets file
+
 **Session budget**:
 A rail's short-window cap — the acute one that blocks work mid-task and clears
 within hours.
