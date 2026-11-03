@@ -42,6 +42,14 @@ widens what an entry's `rail` may be; a valid version-2 document is still read,
 which is what keeps the gates and sticky halt above across the upgrade.
 Per-rail keys, per-rail `lastGood` and the best-effort write are unchanged.
 
+**Extended by [0020](0020-codex-credential-seam.md).** The Codex credential is
+now read from `codexCredsPath`, so that rail's key is
+`resolve(cfg.codexCredsPath)` rather than `resolve(cfg.piAuthPath)`. The two
+keys are the same file by default, so the default install's entry is the one it
+already had; a config that names another Codex credential gets an entry of its
+own, which is the per-credential rule below applied to a rail that gained a
+second source.
+
 ## One file, not one per rail
 
 A shared cache could have been one file per rail and credential, each written

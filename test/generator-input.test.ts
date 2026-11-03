@@ -382,18 +382,18 @@ test("claude with no success ever refuses the run, naming the rail and why", () 
 });
 
 test("codex with no success ever refuses the run, and only codex is named as a reason", () => {
-  const reason = refused(generatorInput(known(healthy(CLAUDE_GOOD), { latest: failed("codex", "no pi auth file") })));
-  assert.ok(reason.some((line) => line.includes("codex") && line.includes("no pi auth file")), reason.join("\n"));
+  const reason = refused(generatorInput(known(healthy(CLAUDE_GOOD), { latest: failed("codex", "no codex credential file") })));
+  assert.ok(reason.some((line) => line.includes("codex") && line.includes("no codex credential file")), reason.join("\n"));
   assert.ok(!reason.some((line) => line.trimStart().startsWith("claude")), `a healthy claude is not a reason: ${reason.join("\n")}`);
 });
 
 test("both capped rails failing are both reported, claude first", () => {
   const reason = refused(generatorInput(known(
     { latest: failed("claude", "HTTP 401") },
-    { latest: failed("codex", "no pi auth file") },
+    { latest: failed("codex", "no codex credential file") },
   )));
   const claudeLine = reason.findIndex((line) => line.includes("claude") && line.includes("HTTP 401"));
-  const codexLine = reason.findIndex((line) => line.includes("codex") && line.includes("no pi auth file"));
+  const codexLine = reason.findIndex((line) => line.includes("codex") && line.includes("no codex credential file"));
   assert.notEqual(claudeLine, -1, `claude's reason is missing: ${reason.join("\n")}`);
   assert.notEqual(codexLine, -1, `codex's reason is missing — only the first failing rail was reported: ${reason.join("\n")}`);
   assert.ok(claudeLine < codexLine, reason.join("\n"));
@@ -416,10 +416,10 @@ test("the refusal reason is exactly the header, the failing rail's line and the 
   // telling the user how to clear the refusal, and a substring check on the
   // lines that remain would not notice it being dropped or moved.
   assert.deepEqual(
-    refused(generatorInput(known(healthy(CLAUDE_GOOD), { latest: failed("codex", "no pi auth file") }))),
+    refused(generatorInput(known(healthy(CLAUDE_GOOD), { latest: failed("codex", "no codex credential file") }))),
     [
       "the generator was not run: a quota-capped rail has no successful reading yet.",
-      "the codex rail has no valid reading yet (no pi auth file).",
+      "the codex rail has no valid reading yet (no codex credential file).",
       "Run /quota-dispatch refresh once the rail can be read, then generate again.",
     ],
   );
@@ -445,7 +445,7 @@ test("every failing capped rail is reported, in the document's own order", () =>
   // pass: the lines are checked as an ordered subsequence of the reason.
   const reason = refused(generatorInput({
     claude: { latest: failed("claude", "no Claude credentials") },
-    codex: { latest: failed("codex", "no pi auth file") },
+    codex: { latest: failed("codex", "no codex credential file") },
     "antigravity-argon": { latest: failed("antigravity-argon", "expired") },
     "antigravity-gemini": { latest: failed("antigravity-gemini", "HTTP 429") },
     "antigravity-3p": { latest: failed("antigravity-3p", "no usage windows returned") },

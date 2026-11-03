@@ -606,8 +606,19 @@ file and nowhere else, which also turns off the [macOS keychain
 fallback](#where-the-numbers-come-from) and makes `claudeRefresh` inert: the
 keychain and the refresh ping both speak for this machine's **default** profile,
 and reporting its headroom — or refreshing its token — while a different profile
-runs would be worse than doing nothing. `agentDir` and `piAuthPath` (defaults
-`<agent dir>/agents` and `<agent dir>/auth.json`) are deliberately **not**
+runs would be worse than doing nothing.
+
+`codexCredsPath` is settable for the same reason, and defaults to pi's own
+`<agent dir>/auth.json`: the file the [Codex rail](#where-the-numbers-come-from)
+reads its credential from, in either pi's document shape or the Codex CLI's. It
+is settable where `piAuthPath` is not because **nothing writes it** — this rail
+never refreshes a Codex token — so naming a file here changes which account's
+numbers are read, and therefore which headroom work is routed on; it must be the
+account the configured models actually run on. See
+[0020](docs/adr/0020-codex-credential-seam.md).
+
+`agentDir` and `piAuthPath` (defaults `<agent dir>/agents` and
+`<agent dir>/auth.json`) are deliberately **not**
 settable from JSON: they are
 paths pi itself owns, derived from `getAgentDir()`, so a file pointing them
 elsewhere would only make the dispatcher edit files nothing reads. Relocate
@@ -1102,8 +1113,21 @@ What each request is read with:
 | Rail | Credential |
 |---|---|
 | Claude | the macOS login keychain (`Claude Code-credentials`), falling back to `~/.claude/.credentials.json` → `claudeAiOauth.accessToken` |
-| Codex | `<agent dir>/auth.json` (normally `~/.pi/agent/auth.json`) → `openai-codex.access` + `accountId` |
-| Antigravity (all three pools) | the same `auth.json` → `antigravity.access`, with `antigravity.projectId` sent when it names one |
+| Codex | the file `codexCredsPath` names (default `<agent dir>/auth.json`, normally `~/.pi/agent/auth.json`) → `openai-codex.access` + `accountId`, or the Codex CLI's `tokens.access_token` + `tokens.account_id` |
+| Antigravity (all three pools) | `piAuthPath` → `antigravity.access`, with `antigravity.projectId` sent when it names one |
+
+Codex joins Claude in reading its credential from a file a config can point
+elsewhere, because two clients publish it: pi persists what its own provider
+obtained under `openai-codex`, and the Codex CLI writes its own `auth.json`
+under `tokens`. Both shapes are accepted at `codexCredsPath` — first usable one
+wins — so a machine whose pi home is not the file to hand a sandbox can be
+pointed at the CLI's file instead, and a shielded launcher needs no second copy
+in pi's shape. The account id is required in either shape: it is not a secret,
+but it selects whose headroom is asked about. Which is also why that file has to
+belong to the account the configured models run on — these numbers are what the
+dispatcher **rewrites agent files** on, so another account's credential would
+route work on headroom it never spends. See
+[0020](docs/adr/0020-codex-credential-seam.md).
 
 The request's `User-Agent` is pinned to the string Antigravity's current CLI
 sends, and it is load-bearing rather than polite: Google omits the `Gemini 4

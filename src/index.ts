@@ -2364,6 +2364,98 @@ export function parseAntigravityToken(text: string, context: { now: number }): A
   return { token: access, ...(projectId === undefined ? {} : { projectId }) };
 }
 
+/** The Codex credential one read must supply: the bearer token, and the account whose usage it asks about. */
+export interface CodexCredential {
+  readonly access: string;
+  readonly accountId: string;
+}
+
+/** A Codex credential, or why the document could not supply one. */
+export type CodexCredentialRead = CodexCredential | { readonly error: string };
+
+/** One document shape a Codex credential arrives in, and the field each part is spelled under. */
+interface CodexShape {
+  /** The top-level section that claims the document for this shape. */
+  readonly section: string;
+  readonly access: string;
+  readonly account: string;
+}
+
+/** pi's `auth.json`, which is where a Codex login obtained by pi lands. */
+const PI_CODEX: CodexShape = { section: "openai-codex", access: "access", account: "accountId" };
+
+/**
+ * The Codex CLI's own `auth.json`.
+ *
+ * Read and never written: the CLI owns that file, and a launcher that shields
+ * the host's credentials publishes this one when it may not publish pi's — see
+ * `docs/adr/0020-codex-credential-seam.md`.
+ */
+const CLI_CODEX: CodexShape = { section: "tokens", access: "access_token", account: "account_id" };
+
+/**
+ * The shapes a file is read in, in the order they are tried.
+ *
+ * pi's first because it is the default file's own shape, so the common case
+ * finds its credential on the first try. Neither is an alias for the other and
+ * a shape is recognised by its section's presence, not by the file's name: one
+ * path is a credential file whatever wrote it.
+ */
+const CODEX_SHAPES: readonly CodexShape[] = [PI_CODEX, CLI_CODEX];
+
+/** One shape's verdict: the credential, the reason it is unusable, or `undefined` when the section is absent. */
+function codexCredentialIn(document: Record<string, unknown>, shape: CodexShape): CodexCredentialRead | undefined {
+  const entry = jsonObject(document[shape.section]);
+  if (entry === undefined) return undefined;
+  const access = entry[shape.access];
+  if (typeof access !== "string" || access === "") return { error: `no ${shape.section}.${shape.access}` };
+  const accountId = entry[shape.account];
+  if (typeof accountId !== "string" || accountId === "") {
+    return { error: `no ${shape.section}.${shape.account}` };
+  }
+  return { access, accountId };
+}
+
+/**
+ * Pulls a Codex credential out of a credential file's text.
+ *
+ * Both shapes are tried and the first usable one wins, so a document carrying a
+ * half-written `openai-codex` section beside a usable `tokens` one still
+ * answers: the shapes are two spellings of one fact, not a precedence.
+ *
+ * The account id is required rather than defaulted. It is not a secret, but it
+ * selects *which* account's usage the request asks about, so a guessed one would
+ * report another account's headroom — what the per-credential key in
+ * `docs/adr/0016-shared-rail-readings.md` exists to prevent.
+ *
+ * Every message is fixed text or built from field names alone: a JSON syntax
+ * error's own message quotes the document, and this document is a credential.
+ */
+export function parseCodexCredential(text: string): CodexCredentialRead {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { error: "codex credential is not valid JSON" };
+  }
+  const document = jsonObject(parsed) ?? {};
+  const refusals: string[] = [];
+  for (const shape of CODEX_SHAPES) {
+    const found = codexCredentialIn(document, shape);
+    if (found === undefined) continue;
+    if ("access" in found) return found;
+    refusals.push(found.error);
+  }
+  // A section that is there but unusable names what it was missing, which is
+  // the actionable answer; a document with neither section names both fields a
+  // file could carry, which is the one that says "this is the wrong file".
+  return {
+    error:
+      refusals[0] ??
+      `no ${PI_CODEX.section}.${PI_CODEX.access} or ${CLI_CODEX.section}.${CLI_CODEX.access}`,
+  };
+}
+
 export interface ClaudeTokenDeps {
   /**
    * Fallback store, consulted only when the file yields no usable token.
@@ -3068,21 +3160,38 @@ export function createDispatcher(
     return { ...reading, note: reading.note === undefined ? outcome.note : `${reading.note}; ${outcome.note}` };
   }
 
-  async function fetchCodex(): Promise<VendorReading> {
-    if (!existsSync(cfg.piAuthPath)) return unavailable("codex", "no pi auth file");
-    let cred: any;
+  /**
+   * The Codex credential, or why the file named by `codexCredsPath` gave none.
+   *
+   * Read fresh on every fetch rather than cached here: the file belongs to
+   * whichever client writes it, and a token this process remembered would be
+   * exactly the stale one the next read has to notice.
+   *
+   * A read failure is reported by its errno, never by the error's message: the
+   * message quotes the path, and a parse failure's message could quote the
+   * document, which is a credential.
+   */
+  async function readCodexCredential(): Promise<CodexCredentialRead> {
+    if (!existsSync(cfg.codexCredsPath)) return { error: "no codex credential file" };
+    let text: string;
     try {
-      cred = JSON.parse(await readFile(cfg.piAuthPath, "utf8"))["openai-codex"];
+      text = await readFile(cfg.codexCredsPath, "utf8");
     } catch (err) {
-      return unavailable("codex", `unreadable pi auth: ${(err as Error).message}`);
+      return {
+        error: `unreadable codex credential file: ${(err as NodeJS.ErrnoException).code ?? "read failed"}`,
+      };
     }
-    if (!cred?.access) return unavailable("codex", "no openai-codex.access");
-    if (!cred?.accountId) return unavailable("codex", "no openai-codex.accountId");
+    return parseCodexCredential(text);
+  }
+
+  async function fetchCodex(): Promise<VendorReading> {
+    const credential = await readCodexCredential();
+    if ("error" in credential) return unavailable("codex", credential.error);
 
     const read = await readUsage(CODEX_USAGE_URL, {
       headers: {
-        Authorization: `Bearer ${cred.access}`,
-        "ChatGPT-Account-Id": cred.accountId,
+        Authorization: `Bearer ${credential.access}`,
+        "ChatGPT-Account-Id": credential.accountId,
         Accept: "application/json",
         Origin: "https://chatgpt.com",
         Referer: "https://chatgpt.com/",
@@ -3300,9 +3409,16 @@ export function createDispatcher(
    * The three Antigravity pools resolve to one key, which is the credential the
    * group is fetched under — not a per-pool key, because they are not per-pool
    * credentials.
+   *
+   * Codex keys on `codexCredsPath` and the pools on `piAuthPath`, which are the
+   * same file by default and different files the moment a layer names one. That
+   * is the point: two Codex sources are two accounts, and an entry one fetched
+   * must never be served for the other.
    */
   function credentialFor(rail: VendorRail): string {
-    return resolve(rail === "claude" ? cfg.claudeCredsPath : cfg.piAuthPath);
+    if (rail === "claude") return resolve(cfg.claudeCredsPath);
+    if (rail === "codex") return resolve(cfg.codexCredsPath);
+    return resolve(cfg.piAuthPath);
   }
 
   /**

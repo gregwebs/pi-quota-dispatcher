@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { createDispatcher, DEFAULT_CONFIG, READINGS_FILE_VERSION } from "../src/index.ts";
 
@@ -24,12 +24,16 @@ async function fixture(t: TestContext) {
   await writeFile(claudeCredsPath, JSON.stringify({ claudeAiOauth: { accessToken: "test-token", expiresAt: NOW + 86_400_000 } }));
   await writeFile(piAuthPath, JSON.stringify({ "openai-codex": { access: "test-token", accountId: "acct-test" } }));
   const cfg = {
-    ...DEFAULT_CONFIG, agentDir, claudeCredsPath, piAuthPath, claudeRefresh: "off" as const,
+    ...DEFAULT_CONFIG, agentDir, claudeCredsPath, piAuthPath, codexCredsPath: piAuthPath, claudeRefresh: "off" as const,
     readingsPath: join(root, "quota-dispatch-readings.json"), ttlMs: 10_000,
     agents: { planner: { primary: { model: PRIMARY, rail: "claude" as const }, alternates: [{ model: ALTERNATE, rail: "codex" as const }] } },
   };
   const probe = { clock: NOW, failed: false };
-  const make = (beforeRespond?: () => Promise<void>, sleep?: (ms: number) => Promise<void>) => {
+  const make = (
+    beforeRespond?: () => Promise<void>,
+    sleep?: (ms: number) => Promise<void>,
+    overrides: Partial<typeof cfg> = {},
+  ) => {
     const calls = { claude: 0, codex: 0 };
     const fetchImpl = (async (url: string | URL) => {
       const u = String(url);
@@ -41,7 +45,7 @@ async function fixture(t: TestContext) {
         ? { five_hour: { utilization: 93 }, seven_day: { utilization: 21 } }
         : { rate_limit: { primary_window: { used_percent: 3 }, secondary_window: { used_percent: 4 } } } };
     }) as unknown as typeof fetch;
-    return { calls, dispatcher: createDispatcher(cfg, {
+    return { calls, dispatcher: createDispatcher({ ...cfg, ...overrides }, {
       fetchImpl, now: () => probe.clock, readKeychain: async () => ({ error: "no keychain" }),
       ...(sleep ? { sleep } : {}), readings: { fetchWaitMs: 1_000, writeWaitMs: 100, pollMs: 2, staleMs: 10_000 },
     }) };
@@ -66,6 +70,34 @@ for (const rail of ["claude", "codex"] as const) {
     assert.equal(c.calls[rail], 0);
   });
 }
+
+// ADR 0016 keys a shared entry by the credential, so a settable Codex path is
+// only safe if a second source is a second entry. Sharing one would report one
+// account's headroom while the other's work draws on it — the one thing the
+// shared cache must not do (issue #89).
+test("two codex credential paths are two shared entries, not one", async (t) => {
+  const fx = await fixture(t);
+  const other = join(dirname(fx.cfg.codexCredsPath), "codex-other.json");
+  await writeFile(other, JSON.stringify({
+    tokens: { access_token: "other-token", account_id: "other-acct" },
+  }));
+
+  const first = fx.make();
+  await first.dispatcher.railReadings("codex", true);
+  const second = fx.make(undefined, undefined, { codexCredsPath: other });
+  // Unforced: if the two paths shared one key, the entry the first dispatcher
+  // just published would answer and this fetch would not happen at all.
+  const reading = await second.dispatcher.railReadings("codex");
+
+  assert.equal(reading.latest.ok, true);
+  assert.equal(first.calls.codex, 1);
+  assert.equal(second.calls.codex, 1, "the second credential must be fetched, not served from the first's entry");
+  const stored = JSON.parse(await readFile(fx.cfg.readingsPath, "utf8"));
+  const codex = stored.entries
+    .filter((entry: { rail: string }) => entry.rail === "codex")
+    .map((entry: { credential: string }) => entry.credential);
+  assert.deepEqual(codex.sort(), [resolve(fx.cfg.codexCredsPath), resolve(other)].sort());
+});
 
 for (const [name, contents] of [
   ["corrupt", "not JSON"],

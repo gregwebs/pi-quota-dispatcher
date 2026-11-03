@@ -101,7 +101,9 @@ async function fixture(t: TestContext, opts: { antigravity?: boolean } = {}) {
   }) as unknown as typeof fetch;
   const readingsPath = join(root, "quota-dispatch-readings.json");
   const dispatcher = createDispatcher({
-    ...DEFAULT_CONFIG, agentDir, claudeCredsPath, piAuthPath, ttlMs: TTL, claudeRefresh: "off",
+    // This fixture carries the Codex credential in pi's own auth file, which is
+    // what `codexCredsPath` names by default (ADR 0020).
+    ...DEFAULT_CONFIG, agentDir, claudeCredsPath, piAuthPath, codexCredsPath: piAuthPath, ttlMs: TTL, claudeRefresh: "off",
     readingsPath,
     agents: agentTable({ planner: routeOf({ primary: { model: PRIMARY, rail: "claude" }, alternates: [{ model: ALTERNATE, rail: "codex" }] }) }),
   }, {

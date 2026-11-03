@@ -887,7 +887,7 @@ const RICH_INPUT = {
 // need *a* multi-line reason to exercise the failure path.
 const REFUSAL = [
   "the generator was not run: a quota-capped rail has no successful reading yet.",
-  "the codex rail has no valid reading yet (no pi auth file).",
+  "the codex rail has no valid reading yet (no codex credential file).",
   "Run /quota-dispatch refresh once the rail can be read, then generate again.",
 ];
 

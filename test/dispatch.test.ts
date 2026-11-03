@@ -1471,6 +1471,7 @@ interface Fixture {
   agentDir: string;
   claudeCredsPath: string;
   piAuthPath: string;
+  codexCredsPath: string;
   readingsPath: string;
 }
 
@@ -1510,7 +1511,7 @@ async function fixture(models: Record<string, string>): Promise<Fixture> {
     "utf8",
   );
 
-  return { agentDir, claudeCredsPath, piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
+  return { agentDir, claudeCredsPath, piAuthPath, codexCredsPath: piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
 }
 
 /** Readings the stub endpoints should report, per rail. */

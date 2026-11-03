@@ -353,6 +353,9 @@ async function fixture(t: TestContext, auth: string | null = STORED_AUTH): Promi
         agentDir: join(root, "agents"),
         claudeCredsPath: join(root, "no-claude-credentials.json"),
         piAuthPath: overrides.piAuthPath ?? piAuthPath,
+        // This fixture's file is pi's auth file, which carries no Codex entry:
+        // named here so no read can fall through to the developer's own.
+        codexCredsPath: overrides.piAuthPath ?? piAuthPath,
         readingsPath: join(root, "quota-dispatch-readings.json"),
         claudeRefresh: "off",
         ttlMs: 10_000,

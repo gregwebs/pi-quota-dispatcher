@@ -92,6 +92,7 @@ function base(): ConfigBase {
     claudeCredsPath: "/root/.claude/.credentials.json",
     claudeRefresh: "off",
     piAuthPath: "/root/auth.json",
+    codexCredsPath: "/root/auth.json",
     readingsPath: "/root/quota-dispatch-readings.json",
     ttlMs: 180000,
     pollMs: 300000,
@@ -124,6 +125,9 @@ test("defaultConfig derives agentDir and piAuthPath from the agent directory", (
   const c = defaultConfig("/opt/pi/agent");
   assert.equal(c.agentDir, join("/opt/pi/agent", "agents"));
   assert.equal(c.piAuthPath, join("/opt/pi/agent", "auth.json"));
+  // The Codex rail's own seam defaults to the same file, so an install that was
+  // readable before this key existed is readable after it (ADR 0020).
+  assert.equal(c.codexCredsPath, c.piAuthPath);
 });
 
 test("defaultConfig keeps claudeCredsPath under the real home directory", () => {
@@ -155,6 +159,7 @@ test("defaultConfig honours PI_CODING_AGENT_DIR at call time", () => {
     const c = defaultConfig();
     assert.equal(c.agentDir, join("/tmp/pqd-relocated", "agents"));
     assert.equal(c.piAuthPath, join("/tmp/pqd-relocated", "auth.json"));
+    assert.equal(c.codexCredsPath, join("/tmp/pqd-relocated", "auth.json"));
   } finally {
     if (previous === undefined) delete process.env[ENV_AGENT_DIR];
     else process.env[ENV_AGENT_DIR] = previous;
@@ -708,6 +713,24 @@ test("a railGauge that is not a boolean warns and keeps the lower value", () => 
   }
 });
 
+test("mergeConfig applies codexCredsPath as a read-only credential seam", () => {
+  for (const source of ["global", "project"] as const) {
+    const r = mergeConfig(base(), [
+      { source, data: { codexCredsPath: "/custom/codex-auth.json" } },
+    ]);
+    assert.deepEqual(r.warnings, [], r.warnings.join("\n"));
+    assert.equal(r.config.codexCredsPath, "/custom/codex-auth.json", `${source} codexCredsPath value`);
+    assert.equal(r.sources.codexCredsPath, source, `${source} codexCredsPath source`);
+    // A non-string is refused where it is written, like any other path scalar.
+    const rejected = mergeConfig(base(), [{ source, data: { codexCredsPath: 42 } }]);
+    assert.equal(rejected.config.codexCredsPath, base().codexCredsPath);
+    assert.ok(
+      rejected.warnings.some((w) => w.includes("codexCredsPath") && w.includes("must be a string")),
+      rejected.warnings.join("\n"),
+    );
+  }
+});
+
 test("mergeConfig applies claudeCredsPath but rejects the agent-dir-owned path scalars", () => {
   const defaults = base();
   for (const source of ["global", "project"] as const) {
@@ -717,8 +740,9 @@ test("mergeConfig applies claudeCredsPath but rejects the agent-dir-owned path s
     assert.deepEqual(r.warnings, [], r.warnings.join("\n"));
     assert.equal(r.config.claudeCredsPath, "/custom/claude-credentials.json", `${source} claudeCredsPath value`);
     assert.equal(r.sources.claudeCredsPath, source, `${source} claudeCredsPath source`);
-    // The two path scalars this layer did not name stay built-in.
-    for (const other of ["agentDir", "piAuthPath"] as const) {
+    // The path scalars this layer did not name stay built-in. `codexCredsPath`
+    // is one of them: naming another Claude profile says nothing about Codex.
+    for (const other of ["agentDir", "piAuthPath", "codexCredsPath"] as const) {
       assert.equal(r.config[other], defaults[other], `${source}: ${other} should be untouched`);
       assert.equal(r.sources[other], "built-in", `${source}: ${other} source`);
     }
@@ -1775,6 +1799,13 @@ test("describeConfig lists the path scalars with their sources", async () => {
   assert.ok(creds.includes("/custom/claude-credentials.json"), creds);
   assert.ok(creds.includes("[project]"), creds);
 
+  // The Codex seam is a scalar of its own, so an install can answer "which
+  // file is the Codex rail reading?" without opening the config files.
+  const codex = lineFor("codexCredsPath");
+  assert.ok(codex, lines.join("\n"));
+  assert.ok(codex.includes("auth.json"), codex);
+  assert.ok(codex.includes("[built-in]"), codex);
+
   for (const key of ["agentDir", "piAuthPath"]) {
     const line = lineFor(key);
     assert.ok(line, `missing ${key}\n${lines.join("\n")}`);
@@ -1788,7 +1819,7 @@ test("describeConfig lists scalars before agents and sorts agents by name", asyn
 
   const firstAgent = lines.findIndex((l) => l.includes("agents."));
   assert.ok(firstAgent > 0, lines.join("\n"));
-  for (const scalar of ["agentDir", "claudeCredsPath", "piAuthPath", "ttlMs", "pollMs", "sessionSwitchAt", "weeklySwitchAt", "margin"]) {
+  for (const scalar of ["agentDir", "claudeCredsPath", "piAuthPath", "codexCredsPath", "ttlMs", "pollMs", "sessionSwitchAt", "weeklySwitchAt", "margin"]) {
     const i = lines.findIndex((l) => l.includes(scalar));
     assert.ok(i >= 0, `missing ${scalar}`);
     assert.ok(i < firstAgent, `${scalar} should come before the agent lines`);
@@ -3041,7 +3072,7 @@ test("describeConfig keeps scalars first, agents sorted and every value sourced 
 
   const firstAgent = lines.findIndex((l) => l.includes("agents."));
   assert.ok(firstAgent > 0, lines.join("\n"));
-  for (const scalar of ["agentDir", "claudeCredsPath", "piAuthPath", "ttlMs", "pollMs", "sessionSwitchAt", "weeklySwitchAt", "margin"]) {
+  for (const scalar of ["agentDir", "claudeCredsPath", "piAuthPath", "codexCredsPath", "ttlMs", "pollMs", "sessionSwitchAt", "weeklySwitchAt", "margin"]) {
     const i = lines.findIndex((l) => l.includes(scalar));
     assert.ok(i >= 0, `missing ${scalar}`);
     assert.ok(i < firstAgent, `${scalar} should come before the agent lines`);
