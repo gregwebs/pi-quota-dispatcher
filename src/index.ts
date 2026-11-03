@@ -82,6 +82,25 @@ import {
   type Rail,
 } from "./rail.ts";
 
+// The endpoints module is where the allow-list and the fetches themselves come
+// from one table; re-exported here so the `urls` form and a test reach the same
+// list as the request path.
+import {
+  ANTIGRAVITY_QUOTA_URL,
+  CLAUDE_USAGE_URL,
+  CODEX_USAGE_URL,
+  describeOutboundRequests,
+} from "./endpoints.ts";
+export {
+  ANTIGRAVITY_QUOTA_URL,
+  CLAUDE_USAGE_URL,
+  CODEX_USAGE_URL,
+  OUTBOUND_REQUESTS,
+  UNREQUESTED_RAILS,
+  describeOutboundRequests,
+} from "./endpoints.ts";
+export type { OutboundRequest, UnrequestedRail } from "./endpoints.ts";
+
 // The reading is the policy's only evidence: its shape, the parsers that build
 // it from a vendor's document and the judgments about it all live here, so the
 // policy, the gauge, the readings file and the generator share one definition.
@@ -2030,15 +2049,6 @@ export const DEFAULT_QUOTA_READ: QuotaReadPacing = {
 };
 
 /**
- * The quota-summary endpoint Antigravity's own CLI calls.
- *
- * Undocumented, like the two vendor endpoints beside it, and the only place the
- * three pools' bucket ids appear. See `docs/adr/0019-antigravity-pool-rails.md`.
- */
-export const ANTIGRAVITY_QUOTA_URL =
-  "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
-
-/**
  * The `User-Agent` Antigravity's own current client sends, and the reason it is
  * pinned rather than borrowed from whatever called pi.
  *
@@ -2871,7 +2881,7 @@ export function createDispatcher(
 
   /** The Claude rail's ordinary read, once a token has been supplied. */
   async function claudeUsage(token: string): Promise<VendorReading> {
-    const read = await readUsage("https://api.anthropic.com/api/oauth/usage", {
+    const read = await readUsage(CLAUDE_USAGE_URL, {
       headers: {
         Authorization: `Bearer ${token}`,
         "anthropic-beta": "oauth-2025-04-20",
@@ -3069,7 +3079,7 @@ export function createDispatcher(
     if (!cred?.access) return unavailable("codex", "no openai-codex.access");
     if (!cred?.accountId) return unavailable("codex", "no openai-codex.accountId");
 
-    const read = await readUsage("https://chatgpt.com/backend-api/wham/usage", {
+    const read = await readUsage(CODEX_USAGE_URL, {
       headers: {
         Authorization: `Bearer ${cred.access}`,
         "ChatGPT-Account-Id": cred.accountId,
@@ -3766,6 +3776,7 @@ function announceUnknownModels(
 export type Invocation =
   | { form: "report"; force: boolean }
   | { form: "config" }
+  | { form: "urls" }
   | { form: "apply" }
   | { form: "generate"; scope: "global" | "project" }
   | { form: "unknown"; arg: string };
@@ -3787,6 +3798,7 @@ export function parseInvocation(args: string): Invocation {
   if (arg === "") return { form: "report", force: false };
   if (arg === "refresh") return { form: "report", force: true };
   if (arg === "config") return { form: "config" };
+  if (arg === "urls") return { form: "urls" };
   if (arg === "apply") return { form: "apply" };
   // `generate` takes exactly one optional word, `project`; ordinary whitespace
   // between and around the words is allowed. Anything else — `generate global`,
@@ -3809,7 +3821,7 @@ export function parseInvocation(args: string): Invocation {
 export function unknownFormNotice(arg: string): string[] {
   return [
     `quota-dispatcher: "${arg}" is not a form.`,
-    "Forms: /quota-dispatch, /quota-dispatch refresh, /quota-dispatch config, /quota-dispatch apply, /quota-dispatch generate [project].",
+    "Forms: /quota-dispatch, /quota-dispatch refresh, /quota-dispatch config, /quota-dispatch urls, /quota-dispatch apply, /quota-dispatch generate [project].",
   ];
 }
 
@@ -4284,7 +4296,8 @@ export default function (pi: ExtensionAPI) {
     // The forms are named here because this is the only place pi shows them:
     // a user who never opens the README would not otherwise learn that the
     // provenance form exists.
-    description: "Show subscription headroom and each agent's model; forms: refresh, config, apply, generate",
+    description:
+      "Show subscription headroom and each agent's model; forms: refresh, config, urls, apply, generate",
     handler: async (args, ctx) => {
       const invocation = parseInvocation(args ?? "");
 
@@ -4295,9 +4308,18 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // The context the gauge draws on for every form below. Set after the typo
-      // return, so a typo changes nothing at all: an unknown form reads no
-      // config, boots nothing and touches no footer.
+      // Answered from the code's own table, before any boot: an allow-list is a
+      // question about what this software can request, not about this install's
+      // routes, so it costs no config read and no quota request.
+      if (invocation.form === "urls") {
+        ctx.ui.notify(describeOutboundRequests().join("\n"), "info");
+        return;
+      }
+
+      // The context the gauge draws on for every form below. Set after the two
+      // forms that answer themselves, so neither reads config, boots anything or
+      // touches a footer: a typo and an allow-list are both answered from text
+      // this process already has.
       footer = ctx;
 
       // Generation runs the declared command and replaces one file, so it is

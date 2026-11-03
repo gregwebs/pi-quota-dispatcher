@@ -298,6 +298,7 @@ The glossary term is in [CONTEXT.md](CONTEXT.md).
 | `/quota-dispatch` | Show rail budgets and the current decision per agent, plus any agent files no route names. Read-only. |
 | `/quota-dispatch refresh` | Force a re-fetch, then show. Read-only. |
 | `/quota-dispatch config` | Print where each configured value came from. Local, so it reads no quota and touches no file. |
+| `/quota-dispatch urls` | List every outbound URL the extension can request, for a firewall allow-list. Local, so it reads no quota and touches no file. |
 | `/quota-dispatch apply` | Write the decisions out now. |
 | `/quota-dispatch generate [project]` | Run the declared generator and replace that file's configuration with its output. It is fed the current rail readings on stdin. See [Generating configuration](#generating-configuration). |
 
@@ -310,6 +311,9 @@ The two reporting forms are read-only by construction — `report()` has no way 
 be asked to write, so "show me the state" cannot rewrite your agents — and
 `config` never gets as far as a rail: it is answered from the config files, so it
 works when a vendor is unreachable or you would rather not spend a request.
+`urls` does not even read the config: it is answered from the endpoints table
+before any boot, so it works on a machine whose firewall blocks the vendors
+entirely.
 
 `/quota-dispatch config` is also what answers "why is reviewer on gpt-6-astra?"
 without opening three files. The report keeps the one line that says which layers
@@ -1072,15 +1076,18 @@ takes no lock at all. See ADR
 
 ## Where the numbers come from
 
-Three endpoints that the vendors' own clients use. None is a documented public
-API, so treat them as best-effort — the extension is built to degrade quietly if
-they change or move.
+Three endpoints that the vendors' own clients use; the metered rail makes no
+request at all. None is a documented public API, so treat them as best-effort —
+the extension is built to degrade quietly if they change or move.
+`/quota-dispatch urls` prints the same list from the code's own table, one URL
+per line, so it can be used to build a firewall allow-list.
 
-| Rail | Credential | Endpoint |
+| Provider | Rails | Request |
 |---|---|---|
-| Claude | the macOS login keychain (`Claude Code-credentials`), falling back to `~/.claude/.credentials.json` → `claudeAiOauth.accessToken` | `api.anthropic.com/api/oauth/usage` |
-| Codex | `<agent dir>/auth.json` (normally `~/.pi/agent/auth.json`) → `openai-codex.access` + `accountId` | `chatgpt.com/backend-api/wham/usage` |
-| Antigravity (all three pools) | the same `auth.json` → `antigravity.access`, with `antigravity.projectId` sent when it names one | `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` |
+| Anthropic | `claude` | `GET https://api.anthropic.com/api/oauth/usage` |
+| OpenAI | `codex` | `GET https://chatgpt.com/backend-api/wham/usage` |
+| Google (Antigravity) | `antigravity-argon`, `antigravity-gemini`, `antigravity-3p` | `POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` |
+| DeepSeek | `deepseek` | none — metered per token, so no request is made |
 
 Antigravity's three pools share a row because they share a request: one `POST`
 answers for all of them, and the buckets in that one body are partitioned by
@@ -1089,6 +1096,14 @@ bucket id — `gemini-argon-*` to `antigravity-argon`, other `gemini-*` to
 windows and percentages, and one shared answer is also why a group the vendor
 omitted costs one pool its reading rather than all three. See
 [0019](docs/adr/0019-antigravity-pool-rails.md).
+
+What each request is read with:
+
+| Rail | Credential |
+|---|---|
+| Claude | the macOS login keychain (`Claude Code-credentials`), falling back to `~/.claude/.credentials.json` → `claudeAiOauth.accessToken` |
+| Codex | `<agent dir>/auth.json` (normally `~/.pi/agent/auth.json`) → `openai-codex.access` + `accountId` |
+| Antigravity (all three pools) | the same `auth.json` → `antigravity.access`, with `antigravity.projectId` sent when it names one |
 
 The request's `User-Agent` is pinned to the string Antigravity's current CLI
 sends, and it is load-bearing rather than polite: Google omits the `Gemini 4
@@ -1099,6 +1114,15 @@ a vendor build that demands a newer string.
 
 Credentials are read, never logged, and never transmitted anywhere except to the
 provider that issued them.
+
+Two network paths are deliberately outside that table. When `claudeRefresh` is
+`offline-ping` or `ping`, the extension runs the `claude` CLI; that process
+performs its own token refresh against Anthropic, and in `ping` mode it makes a
+real model request — neither URL is one this extension chooses. When the
+Antigravity token has expired, the refresh is performed by pi's own provider
+rather than by this extension. Whatever hosts your pi install already needs for
+those flows have to stay reachable; `/quota-dispatch urls` lists only the
+requests this extension makes itself.
 
 The Claude credential has two possible homes because Claude Code has two. On
 macOS the one it actually refreshes is the login keychain; the
