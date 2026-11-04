@@ -5,6 +5,18 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 /**
+ * A **wire-level integration test**: a child process whose `fetch` is a stub, so
+ * what it proves is what the dispatcher actually put on the wire.
+ *
+ * The one fact it is here for is credential→header: which token a refresh left in
+ * the store, and whether that token — and not the resolver's own JSON document —
+ * became `Authorization: Bearer …` on the request. That is a claim about a real
+ * request, so the assertions its callers make read the header back. It is the
+ * boundary ADR-0021's amendment carves out: observing a header on the wire is
+ * allowed here, and inventing vendor protocol knowledge is not — the endpoint it
+ * answers and the request shape it expects are `src/endpoints.ts`' and
+ * `test/rail-read.test.ts`' respectively.
+ *
  * Nothing from `src` may be imported statically here: this file's whole point is
  * that `src/index.ts` is first evaluated *after* `PI_CODING_AGENT_DIR` is set.
  * `agent-write-child.ts` imports it at module scope, so even its `waitUntil` is

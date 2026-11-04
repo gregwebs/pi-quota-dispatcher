@@ -1680,6 +1680,44 @@ test("an unreadable api holds every agent in place", async () => {
   assert.ok(lines.some((l) => l.includes("unreadable")));
 });
 
+/**
+ * The read seam's own defaults are a claim about the domain: a pool a fixture
+ * does not describe is one that was read and has spent nothing — not one with no
+ * reading, which the policy holds as *unknown* — and a credential the install
+ * does not carry is one group-wide failure, not three healthy rails. Neither
+ * claim is visible from a test that states its own answer, so both are asserted
+ * here through the dispatcher's own `railReadings`.
+ */
+test("an undescribed rail is a readable one, and a missing Antigravity credential is not", async () => {
+  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+  // Two installs, each with its own store and its own readings file: a warm
+  // cache from the first must not be mistaken for a second install's answer.
+  const antigravity = async (name: string, auth: Record<string, unknown>) => {
+    const piAuthPath = join(fx.agentDir, `auth-${name}.json`);
+    await writeFile(piAuthPath, JSON.stringify(auth), "utf8");
+    const d = createDispatcher(
+      {
+        ...DEFAULT_CONFIG,
+        ...fx,
+        piAuthPath,
+        codexCredsPath: piAuthPath,
+        readingsPath: join(fx.agentDir, `readings-${name}.json`),
+      },
+      { read: fakeReads() },
+    );
+    return (await d.railReadings("antigravity-gemini", true)).latest;
+  };
+
+  const missing = await antigravity("no-antigravity", { "openai-codex": { access: "t", accountId: "a" } });
+  assert.equal(missing.ok, false, "a credential the store does not carry is a group-wide failure");
+  assert.equal(missing.ok === false ? missing.note : "", "no antigravity.access");
+
+  const healthy = await antigravity("antigravity", { antigravity: { access: "tok", expires: Date.now() + 3_600_000 } });
+  assert.ok(healthy.ok, healthy.ok === false ? healthy.note : "expected a reading");
+  assert.equal(budgetUsed(healthy, "session"), 0, "a pool nobody described has spent nothing");
+  assert.equal(budgetUsed(healthy, "weekly"), 0);
+});
+
 test("limit_reached on codex moves the reviewer onto claude", async () => {
   const fx = await fixture({ reviewer: "openai-codex/gpt-6-astra" });
   const d = dispatcherFor(fx, { codex: { session: 20 }, codexLimited: true });

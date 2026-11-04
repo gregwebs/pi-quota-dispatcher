@@ -4,10 +4,11 @@
  * docs/adr/0007-refresh-pings.md.
  *
  * The default-profile predicate lives here because it is about which profile a
- * ping speaks for. The runner it and the credential reads share is `exec.ts`,
- * and the credential shapes are `credentials.ts`, so this module imports both
- * and neither imports it: the cycle that once ran through the entry point is
- * gone.
+ * ping speaks for. The subprocess runner it uses is `exec.ts` — which is also
+ * where `CredentialRead` lives, so the ping and the credential reads in
+ * `credentials.ts` state one shape for "what a command printed" — and neither of
+ * those modules imports this one: the cycle that once ran through the entry
+ * point is gone.
  */
 import { createServer, type Server } from "node:http";
 import {

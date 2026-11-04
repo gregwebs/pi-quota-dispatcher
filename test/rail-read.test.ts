@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 
 import {
   createDispatcher,
@@ -16,6 +18,7 @@ import {
   DEFAULT_ANTIGRAVITY_USER_AGENT,
   DEFAULT_QUOTA_READ,
   createRailRead,
+  httpTransport,
   type Transport,
   type TransportRequest,
   type TransportResult,
@@ -28,10 +31,16 @@ import type { AntigravityReadings, RailWindow } from "../src/rail-reading.ts";
 const NOW = 1_730_123_456_789;
 const STORED_ACCESS = { token: "stored-access", projectId: "stored-project" };
 
-// This file pins the rail read's own contract, and it is the only test that
-// knows a vendor's endpoint, its document shape, or a header. Everything above
-// it — policy, gauge, report, cache — hands the dispatcher a reading through
-// `deps.read` and never sees any of that.
+// This file pins the rail read's own contract: the request shape (which header
+// names and values go out, the pinned User-Agent, the URLs it sends), the three
+// vendors' document shapes as a read sees them, and how one transport outcome is
+// classified. The wire-level integration tests — `test/antigravity.test.ts` and
+// `test/fixtures/antigravity-child.ts` — stub `fetch` below the transport seam
+// and may *observe* the credential header they put on it, which is their whole
+// subject; no test anywhere routes a stub by a vendor header, and everything
+// above the seam — policy, gauge, report, cache — hands over a reading through
+// `deps.read` and never sees a URL, a header or a document. ADR-0021's
+// amendment is where that boundary is stated.
 
 // ---------------------------------------------------------------- documents
 
@@ -255,15 +264,53 @@ test("Argon is matched before the general gemini prefix", async () => {
 });
 
 test("hostile bodies parse to three empty pools instead of throwing or coercing", async () => {
-  for (const body of [null, 42, "text", {}, { groups: "nope" }, { groups: [{ buckets: 7 }] }]) {
+  const cases: unknown[] = [
+    null,
+    42,
+    "a string",
+    [],
+    {},
+    { groups: null },
+    { groups: "no" },
+    { groups: [null, 7, "x", [], { buckets: null }, { buckets: {} }] },
+    { groups: [{ buckets: [null, 1, "x", []] }] },
+    // One malformed bucket must not take the good ones with it, and must not be
+    // repaired into a window of its own: a non-string id belongs to no pool, a
+    // fraction the vendor wrote as text is not a number the policy may weigh,
+    // and a missing or non-finite fraction is not a reading of zero.
+    { groups: [{ buckets: [{ bucketId: 5, window: "5h", remainingFraction: 0.5 }] }] },
+    { groups: [{ buckets: [{ bucketId: "gemini-5h", window: "5h", remainingFraction: "0.5" }] }] },
+    { groups: [{ buckets: [{ bucketId: "gemini-5h", window: "5h" }] }] },
+    { groups: [{ buckets: [{ bucketId: "gemini-5h", window: "5h", remainingFraction: Number.NaN }] }] },
+    { groups: [{ buckets: [{ bucketId: "gemini-5h", window: "5h", remainingFraction: Number.POSITIVE_INFINITY }] }] },
+  ];
+  for (const body of cases) {
     const group = await readOver(documentTransport(body)).antigravity(STORED_ACCESS);
     for (const rail of ["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const) {
       const reading = group[rail];
       assert.equal(reading.ok, false, `${rail} from ${JSON.stringify(body)}`);
       assert.equal(reading.ok === false ? reading.note : "", "no usage windows returned");
+      assert.deepEqual(reading.windows, [], `${rail} from ${JSON.stringify(body)}`);
       assert.ok(!("raw" in reading), "a failure carries no vendor body");
     }
   }
+});
+
+test("a malformed bucket beside good ones is dropped rather than taking them with it", async () => {
+  const group = await readOver(documentTransport({
+    groups: [
+      {
+        buckets: [
+          { bucketId: "gemini-5h", window: "5h", remainingFraction: "0.5" },
+          { bucketId: "gemini-weekly", window: "weekly", remainingFraction: 0.25 },
+        ],
+      },
+    ],
+  })).antigravity(STORED_ACCESS);
+
+  assert.deepEqual(okWindows(group["antigravity-gemini"]), [
+    { label: "gemini-weekly", used: 75, budget: "weekly" },
+  ]);
 });
 
 test("remainingFraction is complemented and clamped to whole percent", async () => {
@@ -281,10 +328,23 @@ test("remainingFraction is complemented and clamped to whole percent", async () 
 
   assert.deepEqual((await windowsFor(1)).map((w) => w.used), [0]);
   assert.deepEqual((await windowsFor(0.42)).map((w) => w.used), [58]);
+  // The vendor reports what is left, so used is its complement: 1 - 0.9716168 is
+  // 2.83832%, which the wire carries as 3 rather than a fraction.
+  assert.deepEqual((await windowsFor(0.9716168)).map((w) => w.used), [3]);
+  assert.deepEqual((await windowsFor(0.9858084)).map((w) => w.used), [1]);
   // The vendor's own number outside [0, 1] would otherwise weigh as a negative or
   // impossible usage figure.
   assert.deepEqual((await windowsFor(-0.5)).map((w) => w.used), [100]);
+  assert.deepEqual((await windowsFor(1.4)).map((w) => w.used), [0]);
   assert.deepEqual((await windowsFor(2)).map((w) => w.used), [0]);
+
+  // Monotone and integral across the range, so a sign or rounding flip shows up.
+  for (let percent = 0; percent <= 100; percent++) {
+    const [window] = await windowsFor(1 - percent / 100);
+    assert.equal(Number.isInteger(window!.used), true, `${percent}% produced ${window!.used}`);
+    assert.ok(window!.used >= 0 && window!.used <= 100, `${percent}% produced ${window!.used}`);
+    assert.equal(window!.used, percent);
+  }
 });
 
 test("an unfamiliar window is kept as display-only and invents no budget", async () => {
@@ -533,6 +593,202 @@ test("a failure with no code is a bare request failure", async () => {
     { backoffMs: 1 },
   ).claude("tok");
   assert.equal(reading.ok === false ? reading.note : "", "request failed after 2 attempts");
+});
+
+// --------------------------------------------------------- the real adapter
+//
+// Everything above hands the read a failure that was already classified, which
+// proves what the retry loop does with an answer and nothing about the answer
+// itself. The deadline and the redaction live in `httpTransport`, so these drive
+// it over a real loopback socket and the real `fetch`: a request that lost its
+// `AbortSignal` hangs here, and an error message echoed into a note is read back
+// with the credential in it.
+
+/**
+ * A loopback server with one stated behaviour, and its URL.
+ *
+ * Loopback rather than a vendor endpoint: what is under test is the boundary
+ * between a socket and a classification, and the address is only the thing a
+ * request is sent to.
+ */
+async function loopback(t: TestContext, answer: (res: ServerResponse) => void): Promise<string> {
+  const server = createServer((_request, res) => answer(res));
+  await new Promise<void>((listening) => server.listen(0, "127.0.0.1", listening));
+  t.after(async () => {
+    // A stalled body leaves its socket open; the deadline is what closes it, and
+    // a test that runs without one must still end.
+    server.closeAllConnections();
+    await new Promise<void>((closed) => server.close(() => closed()));
+  });
+  const { port } = server.address() as AddressInfo;
+  return `http://127.0.0.1:${port}/usage`;
+}
+
+/**
+ * What `work` settles with, or `"did not settle"` once `ms` has passed.
+ *
+ * A hung test is not a failed test: without this the runner would sit on an open
+ * socket until its own timeout, and "the deadline went missing" would be reported
+ * as an infrastructure hang rather than as a broken request.
+ */
+async function settled<T>(work: Promise<T>, ms: number): Promise<T | "did not settle"> {
+  let timer: NodeJS.Timeout | undefined;
+  const bound = new Promise<"did not settle">((done) => {
+    timer = setTimeout(() => done("did not settle"), ms);
+  });
+  try {
+    return await Promise.race([work, bound]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The real adapter, with only the address a request is sent to replaced. */
+function overLoopback(url: string, http: typeof fetch = fetch): Transport {
+  return (request) => httpTransport(http)({ ...request, url });
+}
+
+/**
+ * How long a stalled-body exchange is given before its deadline fires.
+ *
+ * Sized so the *request* cannot plausibly be what spent it: a loopback connect
+ * and a status line are single-digit milliseconds, so a budget an order of
+ * magnitude larger leaves the body read as the only phase that can still be
+ * running when the deadline arrives. That is the whole reason for the number —
+ * both phases are classified as the same `timeout`, so a body test whose request
+ * phase ran out of time reports a broken body classifier as correct. A larger
+ * budget would only make that less likely, never impossible, and every stalled
+ * body then costs that much suite time; the witness below is what turns the
+ * remaining possibility into a failure, so this number stays small.
+ */
+const BODY_DEADLINE_MS = 500;
+
+/**
+ * The real `fetch`, wrapped so an exchange records whether it got as far as
+ * reading a body.
+ *
+ * This is the difference between "a request was abandoned at its deadline" and
+ * "the body read was abandoned at its deadline", and only the second is what a
+ * stalled-body test is about. Entry into `json()` is recorded before the read
+ * starts, so a body that never yields still leaves the witness behind; a test
+ * asserting it fails loudly when the exchange timed out before its headers
+ * instead of passing on the request phase's timeout.
+ */
+function fetchWatchingBody(): { readonly http: typeof fetch; readonly reachedBody: () => boolean } {
+  let reached = false;
+  const http: typeof fetch = async (input, init) => {
+    const response = await fetch(input, init);
+    const readBody = response.json.bind(response);
+    // `json` is a read-only prototype method; overriding it on this one instance
+    // is what lets the test see the body read begin, and the real read is still
+    // the one that runs.
+    Object.defineProperty(response, "json", {
+      value: async () => {
+        reached = true;
+        return await readBody();
+      },
+    });
+    return response;
+  };
+  return { http, reachedBody: () => reached };
+}
+
+test("a body that stalls after its headers is abandoned at the same deadline", async (t) => {
+  const url = await loopback(t, (res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    // Headers now, body never: a vendor that answered and then went quiet. The
+    // deadline has to cover reading the body, not just getting the response.
+    res.write("{");
+  });
+
+  const { http, reachedBody } = fetchWatchingBody();
+  const result = await settled(httpTransport(http)({ url, headers: {}, timeoutMs: BODY_DEADLINE_MS }), 5_000);
+  assert.ok(reachedBody(), "the exchange must reach the body read, or this test is about the request phase");
+  assert.deepEqual(result, { kind: "failed", failure: { kind: "timeout" } }, "the body read is under the deadline too");
+});
+
+test("a request that never gets a response is the same timeout", async (t) => {
+  // Deliberately the *pre-response* phase, and the reason this case is its own
+  // test: the deadline is meant to run out before a status line arrives, so a
+  // short budget here is the point rather than a hazard. Accepted and then
+  // silent is what a vendor behind a black-holing proxy looks like.
+  const url = await loopback(t, () => {});
+
+  const { http, reachedBody } = fetchWatchingBody();
+  const result = await settled(httpTransport(http)({ url, headers: {}, timeoutMs: 50 }), 5_000);
+  assert.equal(reachedBody(), false, "no response ever arrived, so no body read can have started");
+  assert.deepEqual(result, { kind: "failed", failure: { kind: "timeout" } }, "a timeout is not a network error");
+});
+
+test("a stalled body reaches the note as the budget it gave up on", async (t) => {
+  const url = await loopback(t, (res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.write("{");
+  });
+
+  const { http, reachedBody } = fetchWatchingBody();
+  // The same two attempts and the same note as a stall before the response, so
+  // a lost deadline cannot pass by being reported as anything else.
+  const reading = await settled(
+    readOver(overLoopback(url, http), { timeoutMs: BODY_DEADLINE_MS, backoffMs: 1 }).claude("tok"),
+    5_000,
+  );
+  assert.ok(reachedBody(), "the exchange must reach the body read, or this test is about the request phase");
+  assert.equal(
+    reading === "did not settle" ? reading : reading.ok === false ? reading.note : "",
+    `no answer within ${BODY_DEADLINE_MS}ms after 2 attempts`,
+  );
+});
+
+test("a 200 whose body is not JSON is an unreadable body, not a shape problem", async (t) => {
+  const url = await loopback(t, (res) => {
+    res.writeHead(200, { "content-type": "text/html" });
+    res.end("<html><body>sign in to continue</body></html>");
+  });
+
+  const result = await httpTransport()({ url, headers: {}, timeoutMs: 5_000 });
+  assert.equal(result.kind, "failed");
+  assert.equal(result.kind === "failed" ? result.failure.kind : "", "unreadable-body");
+  // A captive portal looks exactly like this, so it must not be read as a
+  // document whose shape the parsers then reject.
+  assert.notEqual(result.kind === "failed" ? result.failure.kind : "", "timeout");
+
+  const reading = await readOver(overLoopback(url), { backoffMs: 1 }).claude("tok");
+  assert.match(reading.ok === false ? reading.note : "", /^unreadable body \(.+\) after 2 attempts$/);
+});
+
+test("a request that never reached the vendor is reported by its cause's code", async () => {
+  // A listener bound and then let go: the port is real and nothing is listening
+  // on it, so the failure is the OS refusing the connection rather than a stub.
+  const bound = createServer(() => {});
+  await new Promise<void>((listening) => bound.listen(0, "127.0.0.1", listening));
+  const { port } = bound.address() as AddressInfo;
+  await new Promise<void>((closed) => bound.close(() => closed()));
+
+  const result = await httpTransport()({ url: `http://127.0.0.1:${port}/usage`, headers: {}, timeoutMs: 5_000 });
+  if (result.kind !== "failed" || result.failure.kind !== "network") {
+    assert.fail(`a refused connection is a network failure: ${JSON.stringify(result)}`);
+  }
+  // The code, not the message: undici's own text for this is "fetch failed".
+  assert.equal(result.failure.code, "ECONNREFUSED");
+});
+
+test("a request error that quotes the credential never reaches a note", async (t) => {
+  const url = await loopback(t, (res) => { res.end("{}"); });
+  // `fetch` validates header values while building the request, and its message
+  // quotes the value it rejected — here a credential whose token carries a line
+  // break. That message is the leak this assertion exists for: a network failure
+  // is reported by its cause's code, never by what the error says about itself.
+  const token = "sk-secret\r\nX-Injected: 1";
+
+  const result = await httpTransport()({ url, headers: { Authorization: `Bearer ${token}` }, timeoutMs: 5_000 });
+  assert.equal(result.kind === "failed" ? result.failure.kind : "", "network");
+  assert.ok(!JSON.stringify(result).includes("sk-secret"), JSON.stringify(result));
+
+  const reading = await readOver(overLoopback(url), { backoffMs: 1 }).claude(token);
+  const note = reading.ok === false ? reading.note : "";
+  assert.equal(note, "request failed after 2 attempts");
+  assert.ok(!note.includes("sk-secret"), note);
 });
 
 test("a well-formed answer with no windows is still an answer, and says so", async () => {

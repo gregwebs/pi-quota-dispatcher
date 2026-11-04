@@ -174,9 +174,12 @@ import {
   type ClaudeRefresh,
 } from "./refresh.ts";
 
-// The credentials module is where a store's text becomes a token, and where the
-// whole of acquiring one lives; the dispatcher names its types in its deps and
-// asks it for tokens.
+// The credentials module is where a store's text becomes a token, and where
+// the Claude token, the Codex credential and the single-flight Antigravity
+// refresh are acquired. It deliberately does not own every acquisition: the
+// Claude gates and the paid ping need this dispatcher's state, so they stay in
+// this entry point, which names the module's types in its deps and asks it for
+// tokens.
 import {
   PROVIDER_TOKEN_TIMEOUT_MS,
   claudeInstall,

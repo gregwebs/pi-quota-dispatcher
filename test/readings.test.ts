@@ -27,7 +27,7 @@ import {
 } from "../src/rail-reading.ts";
 
 import { agentTable, routeOf } from "./helpers/identifiers.ts";
-import { failureOf, fakeReads, poolFailure, readingOf, type Used } from "./helpers/rails.ts";
+import { failureOf, fakeReads, poolFailure, poolGroup, readingOf, type Used } from "./helpers/rails.ts";
 
 const NOW = 1_730_123_456_789;
 const TTL = 10_000;
@@ -116,11 +116,7 @@ async function fixture(t: TestContext, opts: { antigravity?: boolean } = {}) {
       probe.antigravityCalls++;
       const override = probe.answer.antigravity;
       if (override !== undefined) return override(1) as AntigravityReadings;
-      return {
-        "antigravity-argon": readingOf("antigravity-argon", probe.poolUsed["antigravity-argon"]!, probe.clock) as never,
-        "antigravity-gemini": readingOf("antigravity-gemini", probe.poolUsed["antigravity-gemini"]!, probe.clock) as never,
-        "antigravity-3p": readingOf("antigravity-3p", probe.poolUsed["antigravity-3p"]!, probe.clock) as never,
-      };
+      return poolGroup(probe.poolUsed, probe.clock);
     },
   });
   const readingsPath = join(root, "quota-dispatch-readings.json");

@@ -74,3 +74,69 @@ removes.
 exists to stop: it would put the gates and a paid subprocess inside a module
 whose whole value is that it has no state. When the gate policy does become a
 module, the Claude token's acquisition moves *beside* the read, not into it.
+
+## Amendment: where the test boundary actually is
+
+*Added after the review of `62b321d..b136521`, which found the sentence above to
+be false. The decision stands; one claim about the tests did not.*
+
+"A policy, report or gauge test injects the read and hands over a reading; only
+the read module's own test names a vendor URL, a header or the pinned Antigravity
+user agent" asked for something this extension cannot have. The entry point's own
+tests drive `extension(api)`, which builds the *default* dispatcher, so they stub
+`globalThis.fetch` — below the transport seam. A test there answers a real
+request, and a real request has real headers on it.
+
+The boundary that is true, and is worth keeping, is drawn by what a test is
+*about* rather than by which file it lives in: a test may see as much of a
+rail-read request as the question it asks requires, and no more.
+
+| Level | Test | What it may know |
+| --- | --- | --- |
+| The read itself | `test/rail-read.test.ts` | Owns the request **shape**: every header name and value, the pinned `User-Agent`, the URLs it sends (through the constants in `src/endpoints.ts`, whose literals are that table's own content), and how each transport outcome is classified. |
+| Wire-level integration | `test/antigravity.test.ts` with `test/fixtures/antigravity-child.ts` | Drives the real request-building stack in a child process, so the credential it puts on the wire is its **subject**: its assertions read `Authorization: Bearer <token>` back out of a stub, because credential→header is the one thing a child process can prove. Observing a header is the whole of that licence — it must never *route* a stub by one, and it tells its sources apart by the allow-list constants. |
+| The whole stack with `fetch` stubbed | `test/command.test.ts` | Answers a real request, so it must answer with a body its parsers accept, but it spells no header name and no user agent, and no vendor URL literal: the constants answer and route the three sources, and may be named only in the one test about *which* requests the extension makes — its `urls` test. |
+| Everything above the seam | policy, gauge, report, store, cache | Injects `deps.read` and hands over a reading: no URL, no header, no attempt count, no HTTP stub. |
+
+So the gate is four claims, each checkable by reading the test files. They are
+about **rail-read traffic** — a request this extension makes to a vendor — and
+they stop there: a test that starts its own loopback server and puts an
+`Authorization` header on the request *it* sends (the refresh ping's leak
+assertion in `test/refresh.test.ts`) is the secret-handling claim this extension
+makes about a listener it controls, not a description of a vendor request, and
+no read test can make it.
+
+1. **The request shape is `test/rail-read.test.ts`'s alone.** No other test
+   spells a vendor header name, in a stub or in an assertion — except the two
+   wire-level integration tests named above, whose declared subject is the
+   credential header they read back. No test outside it asserts the pinned
+   Antigravity user agent.
+2. **A vendor URL literal belongs to the allow-list table.** None appears
+   outside `test/rail-read.test.ts` and `test/endpoints.test.ts`;
+   `test/endpoints.test.ts` holds them as the contract table's own content,
+   which is what makes the constants a routing key rather than protocol
+   knowledge.
+3. **No stub is routed by a vendor header.** Every stub that answers a request
+   routes by the constants and fails on a request this extension must not make.
+4. **A test that hands over a reading names no request at all**, and a test that
+   does name one does it through those constants, because the request it is
+   asking about is this extension's own — the `urls` test.
+
+Two consequences followed in the code. `test/command.test.ts` used to tell its
+three rails apart by method and by `ChatGPT-Account-Id`; the endpoint constants
+do that job, so a command test no longer knows a vendor header. And the child
+fixture says at the top of the file what it is, so its `Bearer …` assertions read
+as "what the dispatcher put on the wire" and not as a second copy of the request
+shape.
+
+One thing no rule here can take away: a test that stubs `fetch` below the
+transport seam must answer with a body the parser accepts, so
+`test/command.test.ts` states the documents its three sources return — the field
+names it needs in order to hand over a reading.
+
+**Documents are not what this boundary governs.** Parsing is a pure function
+above the transport seam, and a test may hand a raw payload straight to it —
+`test/dispatch.test.ts`, `test/generator-input.test.ts` and
+`test/readings.test.ts` do, for reasons that have nothing to do with a request.
+What the boundary is about is the **request**: what goes on the wire, and what a
+response is classified as.

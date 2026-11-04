@@ -2,17 +2,21 @@
  * One rail read: the credential is already in hand, the vendor is asked, and the
  * answer becomes a **rail reading**.
  *
- * The module has no state and no dependencies on the rest of the extension: not
- * the rail readings file, not a configuration object, not pi. Its unit is a
- * source rather than a rail — one request answers for `claude`, one for `codex`,
- * and one for all three Antigravity pools — so a pool group is never three
- * requests. Credential *acquisition* is deliberately outside: the Claude token
- * may only be found by consulting the machine-wide refresh gates, which is the
- * dispatcher's state, not a read's.
+ * The module has no state and no store, config, pi or credential-acquisition
+ * dependency: not the rail readings file, not a configuration object, not pi, and
+ * not the refresh gates or the paid ping — it is handed a credential that some
+ * other module already acquired. Its unit is a source rather than a rail — one
+ * request answers for `claude`, one for `codex`, and one for all three
+ * Antigravity pools — so a pool group is never three requests. Credential
+ * *acquisition* is deliberately outside: the Claude token may only be found by
+ * consulting the machine-wide refresh gates, which is the dispatcher's state,
+ * not a read's.
  *
- * The only thing it touches outside itself is the outbound allow-list table in
- * `endpoints.ts`, so the URLs a request uses and the URLs a firewall is told
- * about cannot drift apart. See
+ * What it does depend on is the vocabulary of the answer: the outbound
+ * allow-list table in `endpoints.ts`, so the URLs a request uses and the URLs a
+ * firewall is told about cannot drift apart, and the parsers and payload types
+ * in `rail-reading.ts`, because turning a document into a reading is the last
+ * thing a read does. See
  * docs/adr/0021-a-rail-read-is-its-own-module.md.
  */
 import type { AntigravityAccess, AntigravityToken, CodexCredential } from "./credentials.ts";
@@ -340,8 +344,18 @@ export function createRailRead(deps: RailReadDeps = {}): RailRead {
  * A failed reading, stamped with the clock at the moment the read gave up. That
  * is `readAt` — when the answer turned out to be unusable — not the TTL origin,
  * which is the store's own stamp.
+ *
+ * Generic in the rail so the answer a caller gets back still carries the rail it
+ * was asked about: `AntigravityReadings` is a mapped type whose pool entries are
+ * correlated with their key, and a constructor declared over the plain union
+ * (`rail: VendorRail`) would widen the literal and hand back a value no caller
+ * could put in that slot without an assertion.
  */
-export function failedReading(rail: VendorRail, note: string, readAt: number): FailedReading {
+export function failedReading<R extends VendorRail>(
+  rail: R,
+  note: string,
+  readAt: number,
+): FailedReading & { readonly rail: R } {
   return { rail, ok: false, windows: [], readAt, note };
 }
 
@@ -427,9 +441,7 @@ function poolReadings(
 ): AntigravityReadings {
   const pool = <R extends AntigravityRail>(rail: R): VendorReading & { rail: R } => {
     const found = windows[rail];
-    if (!found.length) {
-      return { rail, ok: false, windows: [], readAt, note: "no usage windows returned" };
-    }
+    if (!found.length) return failedReading(rail, "no usage windows returned", readAt);
     return { rail, ok: true, windows: found, readAt, raw };
   };
   return {
@@ -452,13 +464,8 @@ function poolReadings(
  * that answer is this module's shape to know.
  */
 export function poolFailure(note: string, readAt: number): AntigravityReadings {
-  const pool = <R extends AntigravityRail>(rail: R): VendorReading & { rail: R } => ({
-    rail,
-    ok: false,
-    windows: [],
-    readAt,
-    note,
-  });
+  const pool = <R extends AntigravityRail>(rail: R): VendorReading & { rail: R } =>
+    failedReading(rail, note, readAt);
   return {
     "antigravity-argon": pool("antigravity-argon"),
     "antigravity-gemini": pool("antigravity-gemini"),

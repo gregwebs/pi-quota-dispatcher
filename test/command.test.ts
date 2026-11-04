@@ -204,24 +204,32 @@ function antigravityBody(r: RailReadings): unknown {
 }
 
 /**
- * Which rail a request belongs to, from the request itself.
+ * Which rail a request belongs to, from where it was sent.
  *
  * An end-to-end test stubs the extension's own `fetch`, below the transport
- * seam, so it cannot avoid knowing a document — but it need not know an
- * endpoint: the read is one POST, and the two single-rail reads differ by the
- * account header the vendor requires. The URLs themselves are
- * `rail-read.test.ts`'s and `endpoints.test.ts`'s.
+ * seam, so it cannot avoid answering a document shape. It need not know a single
+ * vendor's protocol though: the allow-list in `src/endpoints.ts` names every
+ * request this extension can make, `test/endpoints.test.ts` owns that table, and
+ * a request to anything else is a test failure rather than a silently answered
+ * Codex read.
  */
-function railOf(init?: RequestInit): "claude" | "codex" | "antigravity" {
-  if (init?.method === "POST") return "antigravity";
-  const headers = (init?.headers ?? {}) as Record<string, string>;
-  return headers["ChatGPT-Account-Id"] === undefined ? "claude" : "codex";
+function railOf(url: string | URL): "claude" | "codex" | "antigravity" {
+  switch (String(url)) {
+    case CLAUDE_USAGE_URL:
+      return "claude";
+    case CODEX_USAGE_URL:
+      return "codex";
+    case ANTIGRAVITY_QUOTA_URL:
+      return "antigravity";
+    default:
+      throw new Error(`a test answered a request the extension must not make: ${String(url)}`);
+  }
 }
 
 function stubFetch(overrides: Partial<RailReadings> = {}): typeof fetch {
   const r: RailReadings = { ...DEFAULT_READINGS, ...overrides };
-  return (async (_url: string | URL, init?: RequestInit) => {
-    const rail = railOf(init);
+  return (async (url: string | URL, init?: RequestInit) => {
+    const rail = railOf(url);
     if (rail === "claude") {
       return {
         ok: true,
@@ -1449,7 +1457,7 @@ test("a rail whose newest read failed is fed as its last good reading, marked", 
   let codexFails = false;
   const healthy = stubFetch();
   const flaky = (async (url: string | URL, init?: RequestInit) => {
-    if (codexFails && railOf(init) === "codex") {
+    if (codexFails && railOf(url) === "codex") {
       // A definite answer: a 429 is not retried, so no backoff runs here.
       return { ok: false, status: 429, json: async () => ({}) };
     }
@@ -1770,7 +1778,7 @@ test("refresh forces a re-fetch while the plain form reuses the cache", async ()
 
   const countingFetch = (async (_url: string | URL, init?: RequestInit) => {
     fetches++;
-    const rail = railOf(init);
+    const rail = railOf(_url);
     if (rail === "claude") {
       return {
         ok: true,
@@ -2743,7 +2751,7 @@ test("hold on unreadable primary leaves already-alternate bytes unchanged", asyn
   await writeFile(fx.plannerFile, original);
   const before = await readFile(fx.plannerFile);
   const unreadable = (async (...args: Parameters<typeof fetch>) => {
-    if (railOf(args[1]) === "claude") throw new Error("fixture unreadable primary");
+    if (railOf(String(args[0])) === "claude") throw new Error("fixture unreadable primary");
     return stubFetch({ codexSession: 85 })(...args);
   }) as typeof fetch;
   await withExtension(fx, async ({ run, sessionStart }) => {
@@ -3917,7 +3925,7 @@ for (const [label, layer, expected] of [
 ] as const) {
   test(`a superseded refresh cannot repaint the gauge: ${label}`, async () => {
     const fx = await generateFixture(layer as unknown, undefined, MAX_POLL_MS);
-    const gate = gatedFetch(stubFetch(), (_url, init) => railOf(init) === "claude");
+    const gate = gatedFetch(stubFetch(), (url) => railOf(url) === "claude");
 
     await withExtension(
       fx,
@@ -3990,7 +3998,7 @@ test("a gauge that cannot be drawn does not veto the pass, and is reported", asy
 test("a pass still in flight at shutdown draws nothing, and writes anyway", async (t) => {
   const errors = t.mock.method(console, "error");
   const fx = await fixture(MAX_POLL_MS, CONFIGURED_AGENTS, { ttlMs: 1 });
-  const gate = gatedFetch(stubFetch(), (_url, init) => railOf(init) === "claude");
+  const gate = gatedFetch(stubFetch(), (url) => railOf(url) === "claude");
 
   await withExtension(
     fx,
@@ -4095,7 +4103,7 @@ test("a gauge sink that throws cannot abort a generation that empties the table"
 test("a gauge sink that throws at shutdown still lets the context go, and draws nothing after", async (t) => {
   const errors = t.mock.method(console, "error");
   const fx = await fixture(MAX_POLL_MS, CONFIGURED_AGENTS, { ttlMs: 1 });
-  const gate = gatedFetch(stubFetch(), (_url, init) => railOf(init) === "claude");
+  const gate = gatedFetch(stubFetch(), (url) => railOf(url) === "claude");
 
   await withExtension(
     fx,
@@ -4141,7 +4149,7 @@ test("a gauge sink that throws at shutdown still lets the context go, and draws 
 test("a warning sink that throws at shutdown still clears the gauge, and the released pass finds no footer", async (t) => {
   const errors = t.mock.method(console, "error");
   const fx = await fixture(MAX_POLL_MS, CONFIGURED_AGENTS, { ttlMs: 1 });
-  const gate = gatedFetch(stubFetch(), (_url, init) => railOf(init) === "claude");
+  const gate = gatedFetch(stubFetch(), (url) => railOf(url) === "claude");
   // Armed only for the shutdown: a start-time warning write would otherwise
   // refuse its key and fail the session start this test needs.
   let refusing = false;
@@ -4222,7 +4230,7 @@ test("a pass that read earlier cannot publish over a later failed read", async (
   // A stub whose claude read can be made to fail after the older pass has read.
   let claudeFails = false;
   const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
-    if (claudeFails && railOf(init) === "claude") {
+    if (claudeFails && railOf(url) === "claude") {
       return { ok: false, status: 429, json: async () => ({}) };
     }
     return stubFetch()(url, init);
