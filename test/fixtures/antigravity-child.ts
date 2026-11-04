@@ -141,7 +141,10 @@ async function run(job: Job) {
       agents: agentTable({}),
     },
     {
-      fetchImpl,
+      // The child exists to prove what reached the wire — the credential that was
+      // persisted, in the header of the request — so it drives the real read
+      // through a transport it can record.
+      transport: index.httpTransport(fetchImpl),
       ...(job.timeoutMs === undefined ? {} : { providerTokenTimeoutMs: job.timeoutMs }),
       ...(resolver === undefined
         ? {}

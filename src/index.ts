@@ -100,6 +100,39 @@ export {
 } from "./endpoints.ts";
 export type { OutboundRequest, UnrequestedRail } from "./endpoints.ts";
 
+// The rail read is where a credential in hand becomes a reading: the request,
+// its deadline and retry, and the parse. Re-exported here because the
+// dispatcher's deps name its types, and because the timings and the pinned
+// Antigravity user agent were reachable from this path before they had a module.
+import {
+  DEFAULT_QUOTA_READ,
+  createRailRead,
+  failedReading,
+  readBoundMs,
+  type QuotaReadPacing,
+  type RailRead,
+  type Transport,
+} from "./rail-read.ts";
+import { poolFailure } from "./rail-read.ts";
+export {
+  DEFAULT_ANTIGRAVITY_USER_AGENT,
+  DEFAULT_QUOTA_READ,
+  antigravityUserAgent,
+  createRailRead,
+  httpTransport,
+  poolFailure,
+  readBoundMs,
+} from "./rail-read.ts";
+export type {
+  QuotaReadPacing,
+  RailRead,
+  RailReadDeps,
+  Transport,
+  TransportFailure,
+  TransportRequest,
+  TransportResult,
+} from "./rail-read.ts";
+
 // The reading is the policy's only evidence: its shape, the parsers that build
 // it from a vendor's document and the judgments about it all live here, so the
 // policy, the gauge, the readings file and the generator share one definition.
@@ -107,6 +140,7 @@ import {
   absentBudgets,
   budgetUsed,
   isTight,
+  type AntigravityReadings,
   parseAntigravityUsage,
   parseClaudeUsage,
   parseCodexUsage,
@@ -219,7 +253,6 @@ export type { Coordination, FileWritePacing, LockAttempt, LockHolder } from "./a
 import {
   DEFAULT_SHARED_READINGS,
   createSharedReadings,
-  type AntigravityReadings,
   type SharedReadingsPacing,
   type SingleFetchRail,
   type StickyHalt,
@@ -235,7 +268,6 @@ export {
   createSharedReadings,
 } from "./readings-file.ts";
 export type {
-  AntigravityReadings,
   CachedReadings,
   CredentialGates,
   GatePatch,
@@ -2053,125 +2085,11 @@ export function describeDecisionLines(decision: Decision, outcome: Outcome): str
   ];
 }
 
-// ---------------------------------------------------------------- rails
+// ---------------------------------------------------------------- readings
 
-/**
- * How long one quota read may stall, and how many times it is asked again
- * before the rail reads as unreadable.
- *
- * Both numbers are small on purpose. The read is awaited by `session_start`, so
- * the point of the bound is that a vendor which has gone quiet costs a session
- * a few seconds rather than the rest of the session. The retry is the other
- * half: without it a single dropped connection reads as an outage and holds
- * every agent on the route, which is a decision made on evidence a second
- * request would have supplied.
- *
- * They are a seam rather than config-file keys: how long to wait for a socket
- * is a fact about this network, not a routing preference, and the two timings
- * only mean anything together.
- *
- * See docs/adr/0006-bounded-quota-reads.md for why the retry does not soften the
- * hold rule.
- */
-export interface QuotaReadPacing {
-  /** One attempt is abandoned after this long, signal and all. */
-  timeoutMs: number;
-  /** Attempts per rail, the first one included. */
-  attempts: number;
-  /** Wait between attempts. */
-  backoffMs: number;
-}
-
-/** The shipped timings — see `QuotaReadPacing`. */
-export const DEFAULT_QUOTA_READ: QuotaReadPacing = {
-  timeoutMs: 5_000,
-  attempts: 2,
-  backoffMs: 250,
-};
-
-/**
- * The `User-Agent` Antigravity's own current client sends, and the reason it is
- * pinned rather than borrowed from whatever called pi.
- *
- * Load-bearing, not cosmetic: Google omits the Argon group from
- * `retrieveUserQuotaSummary` for older agent strings, so a request that looks
- * like an old CLI silently reports two pools instead of three — an honest failed
- * Argon rail whose cause is nowhere in the body. Bumping the version is a change
- * to what the vendor is willing to tell us, so it is one constant with one
- * documented override.
- */
-export const DEFAULT_ANTIGRAVITY_USER_AGENT =
-  "antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=982146307; auth_method=consumer)";
-
-/**
- * The `User-Agent` one request carries: the pinned default, unless the
- * environment overrides it.
- *
- * The override exists so a machine behind a proxy that rewrites the header — or
- * a future vendor build that demands a newer string — does not need a release of
- * this extension. It is read per request rather than at import, so a session
- * that sets it before its first quota read is honoured.
- */
-export function antigravityUserAgent(env: NodeJS.ProcessEnv = process.env): string {
-  return env.ANTIGRAVITY_USER_AGENT?.trim() || DEFAULT_ANTIGRAVITY_USER_AGENT;
-}
-
-/** Waits `ms`, for the pause between two attempts at the same endpoint. */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * What one failed attempt is reported as, in the single line a note has room
- * for.
- *
- * A timeout is reported by its budget rather than by the exception's own text
- * ("The operation was aborted due to timeout"), because the number is the
- * actionable part — it is the one the pacing chose and the one someone would
- * change. A body that is not JSON is named as such: a reply truncated without
- * framing and a captive portal both arrive looking like this, and the parser's
- * message is the only thing that can hint at which one it was.
- *
- * A failed request is reported by the code its cause carries — `ECONNREFUSED`,
- * `ENOTFOUND`, a TLS failure — and never by its message. undici flattens a
- * network failure to a bare "fetch failed" anyway, while an error thrown while
- * *building* the request quotes the header value it rejected — and one of those
- * headers is the credential. Not repeating what a request error says about
- * itself is how this file keeps its promise that no credential is ever logged.
- */
-function attemptFailure(err: unknown, timeoutMs: number): string {
-  if ((err as { name?: unknown } | null)?.name === "TimeoutError") {
-    return `no answer within ${timeoutMs}ms`;
-  }
-  if (err instanceof SyntaxError) return `unreadable body (${err.message})`;
-  const cause = err instanceof Error ? (err.cause as { code?: unknown } | undefined) : undefined;
-  const code = typeof cause?.code === "string" ? cause.code : undefined;
-  return code ? `request failed (${code})` : "request failed";
-}
-
-/**
- * Whether asking again could get a different answer. A 4xx is the endpoint's
- * reply — an expired token stays expired and a moved endpoint stays moved — so
- * only a server-side failure is worth a second request. A 429 is deliberately
- * not on this list: it says "too many requests", and asking again 250ms later
- * without honouring `Retry-After` is the thing it is asking us not to do.
- */
-function retryableStatus(status: number): boolean {
-  return status >= 500;
-}
-
-/**
- * The note a rail reads as when a failure worth retrying outlived its attempts.
- *
- * The count is said out loud only when there was more than one, so the report
- * separates the two failures `unreadable` used to cover: a reading another
- * request would not have fixed — a 401, a 429, a credential store with nothing
- * to give — from one that was asked again and given up on. Both hold, but only
- * the second is about the request rather than about what the endpoint said.
- */
-function afterAttempts(note: string, attempts: number): string {
-  return attempts > 1 ? `${note} after ${attempts} attempts` : note;
-}
+// The two readings the policy itself builds: the metered rail's, which no
+// request produces, and the projection that drops last-good history before a
+// decision sees it. Everything else a rail reads comes from `rail-read.ts`.
 
 /**
  * DeepSeek is metered per token rather than quota-capped, so it never blocks a
@@ -2249,7 +2167,21 @@ function describePing(result: ClaudePing): string {
 }
 
 export interface DispatcherDeps {
-  fetchImpl?: typeof fetch;
+  /**
+   * The three reads, by credential shape, or `undefined` for the real ones.
+   *
+   * The seam every test above a request crosses: a policy, report or gauge test
+   * hands back a reading and never learns a vendor's URL, its document shape,
+   * or how many attempts a failure is worth. Left unset, the dispatcher builds
+   * `createRailRead` over `transport`.
+   */
+  read?: RailRead;
+  /**
+   * The one network seam, used only to build the default reads. A test that
+   * wants the real classification — the retry, the notes, a 429 — injects here;
+   * one that wants a reading injects `read`.
+   */
+  transport?: Transport;
   now?: () => number;
   /**
    * Seam: the claude install the sticky halt is keyed to. Defaults to
@@ -2465,7 +2397,6 @@ export function createDispatcher(
   cfg: DispatcherConfig = DEFAULT_CONFIG,
   deps: DispatcherDeps = {},
 ): Dispatcher {
-  const doFetch = deps.fetchImpl ?? fetch;
   const now = deps.now ?? (() => Date.now());
   // Merged field by field rather than spread, so an injected `undefined` reads
   // as "not stated" instead of replacing a shipped timing with one that has no
@@ -2493,24 +2424,28 @@ export function createDispatcher(
   const providerTokenTimeoutMs = deps.providerTokenTimeoutMs ?? PROVIDER_TOKEN_TIMEOUT_MS;
   const fetchWaitMs =
     deps.readings?.fetchWaitMs ??
-    pacing.attempts * pacing.timeoutMs +
-      (pacing.attempts - 1) * pacing.backoffMs +
-      Math.max(CLAUDE_PING_TIMEOUT_MS, providerTokenTimeoutMs);
+    readBoundMs(pacing) + Math.max(CLAUDE_PING_TIMEOUT_MS, providerTokenTimeoutMs);
   const readings = createSharedReadings({
     path: cfg.readingsPath,
     now,
     ...(deps.sleep === undefined ? {} : { sleep: deps.sleep }),
     pacing: { ...DEFAULT_SHARED_READINGS, ...deps.readings, fetchWaitMs },
   });
-  /**
-   * A failed read, stamped with the dispatcher's own clock at the moment it
-   * gave up. That is `readAt` — when the read gave up — not the TTL origin: the
-   * TTL counts from the cache entry's `at`, stamped at insertion after this
-   * returns.
-   */
-  function unavailable(rail: Rail, note: string): FailedReading {
-    return { rail, ok: false, windows: [], readAt: now(), note };
-  }
+  // A failed read, stamped with the dispatcher's own clock at the moment it gave
+  // up. That is `readAt` — when the read gave up — not the TTL origin: the TTL
+  // counts from the cache entry's `at`, stamped at insertion after this returns.
+  const unavailable = (rail: VendorRail, note: string) => failedReading(rail, note, now());
+
+  // The reads are the one thing a test above a request replaces. Built from the
+  // same pacing the store's waiter bound is derived from, so the numbers a
+  // caller can see cannot disagree about how long a read may take.
+  const railRead: RailRead =
+    deps.read ??
+    createRailRead({
+      pacing,
+      now,
+      ...(deps.transport === undefined ? {} : { transport: deps.transport }),
+    });
   // A `claudeCredsPath` naming anything but the default file belongs to another
   // profile, whose credential the login keychain never holds — so the fallback
   // is not offered to it.
@@ -2546,74 +2481,6 @@ export function createDispatcher(
   // so an `undiverted` verdict can be recorded against the install that actually
   // ran. Not tied to expiry: a usable-token read validates an existing halt too.
   const claudeIdentity = deps.claudeIdentity ?? (() => claudeInstall());
-
-  /**
-   * A vendor's usage document, read under a timeout and retried while the
-   * failure is one another attempt could fix.
-   *
-   * Every attempt carries its own `AbortSignal.timeout`, because a stalled
-   * endpoint is the worst case rather than a mild one: a request that never
-   * answers is not a request that failed, so without the bound it would hold
-   * the evaluation that `session_start` awaits for as long as the vendor felt
-   * like staying quiet.
-   *
-   * The body read is inside the attempt on purpose. The signal stays attached
-   * to the response, so a body that stalls mid-stream is abandoned by the same
-   * deadline instead of hanging past it.
-   *
-   * What comes back is either the parsed document or the note the rail is
-   * unreadable for. The note carries an attempt count only when the read was
-   * given up on: an answer another request would only repeat — a 4xx, a 429 —
-   * is reported as that answer alone. The shape problem ("no usage windows
-   * returned") is left to the caller, because a well-formed answer we cannot use
-   * is still an answer.
-   */
-  async function readUsage(
-    url: string,
-    init: RequestInit,
-  ): Promise<{ json: unknown } | { note: string }> {
-    for (let attempt = 1; ; attempt++) {
-      if (attempt > 1) await sleep(pacing.backoffMs);
-      let note: string;
-      let retry: boolean;
-      try {
-        const res = await doFetch(url, {
-          ...init,
-          signal: AbortSignal.timeout(pacing.timeoutMs),
-        });
-        if (res.ok) return { json: await res.json() };
-        note = `HTTP ${res.status}`;
-        retry = retryableStatus(res.status);
-      } catch (err) {
-        // Everything thrown here is a failure of the request or of its payload:
-        // a dropped connection, a timeout — the signal stays attached to the
-        // response, so even a body that stalls mid-stream is abandoned by the
-        // same deadline — or a body that is not JSON at all, which is what a
-        // truncated reply and a captive portal both look like.
-        note = attemptFailure(err, pacing.timeoutMs);
-        retry = true;
-      }
-      if (!retry) return { note };
-      if (attempt >= pacing.attempts) return { note: afterAttempts(note, attempt) };
-    }
-  }
-
-  /** The Claude rail's ordinary read, once a token has been supplied. */
-  async function claudeUsage(token: string): Promise<VendorReading> {
-    const read = await readUsage(CLAUDE_USAGE_URL, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "anthropic-beta": "oauth-2025-04-20",
-        Accept: "application/json",
-      },
-    });
-    if ("note" in read) return unavailable("claude", read.note);
-
-    const readAt = now();
-    const windows = parseClaudeUsage(read.json);
-    if (!windows.length) return unavailable("claude", "no usage windows returned");
-    return { rail: "claude", ok: true, windows, readAt, raw: read.json };
-  }
 
   /**
    * The line one verdict earns, and the gate it arms. `undefined` for a verdict
@@ -2779,111 +2646,28 @@ export function createDispatcher(
     return { note: expiredNote(reread.error, decision) };
   }
 
-  async function fetchClaude(): Promise<VendorReading> {
-    const outcome = await claudeToken();
-    if (!("token" in outcome)) return unavailable("claude", outcome.note);
-    const reading = await claudeUsage(outcome.token);
-    if (outcome.note === undefined) return reading;
-    return { ...reading, note: reading.note === undefined ? outcome.note : `${reading.note}; ${outcome.note}` };
-  }
-
   async function fetchCodex(): Promise<VendorReading> {
     const credential = await readCodexCredential(cfg.codexCredsPath);
     if ("error" in credential) return unavailable("codex", credential.error);
-
-    const read = await readUsage(CODEX_USAGE_URL, {
-      headers: {
-        Authorization: `Bearer ${credential.access}`,
-        "ChatGPT-Account-Id": credential.accountId,
-        Accept: "application/json",
-        Origin: "https://chatgpt.com",
-        Referer: "https://chatgpt.com/",
-        "User-Agent": "Mozilla/5.0",
-      },
-    });
-    if ("note" in read) return unavailable("codex", read.note);
-
-    const readAt = now();
-    const { windows, limited } = parseCodexUsage(read.json, { readAt });
-    if (!windows.length) return unavailable("codex", "no rate_limit windows returned");
-    if (!limited) return { rail: "codex", ok: true, windows, readAt, raw: read.json };
-    // `limit_reached` means blocked outright, not merely close, so every budget
-    // reads full rather than leaving a comfortable-looking percentage behind.
-    return {
-      rail: "codex",
-      ok: true,
-      windows: windows.map((w) => ({ ...w, used: 100 })),
-      readAt,
-      raw: read.json,
-      note: "limit_reached=true",
-    };
-  }
-
-  /** The three pools one summary describes; a pool it said nothing about is that pool's own failure. */
-  function antigravityReadings(
-    windows: Record<AntigravityRail, RailWindow[]>,
-    readAt: number,
-    raw: unknown,
-  ): AntigravityReadings {
-    const pool = <R extends AntigravityRail>(rail: R): VendorReading & { rail: R } => {
-      const found = windows[rail];
-      if (!found.length) return { rail, ok: false, windows: [], readAt, note: "no usage windows returned" };
-      return { rail, ok: true, windows: found, readAt, raw };
-    };
-    return {
-      "antigravity-argon": pool("antigravity-argon"),
-      "antigravity-gemini": pool("antigravity-gemini"),
-      "antigravity-3p": pool("antigravity-3p"),
-    };
+    return railRead.codex(credential);
   }
 
   /**
-   * One failure for the whole group, stamped once.
-   *
-   * A credential or transport failure happened once, at one instant; giving each
-   * pool its own `now()` would date one failure three ways. `raw` is absent, not
-   * carried from an earlier read: a failure reports why it failed and nothing
-   * else.
-   */
-  function antigravityFailedGroup(note: string, readAt: number): AntigravityReadings {
-    const pool = <R extends AntigravityRail>(rail: R): VendorReading & { rail: R } => ({
-      rail,
-      ok: false,
-      windows: [],
-      readAt,
-      note,
-    });
-    return {
-      "antigravity-argon": pool("antigravity-argon"),
-      "antigravity-gemini": pool("antigravity-gemini"),
-      "antigravity-3p": pool("antigravity-3p"),
-    };
-  }
-
-  /**
-   * The one vendor request that answers for all three Antigravity pools.
-   *
-   * The body carries the project only when the credential names one, an empty
-   * object otherwise: a `{"project": ""}` would ask the vendor about a project
-   * that has no id. The `User-Agent` is the pinned one, whose default is what
-   * makes the vendor report the Argon pool at all.
+   * The one vendor request that answers for all three Antigravity pools. The
+   * credential is acquired first — including pi's delegated refresh, which is
+   * why it is not the read's job — and the read is handed the result so a
+   * credential failure is one group-wide failure rather than three.
    */
   async function fetchAntigravity(): Promise<AntigravityReadings> {
-    const credential = await antigravity.read();
-    if (!("token" in credential)) return antigravityFailedGroup(credential.error, now());
-    const read = await readUsage(ANTIGRAVITY_QUOTA_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${credential.token}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "User-Agent": antigravityUserAgent(),
-      },
-      body: JSON.stringify(credential.projectId === undefined ? {} : { project: credential.projectId }),
-    });
-    const readAt = now();
-    if ("note" in read) return antigravityFailedGroup(read.note, readAt);
-    return antigravityReadings(parseAntigravityUsage(read.json), readAt, read.json);
+    return railRead.antigravity(await antigravity.read());
+  }
+
+  async function fetchClaude(): Promise<VendorReading> {
+    const outcome = await claudeToken();
+    if (!("token" in outcome)) return unavailable("claude", outcome.note);
+    const reading = await railRead.claude(outcome.token);
+    if (outcome.note === undefined) return reading;
+    return { ...reading, note: reading.note === undefined ? outcome.note : `${reading.note}; ${outcome.note}` };
   }
 
   /**
@@ -2944,7 +2728,7 @@ export function createDispatcher(
       try {
         return await fetchAntigravity();
       } catch {
-        return antigravityFailedGroup("antigravity read failed", now());
+        return poolFailure("antigravity read failed", now());
       }
     };
   }

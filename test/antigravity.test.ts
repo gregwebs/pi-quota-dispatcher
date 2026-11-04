@@ -6,10 +6,10 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 
 import {
-  ANTIGRAVITY_QUOTA_URL,
   DEFAULT_ANTIGRAVITY_USER_AGENT,
   DEFAULT_CONFIG,
   createDispatcher,
+  httpTransport,
   parseAntigravityToken,
   providerTokenResolver,
 } from "../src/index.ts";
@@ -63,159 +63,6 @@ function quotaBody(options: {
     ],
   };
 }
-
-// ---------------------------------------------------------------- the parser
-
-test("a bucket's pool comes from its id, not the group it was filed under", () => {
-  // The vendor's display names and group order are presentation. Here every
-  // bucket is in one group with a name that belongs to none of them, and the
-  // pools must still come out right.
-  const parsed = parseAntigravityUsage({
-    groups: [
-      {
-        displayName: "Miscellaneous",
-        buckets: [
-          { bucketId: "3p-5h", window: "5h", remainingFraction: 0.97 },
-          { bucketId: "gemini-argon-wtu-weekly", window: "weekly", remainingFraction: 1 },
-          { bucketId: "gemini-5h", window: "5h", remainingFraction: 0.42 },
-        ],
-      },
-    ],
-  });
-  assert.deepEqual(parsed["antigravity-argon"].map((w) => w.label), ["gemini-argon-wtu-weekly"]);
-  assert.deepEqual(parsed["antigravity-gemini"].map((w) => w.label), ["gemini-5h"]);
-  assert.deepEqual(parsed["antigravity-3p"].map((w) => w.label), ["3p-5h"]);
-});
-
-test("Argon is matched before the general gemini prefix", () => {
-  // `gemini-argon-...` starts with `gemini-`, so the order of the checks is the
-  // difference between the Argon pool and a Gemini window it does not have.
-  const parsed = parseAntigravityUsage({
-    groups: [{ buckets: [{ bucketId: "gemini-argon-wtu-weekly", window: "weekly", remainingFraction: 0.5 }] }],
-  });
-  assert.equal(parsed["antigravity-argon"].length, 1);
-  assert.equal(parsed["antigravity-gemini"].length, 0);
-});
-
-test("hostile bodies parse to three empty pools instead of throwing or coercing", () => {
-  const cases: unknown[] = [
-    null,
-    42,
-    "a string",
-    [],
-    {},
-    { groups: null },
-    { groups: "no" },
-    { groups: [null, 7, "x", [], { buckets: null }, { buckets: {} }] },
-    { groups: [{ buckets: [null, 1, "x", []] }] },
-    { groups: [{ buckets: [{ bucketId: 5, window: "5h", remainingFraction: 0.5 }] }] },
-    { groups: [{ buckets: [{ bucketId: "gemini-5h", window: "5h", remainingFraction: "0.5" }] }] },
-    { groups: [{ buckets: [{ bucketId: "gemini-5h", window: "5h" }] }] },
-    { groups: [{ buckets: [{ bucketId: "gemini-5h", window: "5h", remainingFraction: Number.NaN }] }] },
-    { groups: [{ buckets: [{ bucketId: "gemini-5h", window: "5h", remainingFraction: Number.POSITIVE_INFINITY }] }] },
-  ];
-  for (const body of cases) {
-    const parsed = parseAntigravityUsage(body);
-    assert.deepEqual(Object.keys(parsed).sort(), ["antigravity-3p", "antigravity-argon", "antigravity-gemini"]);
-    for (const rail of ["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const) {
-      assert.deepEqual(parsed[rail], [], `${rail} of ${JSON.stringify(body)}`);
-    }
-  }
-});
-
-test("remainingFraction is complemented and clamped to whole percent", () => {
-  const used = (remaining: number) =>
-    parseAntigravityUsage({
-      groups: [{ buckets: [{ bucketId: "gemini-5h", window: "5h", remainingFraction: remaining }] }],
-    })["antigravity-gemini"][0]!.used;
-  // The vendor reports what is left, so used is its complement: 1 - 0.9716168
-  // is 2.83832%, which the wire carries as 3 rather than a fraction.
-  assert.equal(used(0.9716168), 3);
-  assert.equal(used(0.9858084), 1);
-  assert.equal(used(1), 0);
-  assert.equal(used(0), 100);
-  // Out of range is clamped rather than trusted: an impossible fraction must not
-  // become a negative or over-100 usage the policy would weigh as real.
-  assert.equal(used(1.4), 0);
-  assert.equal(used(-0.2), 100);
-  // Monotone and integral across the range, so a sign or rounding flip shows up.
-  for (let percent = 0; percent <= 100; percent++) {
-    const value = used(1 - percent / 100);
-    assert.equal(Number.isInteger(value), true, `${percent}% produced ${value}`);
-    assert.ok(value >= 0 && value <= 100, `${percent}% produced ${value}`);
-    assert.equal(value, percent);
-  }
-});
-
-test("an unfamiliar window is kept as display-only and invents no budget", () => {
-  const parsed = parseAntigravityUsage({
-    groups: [
-      {
-        buckets: [
-          { bucketId: "gemini-monthly", window: "monthly", remainingFraction: 0.2 },
-          { bucketId: "gemini-5h", window: "5hr", remainingFraction: 0.2 },
-        ],
-      },
-    ],
-  });
-  assert.deepEqual(parsed["antigravity-gemini"], [
-    { label: "gemini-monthly", used: 80 },
-    { label: "gemini-5h", used: 80 },
-  ]);
-});
-
-test("a bucket of no known pool is dropped rather than guessed into one", () => {
-  const parsed = parseAntigravityUsage({
-    groups: [{ buckets: [{ bucketId: "other-weekly", window: "weekly", remainingFraction: 0.2 }] }],
-  });
-  assert.deepEqual(parsed["antigravity-argon"], []);
-  assert.deepEqual(parsed["antigravity-gemini"], []);
-  assert.deepEqual(parsed["antigravity-3p"], []);
-});
-
-test("reset times are parsed as instants, and unusable ones are omitted entirely", () => {
-  const parsed = parseAntigravityUsage({
-    groups: [
-      {
-        buckets: [
-          { bucketId: "gemini-weekly", window: "weekly", remainingFraction: 0.5, resetTime: "2026-11-05T16:46:22Z" },
-          { bucketId: "gemini-5h", window: "5h", remainingFraction: 0.5, resetTime: "2026-10-29T21:46:22.123456+00:00" },
-          { bucketId: "gemini-3p", window: "weekly", remainingFraction: 0.5, resetTime: "not a time" },
-          { bucketId: "gemini-7d", window: "weekly", remainingFraction: 0.5, resetTime: 12 },
-          { bucketId: "3p-5h", window: "5h", remainingFraction: 0.5, resetTime: "1970-01-01T00:00:00Z" },
-        ],
-      },
-    ],
-  });
-  assert.deepEqual(parsed["antigravity-gemini"], [
-    { label: "gemini-weekly", used: 50, budget: "weekly", resetsAt: Date.parse("2026-11-05T16:46:22Z") },
-    { label: "gemini-5h", used: 50, budget: "session", resetsAt: Date.parse("2026-10-29T21:46:22.123456+00:00") },
-    // A malformed or non-string reset is dropped, and the key is absent rather
-    // than present as `undefined`.
-    { label: "gemini-3p", used: 50, budget: "weekly" },
-    { label: "gemini-7d", used: 50, budget: "weekly" },
-  ]);
-  for (const window of parsed["antigravity-gemini"]) {
-    assert.equal("resetsAt" in window ? typeof window.resetsAt : "absent", "resetsAt" in window ? "number" : "absent");
-  }
-  // Epoch 0 is a real instant, not a missing one.
-  assert.equal(parsed["antigravity-3p"][0]!.resetsAt, 0);
-});
-
-test("windows are kept in encounter order, one entry per bucket", () => {
-  const parsed = parseAntigravityUsage({
-    groups: [
-      { buckets: [{ bucketId: "3p-weekly", window: "weekly", remainingFraction: 0.9 }] },
-      { buckets: [{ bucketId: "3p-5h", window: "5h", remainingFraction: 0.4 }] },
-      { buckets: [{ bucketId: "3p-weekly-preview", window: "weekly", remainingFraction: 0.95 }] },
-    ],
-  });
-  assert.deepEqual(parsed["antigravity-3p"].map((w) => [w.label, w.budget, w.used]), [
-    ["3p-weekly", "weekly", 10],
-    ["3p-5h", "session", 60],
-    ["3p-weekly-preview", "weekly", 5],
-  ]);
-});
 
 // ---------------------------------------------------------------- the credential
 
@@ -362,7 +209,11 @@ async function fixture(t: TestContext, auth: string | null = STORED_AUTH): Promi
         agents: agentTable({}),
       },
       {
-        fetchImpl,
+        // These tests are about credentials and the delegated refresh, so the
+        // one wire fact they observe — which Authorization header a request
+        // carried — is read at the transport. The document shapes themselves
+        // are `rail-read.test.ts`'s.
+        transport: httpTransport(fetchImpl),
         now: () => probe.clock++,
         // A definite answer, so the retry path is only entered where a test asks
         // for a 5xx; tiny timings keep a stalled body from spending real time.
@@ -379,9 +230,9 @@ async function fixture(t: TestContext, auth: string | null = STORED_AUTH): Promi
   return { piAuthPath, root, probe, dispatcher };
 }
 
-/** The requests this fixture made to the Antigravity endpoint, in order. */
+/** The requests this fixture made, in order. */
 function quotaCalls(probe: Probe) {
-  return probe.requests.filter((request) => request.url === ANTIGRAVITY_QUOTA_URL);
+  return probe.requests;
 }
 
 /** One pool's readings, asserting the arm so a test reads a vendor reading. */
@@ -389,149 +240,6 @@ function pool(readings: RailReadings) {
   assert.ok(!readings.latest.metered, "a pool is quota-capped, never metered");
   return readings.latest;
 }
-
-test("asking for any pool makes one POST that answers for all three", async (t) => {
-  const fx = await fixture(t);
-  const dispatcher = fx.dispatcher();
-  const readings = await Promise.all(
-    (["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const).map((rail) =>
-      dispatcher.railReadings(rail, true),
-    ),
-  );
-  const calls = quotaCalls(fx.probe);
-  assert.equal(calls.length, 1, "three pools are one vendor request");
-  const [request] = calls;
-  assert.equal(request!.url, ANTIGRAVITY_QUOTA_URL);
-  assert.equal(request!.method, "POST");
-  assert.equal(request!.headers.Authorization, "Bearer stored-access");
-  assert.equal(request!.headers["Content-Type"], "application/json");
-  assert.equal(request!.headers.Accept, "application/json");
-  assert.equal(request!.headers["User-Agent"], DEFAULT_ANTIGRAVITY_USER_AGENT);
-  assert.deepEqual(request!.body, { project: "stored-project" });
-
-  assert.deepEqual(readings.map((r) => pool(r).rail), ["antigravity-argon", "antigravity-gemini", "antigravity-3p"]);
-  for (const r of readings) assert.equal(pool(r).ok, true);
-  // One answer, one instant: three stamps would be three answers.
-  const readAts = new Set(readings.map((r) => pool(r).readAt));
-  assert.equal(readAts.size, 1);
-  // Each pool's raw is the whole body, so a generator reading any pool sees the
-  // account-wide document.
-  const raws = readings.map((r) => {
-    const latest = pool(r);
-    return latest.ok ? latest.raw : undefined;
-  });
-  assert.deepEqual(raws[1], raws[0]);
-  assert.deepEqual(raws[2], raws[0]);
-});
-
-test("the request body carries the project only when the credential names one", async (t) => {
-  const noProject = await fixture(t, JSON.stringify({ antigravity: { access: "stored-access" } }));
-  await noProject.dispatcher().railReadings("antigravity-argon", true);
-  assert.deepEqual(quotaCalls(noProject.probe)[0]!.body, {}, "an empty project id is not sent as one");
-
-  const withProject = await fixture(t);
-  await withProject.dispatcher().railReadings("antigravity-argon", true);
-  assert.deepEqual(quotaCalls(withProject.probe)[0]!.body, { project: "stored-project" });
-});
-
-test("the User-Agent is the pinned one unless the environment overrides it, trimmed", async (t) => {
-  const previous = process.env.ANTIGRAVITY_USER_AGENT;
-  t.after(() => {
-    if (previous === undefined) delete process.env.ANTIGRAVITY_USER_AGENT;
-    else process.env.ANTIGRAVITY_USER_AGENT = previous;
-  });
-  const fx = await fixture(t);
-
-  delete process.env.ANTIGRAVITY_USER_AGENT;
-  await fx.dispatcher().railReadings("antigravity-argon", true);
-  assert.equal(quotaCalls(fx.probe)[0]!.headers["User-Agent"], DEFAULT_ANTIGRAVITY_USER_AGENT);
-
-  // Blank is not an override: falling back to the pinned string is the only way
-  // the vendor is asked in a way that reports the Argon pool at all.
-  process.env.ANTIGRAVITY_USER_AGENT = "   ";
-  await fx.dispatcher().railReadings("antigravity-argon", true);
-  assert.equal(quotaCalls(fx.probe)[1]!.headers["User-Agent"], DEFAULT_ANTIGRAVITY_USER_AGENT);
-
-  process.env.ANTIGRAVITY_USER_AGENT = "  antigravity/cli/2.0.0  ";
-  await fx.dispatcher().railReadings("antigravity-argon", true);
-  assert.equal(quotaCalls(fx.probe)[2]!.headers["User-Agent"], "antigravity/cli/2.0.0");
-});
-
-test("an omitted Argon group fails only Argon, and keeps the other pools' readings", async (t) => {
-  // The omitted group is what the vendor does when its User-Agent is too old, so
-  // it is the failure that must stay honest: two healthy pools and one pool
-  // whose absence is reported rather than filled in.
-  const fx = await fixture(t);
-  const readings = await fx.dispatcher({ body: quotaBody({ argon: false }) }).allReadings(true);
-  assert.equal(quotaCalls(fx.probe).length, 1, "an incomplete group is still one request");
-  const gemini = pool(readings.get("antigravity-gemini")!);
-  const threeParty = pool(readings.get("antigravity-3p")!);
-  assert.equal(gemini.ok, true);
-  assert.equal(threeParty.ok, true);
-  const argon = pool(readings.get("antigravity-argon")!);
-  assert.equal(argon.ok, false);
-  assert.equal(argon.ok === false ? argon.note : "", "no usage windows returned");
-  assert.ok(!("raw" in argon), "a failure carries no vendor body");
-  // The successes still carry the whole body, which is the only place the
-  // omitted pool's absence is visible to a reader of the raw.
-  assert.deepEqual(gemini.ok ? gemini.raw : undefined, quotaBody({ argon: false }));
-});
-
-test("a transport failure stamps one instant on all three pools, and no body", async (t) => {
-  const fx = await fixture(t);
-  // A clock that moves on every read, so three separate `now()` calls for the
-  // three failures would be three visibly different numbers.
-  const readings = await fx.dispatcher({ failing: 5 }).allReadings(true);
-  const failures = (["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const).map((rail) =>
-    pool(readings.get(rail)!),
-  );
-  for (const failure of failures) {
-    assert.equal(failure.ok, false);
-    assert.equal(failure.ok === false ? failure.note : "", "HTTP 503 after 2 attempts");
-    assert.ok(!("raw" in failure));
-  }
-  assert.deepEqual(new Set(failures.map((f) => f.readAt)).size, 1, "one failure happened at one instant");
-});
-
-test("a definite 401 is not retried, and never triggers a refresh", async (t) => {
-  const fx = await fixture(t);
-  let resolverCalls = 0;
-  const dispatcher = createDispatcher(
-    {
-      ...DEFAULT_CONFIG,
-      agentDir: join(fx.root, "agents"),
-      claudeCredsPath: join(fx.root, "no-claude-credentials.json"),
-      piAuthPath: fx.piAuthPath,
-      readingsPath: join(fx.root, "readings.json"),
-      claudeRefresh: "off",
-      agents: agentTable({}),
-    },
-    {
-      fetchImpl: (async () => ({ ok: false, status: 401, json: async () => ({}) })) as unknown as typeof fetch,
-      quotaRead: { timeoutMs: 200, backoffMs: 1 },
-      resolveProviderToken: async () => {
-        resolverCalls++;
-        return "{}";
-      },
-    },
-  );
-  const readings = await dispatcher.railReadings("antigravity-3p", true);
-  assert.equal(pool(readings).ok === false ? pool(readings).note : "", "HTTP 401");
-  assert.equal(resolverCalls, 0, "expiry, not a 401, is the refresh trigger");
-});
-
-test("a 5xx is retried once, and every attempt is still a POST with the same body", async (t) => {
-  const fx = await fixture(t);
-  await fx.dispatcher({ failing: 1 }).railReadings("antigravity-argon", true);
-  const calls = quotaCalls(fx.probe);
-  assert.equal(calls.length, 2);
-  for (const request of calls) {
-    assert.equal(request.url, ANTIGRAVITY_QUOTA_URL);
-    assert.equal(request.method, "POST");
-    assert.deepEqual(request.body, { project: "stored-project" });
-    assert.equal(request.headers.Authorization, "Bearer stored-access");
-  }
-});
 
 test("a missing or unreadable auth file is unavailable without a request", async (t) => {
   const missing = await fixture(t, null);

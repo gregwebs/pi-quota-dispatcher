@@ -8,6 +8,7 @@ import {
   type ClaudeIdentity, type ClaudeRefresh,
 } from "../src/index.ts";
 import { lockPathFor, withLockPath } from "../src/agent-file.ts";
+import { fakeReads, readingOf } from "./helpers/rails.ts";
 import { createSharedReadings } from "../src/readings-file.ts";
 
 const NOW = 1_730_123_456_789;
@@ -35,18 +36,16 @@ async function fixture(t: TestContext) {
     readKeychain: async () => ({ error: "no keychain" }),
     sleep: sleep ?? (async (ms) => { probe.clock += ms; }),
     readings: { fetchWaitMs: 100, writeWaitMs: 100, pollMs: 1, staleMs: 10_000 },
-    fetchImpl: (async (url: string | URL, init?: { headers?: Record<string, string> }) => {
-      if (String(url).includes("chatgpt.com")) {
-        return { ok: true, status: 200, json: async () => ({ rate_limit: {
-          primary_window: { used_percent: 5 }, secondary_window: { used_percent: 10 },
-        } }) };
-      }
-      assert.ok(String(url).includes("anthropic.com"), `unexpected request ${url}`);
-      probe.fetches.push(init?.headers?.Authorization ?? "");
-      return { ok: true, status: 200, json: async () => ({
-        five_hour: { utilization: 10 }, seven_day: { utilization: 20 },
-      }) };
-    }) as unknown as typeof fetch,
+    // A read replaces the request, so the token this records is the credential
+    // the dispatcher acquired — not a header some request built out of it. Every
+    // "an expired token never reaches the vendor" assertion reads that.
+    read: fakeReads({
+      claude: (token) => {
+        probe.fetches.push(token);
+        return readingOf("claude", { session: 10, weekly: 20 });
+      },
+      codex: readingOf("codex", { session: 5, weekly: 10 }),
+    }),
   });
   return { root, cfg, probe, make, token };
 }
@@ -93,7 +92,7 @@ test("a pinged expired episode halts peers until a usable token ends the episode
   assert.equal(fx.probe.refreshes, 1, "halt is not a cooldown");
   await fx.token(true);
   assert.equal((await b.railReadings("claude", true)).latest.ok, true);
-  assert.deepEqual(fx.probe.fetches, ["Bearer usable-token"]);
+  assert.deepEqual(fx.probe.fetches, ["usable-token"]);
   assert.equal(fx.probe.refreshes, 1);
   await fx.token(false);
   await fx.make(pinged).railReadings("claude", true);
@@ -222,7 +221,7 @@ test("concurrent forced fresh reads across dispatchers make exactly one offline 
   assert.deepEqual(await second, reading);
   assert.equal(reading.latest.ok, true);
   assert.equal(fx.probe.refreshes, 1);
-  assert.deepEqual(fx.probe.fetches, ["Bearer usable-token"]);
+  assert.deepEqual(fx.probe.fetches, ["usable-token"]);
 });
 
 test("sticky identity is captured before a ping that changes the install", async (t) => {

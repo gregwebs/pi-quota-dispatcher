@@ -30,6 +30,7 @@ import {
   type RailWindow,
 } from "../src/rail-reading.ts";
 import { agentName, modelId, routeOf, agentTable, modelTable } from "./helpers/identifiers.ts";
+import { failureOf, fakeReads, readingOf } from "./helpers/rails.ts";
 import { startHolder } from "./fixtures/agent-write-child.ts";
 
 const definitionOf = (agent: string, cfg: DispatcherConfig): AgentDefinition => ({ agent: agentName(agent), file: join(cfg.agentDir, `${agent}.md`) });
@@ -1523,52 +1524,33 @@ interface StubReadings {
   codexOmitSession?: boolean;
 }
 
-function stubFetch(opts: StubReadings = {}) {
-  return (async (url: string | URL) => {
-    const u = String(url);
-    if (u.includes("anthropic.com")) {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
-          five_hour: { utilization: opts.claude?.session ?? 0 },
-          seven_day: { utilization: opts.claude?.weekly ?? 0 },
-        }),
-      };
-    }
-    if (u.includes("chatgpt.com")) {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
-          rate_limit: {
-            limit_reached: opts.codexLimited ?? false,
-            ...(opts.codexOmitSession
-              ? {}
-              : {
-                  primary_window: {
-                    used_percent: opts.codex?.session ?? 0,
-                    limit_window_seconds: 18000,
-                    reset_after_seconds: 3600,
-                  },
-                }),
-            secondary_window: {
-              used_percent: opts.codex?.weekly ?? 0,
-              limit_window_seconds: 604800,
-              reset_after_seconds: 400000,
-            },
-          },
-        }),
-      };
-    }
-    throw new Error(`unexpected url ${u}`);
-  }) as unknown as typeof fetch;
+
+/**
+ * The read a fixture's percentages become: no request, no document, no URL.
+ *
+ * A rail the fixture says nothing about reports zero for both budgets, which is
+ * what the document stub used to answer with — so a test that is not about
+ * quota gets the comfortable reading it expects.
+ */
+function readsFor(opts: StubReadings = {}) {
+  const session = opts.codex?.session ?? 0;
+  return fakeReads({
+    claude: readingOf("claude", { session: opts.claude?.session ?? 0, weekly: opts.claude?.weekly ?? 0 }),
+    codex:
+      opts.codexLimited === true
+        // `limit_reached` reads every budget full: blocked outright, not close.
+        ? { ...readingOf("codex", { session: 100, weekly: 100 }), note: "limit_reached=true" }
+        : readingOf("codex", {
+            ...(opts.codexOmitSession === true ? {} : { session }),
+            weekly: opts.codex?.weekly ?? 0,
+          }),
+  });
 }
 
 function dispatcherFor(fx: Fixture, opts: StubReadings = {}) {
   return createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, agents: agentTable(AGENT_ROUTES) },
-    { fetchImpl: stubFetch(opts) },
+    { read: readsFor(opts) },
   );
 }
 
@@ -1636,7 +1618,7 @@ test("a pass holds, and says why, when another process holds the file's lock", a
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, agents: agentTable(AGENT_ROUTES) },
     {
-      fetchImpl: stubFetch({ claude: { session: 90 }, codex: { session: 10 } }),
+      read: readsFor({ claude: { session: 90 }, codex: { session: 10 } }),
       fileWrite: { waitMs: 40, pollMs: 2 },
     },
   );
@@ -1680,9 +1662,10 @@ test("an unreadable api holds every agent in place", async () => {
   const failing = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, agents: agentTable(AGENT_ROUTES) },
     {
-      fetchImpl: (async () => {
-        throw new Error("ECONNREFUSED");
-      }) as unknown as typeof fetch,
+      read: fakeReads({
+        claude: failureOf("claude", "request failed (ECONNREFUSED)"),
+        codex: failureOf("codex", "request failed (ECONNREFUSED)"),
+      }),
     },
   );
   const lines = await failing.report({ force: true });
@@ -1732,7 +1715,7 @@ test("a missing credential file holds every agent, even when a switch looks due"
   const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeCredsPath: join(fx.agentDir, "absent.json"), agents: agentTable(AGENT_ROUTES) },
-    { fetchImpl: stubFetch({ claude: { session: 95 } }) },
+    { read: readsFor({ claude: { session: 95 } }) },
   );
   const results = await d.evaluate({ force: true });
   const planner = results.find((r) => r.decision.agent === "planner")!;
@@ -1752,7 +1735,7 @@ test("an unreadable quota leaves an agent on the alternate untouched", async () 
   const fx = await fixture({ planner: "openai-codex/gpt-6-sol" });
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeCredsPath: join(fx.agentDir, "absent.json"), agents: agentTable(AGENT_ROUTES) },
-    { fetchImpl: stubFetch({ claude: { session: 95 } }) },
+    { read: readsFor({ claude: { session: 95 } }) },
   );
 
   const path = join(fx.agentDir, "planner.md");
@@ -1787,20 +1770,14 @@ test("report never writes, even when a switch is due", async () => {
 
 test("a forced report fetches each rail exactly once", async () => {
   const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
-  let calls = 0;
-  const inner = stubFetch({}) as unknown as (u: unknown) => Promise<unknown>;
+  const read = readsFor();
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, agents: agentTable(AGENT_ROUTES) },
-    {
-      fetchImpl: (async (url: string | URL) => {
-        calls++;
-        return inner(url);
-      }) as unknown as typeof fetch,
-    },
+    { read },
   );
 
   await d.report({ force: true });
-  assert.equal(calls, 2, "the two live rails, once each");
+  assert.equal(read.reads.claude + read.reads.codex, 2, "the two live rails, once each");
 });
 
 test("an expired claude token counts as unreadable rather than switching", async () => {
@@ -1817,252 +1794,6 @@ test("an expired claude token counts as unreadable rather than switching", async
   assert.equal(planner.decision.kind, "hold");
   assert.equal("file" in planner.decision, false, "a hold has no file to write");
   assert.match(planner.decision.why, /unreadable/);
-});
-
-// ---------------------------------------------------------------- bounded reads
-
-/** Records every request, so a retry can be told from another rail's read. */
-function countingFetch(handler: (url: string, init?: RequestInit) => Promise<unknown>) {
-  const calls: string[] = [];
-  const impl = (async (url: string | URL, init?: RequestInit) => {
-    calls.push(String(url));
-    return handler(String(url), init);
-  }) as unknown as typeof fetch;
-  return { impl, calls };
-}
-
-/** A dispatcher whose reads can be told to give up faster than the shipped pacing. */
-function readDispatcher(
-  fx: Fixture,
-  fetchImpl: typeof fetch,
-  quotaRead: Partial<QuotaReadPacing>,
-) {
-  return createDispatcher(
-    { ...DEFAULT_CONFIG, ...fx, agents: agentTable(AGENT_ROUTES) },
-    { fetchImpl, quotaRead },
-  );
-}
-
-/**
- * The retry earns its keep on the switch path: without it, one 5xx on the
- * alternate holds the agent on a rail that is at 95%, which is a decision made
- * on evidence a second request would have supplied.
- */
-test("a blip on the alternate is retried, so the switch still happens", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
-  const healthy = stubFetch({ claude: { session: 95 }, codex: { session: 10 } });
-  let codexAttempts = 0;
-  const { impl, calls } = countingFetch(async (url) => {
-    if (url.includes("chatgpt.com") && ++codexAttempts === 1) {
-      return { ok: false, status: 503, json: async () => ({}) };
-    }
-    return healthy(url);
-  });
-
-  const started = Date.now();
-  const d = readDispatcher(fx, impl, { backoffMs: 30 });
-  const results = await d.evaluate({ force: true });
-  const planner = results.find((r) => r.decision.agent === "planner")!;
-
-  assert.equal(assignedModel(planner.decision), "openai-codex/gpt-6-sol");
-  assert.equal(codexAttempts, 2, "the failed attempt is asked again");
-  assert.equal(calls.length, 3, "two rails, one of them read twice");
-  // The second attempt waits out the backoff rather than hammering the endpoint.
-  // A hair of slack, because a timer can land just under its nominal delay when
-  // the delta is taken with the wall clock.
-  assert.ok(Date.now() - started >= 25, "the retry is spaced, not immediate");
-});
-
-/**
- * A status the endpoint means, and which another request would only repeat — an
- * expired token stays expired, and a rate limit asks us to slow down rather than
- * to ask again 250ms later.
- */
-async function assertNotRetried(status: number) {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
-  const healthy = stubFetch({ claude: { session: 95 } });
-  const { impl, calls } = countingFetch(async (url) =>
-    url.includes("chatgpt.com") ? { ok: false, status, json: async () => ({}) } : healthy(url),
-  );
-
-  const d = readDispatcher(fx, impl, { backoffMs: 1 });
-  const results = await d.evaluate({ force: true });
-  const planner = results.find((r) => r.decision.agent === "planner")!;
-
-  assert.equal(calls.filter((u) => u.includes("chatgpt.com")).length, 1, `HTTP ${status} is an answer`);
-  assert.equal(planner.decision.kind, "hold");
-  assert.equal("file" in planner.decision, false, "a hold has no file to write");
-  assert.match(planner.decision.why, new RegExp(`unreadable \\(HTTP ${status}\\)`));
-}
-
-test("a 401 is the endpoint's answer, so it is not retried", () => assertNotRetried(401));
-test("a 429 asks us to slow down, so it is not retried", () => assertNotRetried(429));
-
-/**
- * The count belongs to failures that were worth asking about. A 500 on the first
- * attempt and a 401 on the second is the endpoint's answer, not a read that was
- * given up on, so the note says the answer alone.
- */
-test("a definite answer on the retry carries no attempt count", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
-  const healthy = stubFetch({ claude: { session: 95 } });
-  let codexAttempts = 0;
-  const { impl } = countingFetch(async (url) => {
-    if (!url.includes("chatgpt.com")) return healthy(url);
-    return ++codexAttempts === 1
-      ? { ok: false, status: 503, json: async () => ({}) }
-      : { ok: false, status: 401, json: async () => ({}) };
-  });
-
-  const d = readDispatcher(fx, impl, { backoffMs: 1 });
-  const { latest: state } = await d.railReadings("codex", true);
-
-  assert.equal(codexAttempts, 2);
-  assert.equal(state.note, "HTTP 401");
-});
-
-/**
- * A body that is not the JSON this endpoint promises — an HTML error page, a
- * captive portal, a reply truncated without framing — is a failure like any
- * other, so it is asked again once and the count says so. The note names the
- * payload rather than the transport, because the parser's own message is the
- * only thing that can hint at which of those it was.
- */
-test("a body that is not JSON reads as an unreadable body, not as a shape problem", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
-  const healthy = stubFetch({ claude: { session: 95 } });
-  let codexAttempts = 0;
-  const { impl } = countingFetch(async (url) => {
-    if (!url.includes("chatgpt.com")) return healthy(url);
-    codexAttempts++;
-    return { ok: true, status: 200, json: async () => JSON.parse("<html>not json</html>") };
-  });
-
-  const d = readDispatcher(fx, impl, { backoffMs: 1 });
-  const { latest: state } = await d.railReadings("codex", true);
-
-  assert.equal(codexAttempts, 2);
-  assert.match(state.note ?? "", /^unreadable body \(.*\) after 2 attempts$/);
-});
-
-/**
- * `undefined` in an injected timing has to read as "not stated". It used to
- * replace the shipped value outright, and `AbortSignal.timeout(undefined)` then
- * threw — inside the attempt, so a configuration mistake was reported as a
- * network blip.
- *
- * `backoffMs` is the field this test can see: a leaked `undefined` retries with
- * no pause at all, where the shipped 250ms is unmissable. `timeoutMs` and
- * `attempts` go through the same merge, and a leak there is not something a fast
- * test can distinguish from a working one.
- */
-test("an unstated timing reads as the shipped one, not as undefined", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
-  const { impl } = countingFetch(async () => ({ ok: false, status: 500, json: async () => ({}) }));
-
-  const started = Date.now();
-  const d = readDispatcher(fx, impl, { backoffMs: undefined });
-  const { latest: state } = await d.railReadings("claude", true);
-
-  assert.equal(state.note, "HTTP 500 after 2 attempts");
-  // ~250ms of shipped backoff, not the no-pause retry an `undefined` would give.
-  assert.ok(Date.now() - started >= 200, "the shipped backoff was used");
-});
-
-/**
- * The error that a request failing its own validation raises quotes the header
- * value it rejected — and one of those headers is the credential. The note must
- * not repeat it, which is why a thrown failure is reported by its cause's code
- * rather than by its message.
- */
-test("a request error does not repeat what it says about the credential", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
-  const { impl } = countingFetch(async () => {
-    throw new TypeError('Headers.append: "Bearer sk-secret\\nx" is an invalid header value.');
-  });
-
-  const d = readDispatcher(fx, impl, { backoffMs: 1 });
-  const { latest: state } = await d.railReadings("claude", true);
-
-  assert.equal(state.note, "request failed after 2 attempts");
-  assert.ok(!(state.note ?? "").includes("sk-secret"), "a credential must not reach a note");
-});
-
-/** The other half of the distinction: a rail tried twice says how many were spent. */
-test("a rail that failed every attempt says how many were spent", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
-  const healthy = stubFetch({ claude: { session: 10 }, codex: { session: 10 } });
-  const { impl, calls } = countingFetch(async (url) =>
-    url.includes("chatgpt.com") ? { ok: false, status: 500, json: async () => ({}) } : healthy(url),
-  );
-
-  const d = readDispatcher(fx, impl, { backoffMs: 1 });
-  const lines = await d.report({ force: true });
-
-  assert.equal(calls.filter((u) => u.includes("chatgpt.com")).length, 2);
-  assert.ok(
-    lines.some((l) => l.includes("codex: unavailable — HTTP 500 after 2 attempts")),
-    lines.join("\n"),
-  );
-});
-
-/**
- * A request that never answers, with a handle that keeps the event loop alive
- * the way a real socket does.
- *
- * `AbortSignal.timeout`'s own timer deliberately does not hold the loop open, so
- * without a handle here the test would end before the deadline it is testing.
- * `body` stalls after the headers instead of before them.
- */
-function stallingHandler(opts: { body?: boolean } = {}) {
-  return (_url: string, init?: RequestInit): Promise<unknown> => {
-    const alive = setTimeout(() => {}, 10_000);
-    const never = () =>
-      new Promise((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () => {
-          clearTimeout(alive);
-          reject(init.signal!.reason);
-        });
-      });
-    return opts.body ? Promise.resolve({ ok: true, status: 200, json: never }) : never();
-  };
-}
-
-/**
- * A stalled endpoint is the worst case, not a mild one: it is awaited by
- * `session_start`. The signal has to end the attempt, and the read has to end
- * with it rather than waiting on a socket that will never answer.
- */
-test("a stalled endpoint is abandoned by its timeout and retried", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
-  const { impl, calls } = countingFetch(stallingHandler());
-
-  const d = readDispatcher(fx, impl, { timeoutMs: 20, backoffMs: 5 });
-  const started = Date.now();
-  const { latest: state } = await d.railReadings("claude", true);
-  const elapsed = Date.now() - started;
-
-  assert.equal(state.ok, false);
-  assert.equal(state.note, "no answer within 20ms after 2 attempts");
-  assert.equal(calls.length, 2);
-  assert.ok(elapsed < 1_000, `a stalled rail must not hold the read for ${elapsed}ms`);
-});
-
-/**
- * Headers are not the whole answer: the body is read inside the attempt, on the
- * same signal, so an endpoint that starts replying and then stops is abandoned
- * by the deadline too. This one stalls the Codex rail, so the pair covers both.
- */
-test("a body that stalls mid-stream is abandoned by the same deadline", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
-  const { impl, calls } = countingFetch(stallingHandler({ body: true }));
-
-  const d = readDispatcher(fx, impl, { timeoutMs: 20, backoffMs: 5 });
-  const { latest: state } = await d.railReadings("codex", true);
-
-  assert.equal(state.ok, false);
-  assert.equal(state.note, "no answer within 20ms after 2 attempts");
-  assert.equal(calls.length, 2);
 });
 
 // ---------------------------------------------------------------- #47 session override

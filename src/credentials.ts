@@ -232,8 +232,14 @@ export async function readClaudeToken(
  * request body, and a user on a project-scoped account needs the quota summary
  * of *that* project.
  */
+export interface AntigravityAccess {
+  readonly token: string;
+  readonly projectId?: string;
+}
+
+/** The Antigravity credential, or why no store supplied one. */
 export type AntigravityToken =
-  | { readonly token: string; readonly projectId?: string }
+  | AntigravityAccess
   | { readonly error: string; readonly reason: TokenFailure };
 
 /**
