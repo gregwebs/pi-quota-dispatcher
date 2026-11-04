@@ -5,23 +5,28 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
-  type AgentRoute,
   type AgentDefinition,
-  type Candidate,
-  type DispatcherConfig,
-  type ModelLookup,
-  DEFAULT_CONFIG,
-  checkModels,
   createDispatcher,
   decide,
   heldDecision,
-  modelLookup,
 } from "../src/index.ts";
+import {
+  type AgentRoute,
+  type Candidate,
+  type DispatcherConfig,
+  DEFAULT_CONFIG,
+} from "../src/config.ts";
+import {
+  type ModelLookup,
+  checkModels,
+  modelLookup,
+} from "../src/models.ts";
 import type { Rail } from "../src/rail.ts";
 import type { RailReading, RailWindow } from "../src/rail-reading.ts";
 
 import type { ModelId } from "../src/identifiers.ts";
 import { agentName, agentTable, modelId, modelTable } from "./helpers/identifiers.ts";
+import { fakeReads, readingOf } from "./helpers/rails.ts";
 
 const definitionOf = (agent: string, cfg: DispatcherConfig): AgentDefinition => ({ agent: agentName(agent), file: join(cfg.agentDir, `${agent}.md`) });
 
@@ -557,50 +562,6 @@ async function fixture(models: Record<string, string>): Promise<Fixture> {
   return { agentDir, claudeCredsPath, piAuthPath, codexCredsPath: piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
 }
 
-/** Readings the stub endpoints should report, per live rail. */
-interface StubReadings {
-  claude?: { session?: number; weekly?: number };
-  codex?: { session?: number; weekly?: number };
-}
-
-function stubFetch(opts: StubReadings = {}) {
-  return (async (url: string | URL) => {
-    const u = String(url);
-    if (u.includes("anthropic.com")) {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
-          five_hour: { utilization: opts.claude?.session ?? 0 },
-          seven_day: { utilization: opts.claude?.weekly ?? 0 },
-        }),
-      };
-    }
-    if (u.includes("chatgpt.com")) {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
-          rate_limit: {
-            limit_reached: false,
-            primary_window: {
-              used_percent: opts.codex?.session ?? 0,
-              limit_window_seconds: 18000,
-              reset_after_seconds: 3600,
-            },
-            secondary_window: {
-              used_percent: opts.codex?.weekly ?? 0,
-              limit_window_seconds: 604800,
-              reset_after_seconds: 400000,
-            },
-          },
-        }),
-      };
-    }
-    throw new Error(`unexpected url ${u}`);
-  }) as unknown as typeof fetch;
-}
-
 test("a held unknown primary leaves the agent's file byte-for-byte alone even when a switch is due", async () => {
   const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
   const cfg: DispatcherConfig = {
@@ -625,7 +586,10 @@ test("a held unknown primary leaves the agent's file byte-for-byte alone even wh
   // never be reached for a held agent.
   const dispatcher = createDispatcher(checked.config, {
     held: checked.held,
-    fetchImpl: stubFetch({ claude: { session: 90 }, codex: { session: 10 } }),
+    read: fakeReads({
+      claude: readingOf("claude", { session: 90 }),
+      codex: readingOf("codex", { session: 10 }),
+    }),
   });
   const results = await dispatcher.evaluate({ force: true });
   const planner = results.find((r) => r.decision.agent === "planner")!;

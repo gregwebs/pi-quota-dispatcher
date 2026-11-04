@@ -10,18 +10,16 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ThinkingLevel } from "../src/config.ts";
 import { agentTable, candidateOf } from "./helpers/identifiers.ts";
 import extension, {
-  ANTIGRAVITY_QUOTA_URL,
-  CLAUDE_USAGE_URL,
-  CODEX_USAGE_URL,
   checkAgentFiles,
-  DEFAULT_CONFIG,
   evaluationFence,
-  explicitSkill,
   fencedEvaluation,
   parseInvocation,
   readAgentDirectory,
   unknownFormNotice,
 } from "../src/index.ts";
+import { ANTIGRAVITY_QUOTA_URL, CLAUDE_USAGE_URL, CODEX_USAGE_URL } from "../src/endpoints.ts";
+import { DEFAULT_CONFIG } from "../src/config.ts";
+import { explicitSkill } from "../src/skill-binding.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
 // documented literal directly.
@@ -205,11 +203,34 @@ function antigravityBody(r: RailReadings): unknown {
   };
 }
 
+/**
+ * Which rail a request belongs to, from where it was sent.
+ *
+ * An end-to-end test stubs the extension's own `fetch`, below the transport
+ * seam, so it cannot avoid answering a document shape. It need not know a single
+ * vendor's protocol though: the allow-list in `src/endpoints.ts` names every
+ * request this extension can make, `test/endpoints.test.ts` owns that table, and
+ * a request to anything else is a test failure rather than a silently answered
+ * Codex read.
+ */
+function railOf(url: string | URL): "claude" | "codex" | "antigravity" {
+  switch (String(url)) {
+    case CLAUDE_USAGE_URL:
+      return "claude";
+    case CODEX_USAGE_URL:
+      return "codex";
+    case ANTIGRAVITY_QUOTA_URL:
+      return "antigravity";
+    default:
+      throw new Error(`a test answered a request the extension must not make: ${String(url)}`);
+  }
+}
+
 function stubFetch(overrides: Partial<RailReadings> = {}): typeof fetch {
   const r: RailReadings = { ...DEFAULT_READINGS, ...overrides };
-  return (async (url: string | URL) => {
-    const u = String(url);
-    if (u.includes("anthropic.com")) {
+  return (async (url: string | URL, init?: RequestInit) => {
+    const rail = railOf(url);
+    if (rail === "claude") {
       return {
         ok: true,
         status: 200,
@@ -219,7 +240,7 @@ function stubFetch(overrides: Partial<RailReadings> = {}): typeof fetch {
         }),
       };
     }
-    if (u.includes("chatgpt.com")) {
+    if (rail === "codex") {
       return {
         ok: true,
         status: 200,
@@ -232,10 +253,7 @@ function stubFetch(overrides: Partial<RailReadings> = {}): typeof fetch {
         }),
       };
     }
-    if (u.includes("cloudcode-pa.googleapis.com")) {
-      return { ok: true, status: 200, json: async () => antigravityBody(r) };
-    }
-    throw new Error(`unexpected url ${u}`);
+    return { ok: true, status: 200, json: async () => antigravityBody(r) };
   }) as unknown as typeof fetch;
 }
 
@@ -1438,12 +1456,12 @@ test("a rail whose newest read failed is fed as its last good reading, marked", 
   const fx = await generateFixture({}, capturingGenerator);
   let codexFails = false;
   const healthy = stubFetch();
-  const flaky = (async (url: string | URL) => {
-    if (codexFails && String(url).includes("chatgpt.com")) {
+  const flaky = (async (url: string | URL, init?: RequestInit) => {
+    if (codexFails && railOf(url) === "codex") {
       // A definite answer: a 429 is not retried, so no backoff runs here.
       return { ok: false, status: 429, json: async () => ({}) };
     }
-    return healthy(url);
+    return healthy(url, init);
   }) as unknown as typeof fetch;
 
   await withExtension(
@@ -1558,9 +1576,9 @@ test("a slow quota read does not consume the generator's timeoutMs", async () =>
     config.generator.timeoutMs = 150;
   });
   const healthy = stubFetch();
-  const slow = (async (url: string | URL) => {
+  const slow = (async (url: string | URL, init?: RequestInit) => {
     await new Promise((done) => setTimeout(done, 400));
-    return healthy(url);
+    return healthy(url, init);
   }) as unknown as typeof fetch;
 
   await withExtension(
@@ -1758,17 +1776,17 @@ test("refresh forces a re-fetch while the plain form reuses the cache", async ()
   let codexSession = 10;
   let fetches = 0;
 
-  const countingFetch = (async (url: string | URL) => {
+  const countingFetch = (async (_url: string | URL, init?: RequestInit) => {
     fetches++;
-    const u = String(url);
-    if (u.includes("anthropic.com")) {
+    const rail = railOf(_url);
+    if (rail === "claude") {
       return {
         ok: true,
         status: 200,
         json: async () => ({ five_hour: { utilization: claudeSession }, seven_day: { utilization: 0 } }),
       };
     }
-    if (u.includes("chatgpt.com")) {
+    if (rail === "codex") {
       return {
         ok: true,
         status: 200,
@@ -1783,10 +1801,7 @@ test("refresh forces a re-fetch while the plain form reuses the cache", async ()
     }
     // The three pools are one request, so a complete read is three requests and
     // a refresh is three more.
-    if (u.includes("cloudcode-pa.googleapis.com")) {
-      return { ok: true, status: 200, json: async () => antigravityBody(DEFAULT_READINGS) };
-    }
-    throw new Error(`unexpected url ${u}`);
+    return { ok: true, status: 200, json: async () => antigravityBody(DEFAULT_READINGS) };
   }) as unknown as typeof fetch;
 
   await withExtension(
@@ -1854,14 +1869,14 @@ async function waitFor(
  * before delegating, which gives the test both an arrival signal and control of
  * the moment the read finishes.
  */
-function gatedFetch(inner: typeof fetch, match: (url: string) => boolean) {
+function gatedFetch(inner: typeof fetch, match: (url: string, init?: RequestInit) => boolean) {
   let armed = false;
   let arrive: (() => void) | undefined;
   let open: (() => void) | undefined;
   let entered = Promise.resolve();
   let gate = Promise.resolve();
   const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
-    if (armed && match(String(url))) {
+    if (armed && match(String(url), init)) {
       armed = false;
       arrive?.();
       await gate;
@@ -2736,7 +2751,7 @@ test("hold on unreadable primary leaves already-alternate bytes unchanged", asyn
   await writeFile(fx.plannerFile, original);
   const before = await readFile(fx.plannerFile);
   const unreadable = (async (...args: Parameters<typeof fetch>) => {
-    if (String(args[0]).includes("anthropic.com")) throw new Error("fixture unreadable primary");
+    if (railOf(String(args[0])) === "claude") throw new Error("fixture unreadable primary");
     return stubFetch({ codexSession: 85 })(...args);
   }) as typeof fetch;
   await withExtension(fx, async ({ run, sessionStart }) => {
@@ -2823,9 +2838,9 @@ function refusingFetch(): { factory: () => typeof fetch; count: () => number } {
 function countingStubFetch(overrides: Partial<RailReadings> = {}): { factory: () => typeof fetch; count: () => number } {
   let count = 0;
   const stub = stubFetch(overrides);
-  const counting = (async (url: string | URL) => {
+  const counting = (async (url: string | URL, init?: RequestInit) => {
     count++;
-    return stub(url);
+    return stub(url, init);
   }) as unknown as typeof fetch;
   return { factory: () => counting, count: () => count };
 }
@@ -3910,7 +3925,7 @@ for (const [label, layer, expected] of [
 ] as const) {
   test(`a superseded refresh cannot repaint the gauge: ${label}`, async () => {
     const fx = await generateFixture(layer as unknown, undefined, MAX_POLL_MS);
-    const gate = gatedFetch(stubFetch(), (url) => url.includes("anthropic.com"));
+    const gate = gatedFetch(stubFetch(), (url) => railOf(url) === "claude");
 
     await withExtension(
       fx,
@@ -3983,7 +3998,7 @@ test("a gauge that cannot be drawn does not veto the pass, and is reported", asy
 test("a pass still in flight at shutdown draws nothing, and writes anyway", async (t) => {
   const errors = t.mock.method(console, "error");
   const fx = await fixture(MAX_POLL_MS, CONFIGURED_AGENTS, { ttlMs: 1 });
-  const gate = gatedFetch(stubFetch(), (url) => url.includes("anthropic.com"));
+  const gate = gatedFetch(stubFetch(), (url) => railOf(url) === "claude");
 
   await withExtension(
     fx,
@@ -4088,7 +4103,7 @@ test("a gauge sink that throws cannot abort a generation that empties the table"
 test("a gauge sink that throws at shutdown still lets the context go, and draws nothing after", async (t) => {
   const errors = t.mock.method(console, "error");
   const fx = await fixture(MAX_POLL_MS, CONFIGURED_AGENTS, { ttlMs: 1 });
-  const gate = gatedFetch(stubFetch(), (url) => url.includes("anthropic.com"));
+  const gate = gatedFetch(stubFetch(), (url) => railOf(url) === "claude");
 
   await withExtension(
     fx,
@@ -4134,7 +4149,7 @@ test("a gauge sink that throws at shutdown still lets the context go, and draws 
 test("a warning sink that throws at shutdown still clears the gauge, and the released pass finds no footer", async (t) => {
   const errors = t.mock.method(console, "error");
   const fx = await fixture(MAX_POLL_MS, CONFIGURED_AGENTS, { ttlMs: 1 });
-  const gate = gatedFetch(stubFetch(), (url) => url.includes("anthropic.com"));
+  const gate = gatedFetch(stubFetch(), (url) => railOf(url) === "claude");
   // Armed only for the shutdown: a start-time warning write would otherwise
   // refuse its key and fail the session start this test needs.
   let refusing = false;
@@ -4214,11 +4229,11 @@ test("a pass that read earlier cannot publish over a later failed read", async (
 
   // A stub whose claude read can be made to fail after the older pass has read.
   let claudeFails = false;
-  const fetchImpl = (async (url: string | URL) => {
-    if (claudeFails && String(url).includes("anthropic.com")) {
+  const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+    if (claudeFails && railOf(url) === "claude") {
       return { ok: false, status: 429, json: async () => ({}) };
     }
-    return stubFetch()(url);
+    return stubFetch()(url, init);
   }) as unknown as typeof fetch;
 
   await withExtension(

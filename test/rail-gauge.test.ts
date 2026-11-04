@@ -2,15 +2,15 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
-  type GaugeEntry,
-  type GaugeStyle,
-  DEFAULT_CONFIG,
-  type DispatcherConfig,
   railGauge,
   railGaugeEntries,
+} from "../src/index.ts";
+import {
+  type GaugeEntry,
+  type GaugeStyle,
   renderRailGauge,
   resetText,
-} from "../src/index.ts";
+} from "../src/rail-gauge.ts";
 import type { Rail } from "../src/rail.ts";
 import type {
   FailedReading,
@@ -20,7 +20,11 @@ import type {
   VendorRail,
 } from "../src/rail-reading.ts";
 import { agentTable, routeOf } from "./helpers/identifiers.ts";
-import type { AgentRoute } from "../src/config.ts";
+import {
+  type AgentRoute,
+  DEFAULT_CONFIG,
+  type DispatcherConfig,
+} from "../src/config.ts";
 
 // ---------------------------------------------------------------- fixtures
 

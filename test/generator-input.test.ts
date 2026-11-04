@@ -7,7 +7,10 @@ import {
   type GeneratorInputOutcome,
   type GeneratorReadingInput,
 } from "../src/generator.ts";
-import { generatorInput, type KnownReadings } from "../src/index.ts";
+import {
+  generatorInput,
+  type KnownReadings,
+} from "../src/generator-input.ts";
 import type {
   FailedReading,
   GoodReading,
