@@ -3,7 +3,16 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
-import { createDispatcher, DEFAULT_CONFIG, READINGS_FILE_VERSION } from "../src/index.ts";
+import {
+  createDispatcher,
+} from "../src/index.ts";
+import {
+  DEFAULT_CONFIG,
+} from "../src/config.ts";
+import {
+  READINGS_FILE_VERSION,
+} from "../src/readings-file.ts";
+import { failureOf, fakeReads, readingOf } from "./helpers/rails.ts";
 
 const NOW = 1_730_123_456_789;
 const PRIMARY = "claude-bridge/claude-opus-5-5";
@@ -35,18 +44,25 @@ async function fixture(t: TestContext) {
     overrides: Partial<typeof cfg> = {},
   ) => {
     const calls = { claude: 0, codex: 0 };
-    const fetchImpl = (async (url: string | URL) => {
-      const u = String(url);
-      const rail = u.includes("anthropic.com") ? "claude" : u.includes("chatgpt.com") ? "codex" : undefined;
-      assert.ok(rail, `unexpected request ${u}`); calls[rail]++;
-      if (beforeRespond) await beforeRespond();
-      const failed = probe.failed && rail === "claude";
-      return { ok: !failed, status: failed ? 429 : 200, json: async () => rail === "claude"
-        ? { five_hour: { utilization: 93 }, seven_day: { utilization: 21 } }
-        : { rate_limit: { primary_window: { used_percent: 3 }, secondary_window: { used_percent: 4 } } } };
-    }) as unknown as typeof fetch;
+    // The reads are the seam, so a test counts reads here rather than requests:
+    // what it pins is how many times a dispatcher went to a rail, which is what
+    // the shared entry is supposed to answer for it.
+    const read = fakeReads({
+      claude: async () => {
+        calls.claude++;
+        if (beforeRespond) await beforeRespond();
+        return probe.failed
+          ? failureOf("claude", "HTTP 429")
+          : readingOf("claude", { session: 93, weekly: 21 });
+      },
+      codex: async () => {
+        calls.codex++;
+        if (beforeRespond) await beforeRespond();
+        return readingOf("codex", { session: 3, weekly: 4 });
+      },
+    });
     return { calls, dispatcher: createDispatcher({ ...cfg, ...overrides }, {
-      fetchImpl, now: () => probe.clock, readKeychain: async () => ({ error: "no keychain" }),
+      read, now: () => probe.clock, readKeychain: async () => ({ error: "no keychain" }),
       ...(sleep ? { sleep } : {}), readings: { fetchWaitMs: 1_000, writeWaitMs: 100, pollMs: 2, staleMs: 10_000 },
     }) };
   };

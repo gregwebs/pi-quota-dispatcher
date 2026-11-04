@@ -39,11 +39,15 @@
  * bridge rather than through `claude` directly. See
  * docs/adr/0003-claude-credential-stores.md.
  */
-import { existsSync, type Stats } from "node:fs";
+import { type Stats } from "node:fs";
 import { open, readFile, readdir, stat } from "node:fs/promises";
-import { userInfo } from "node:os";
-import { basename, delimiter, join, resolve, sep } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent";
+
+// The entry point imports the module that owns each concept and re-exports none
+// of them: a name lives where it is defined, so what this file offers is what
+// the extension itself does — the dispatcher's policy and report, the agent-file
+// write path, and the pi wiring — rather than a namespace of everyone else's.
 import {
   DEFAULT_CONFIG,
   type AgentRoute,
@@ -82,39 +86,16 @@ import {
   type Rail,
 } from "./rail.ts";
 
-// The endpoints module is where the allow-list and the fetches themselves come
-// from one table; re-exported here so the `urls` form and a test reach the same
-// list as the request path.
-import {
-  ANTIGRAVITY_QUOTA_URL,
-  CLAUDE_USAGE_URL,
-  CODEX_USAGE_URL,
-  describeOutboundRequests,
-} from "./endpoints.ts";
-export {
-  ANTIGRAVITY_QUOTA_URL,
-  CLAUDE_USAGE_URL,
-  CODEX_USAGE_URL,
-  OUTBOUND_REQUESTS,
-  UNREQUESTED_RAILS,
-  describeOutboundRequests,
-} from "./endpoints.ts";
-export type { OutboundRequest, UnrequestedRail } from "./endpoints.ts";
-
-// The reading is the policy's only evidence: its shape, the parsers that build
-// it from a vendor's document and the judgments about it all live here, so the
-// policy, the gauge, the readings file and the generator share one definition.
+// The reading is the policy's only evidence: its shape and the judgments about it
+// live in one module, so the policy, the gauge, the readings file and the
+// generator cannot disagree about what a reading is.
 import {
   absentBudgets,
   budgetUsed,
   isTight,
-  parseAntigravityUsage,
-  parseClaudeUsage,
-  parseCodexUsage,
   weekSpent,
-  type FailedReading,
+  type AntigravityReadings,
   type GoodReading,
-  type MeteredRailReadings,
   type MeteredReading,
   type RailReading,
   type RailReadings,
@@ -124,364 +105,103 @@ import {
   type VendorReading,
 } from "./rail-reading.ts";
 
-import { jsonObject } from "./json.ts";
+// The rail read is where a credential already in hand becomes a reading: the
+// request, its deadline and retry, the parse, and the note a failure earns.
+import {
+  DEFAULT_QUOTA_READ,
+  createRailRead,
+  failedReading,
+  poolFailure,
+  readBoundMs,
+  type QuotaReadPacing,
+  type RailRead,
+  type Transport,
+} from "./rail-read.ts";
+
+// The endpoints table is the one place the `urls` form and the requests agree.
+import { describeOutboundRequests } from "./endpoints.ts";
 
 // The generator module is where a declared command's output replaces one config
 // layer. Its orchestration is a call the command handler makes, not a public
-// surface: the tests import the module directly, so nothing is re-exported here.
-// The stdin document's types come back the other way, so the projection onto
-// them can be built where the readings live without generator.ts learning about
-// dispatchers.
-import {
-  type GeneratorInputOutcome,
-  type GeneratorReadingInput,
-  type GeneratorWindowInput,
-  GENERATOR_INPUT_VERSION,
-  generateConfig,
-} from "./generator.ts";
+// surface: the tests import the module directly.
+import { generateConfig } from "./generator.ts";
 
-// Config is a separate module because it is read from disk at run time; it is
-// re-exported here so the extension's runtime surface has one import path. The
-// rail and reading vocabulary is deliberately not part of that surface: `rail.ts`
-// and `rail-reading.ts` are imported directly by everything that needs them, so
-// the entry point cannot become the definition of a reading again.
-export {
-  CLAUDE_REFRESH_MODES,
-  CONFIG_FILE_NAME,
-  DEFAULT_CONFIG,
-  DEFAULT_GENERATOR_TIMEOUT_MS,
-  THINKING_LEVELS,
-  agentKey,
-  configFilesFor,
-  defaultConfig,
-  describeConfig,
-  describeConfigLayers,
-  describeConfigWarnings,
-  globalConfigPath,
-  isClaudeRefreshMode,
-  isThinkingLevel,
-  loadConfig,
-  mergeConfig,
-  modelIdRejection,
-  parseGeneratorDeclaration,
-  projectConfigPath,
-  skillKey,
-  thinkingFor,
-} from "./config.ts";
-export type {
-  AgentRoute,
-  Candidate,
-  ClaudeRefreshMode,
-  ConfigFile,
-  ConfigFileFault,
-  ConfigFileState,
-  ConfigPosition,
-  ConfigSource,
-  DispatcherConfig,
-  GeneratorDeclaration,
-  LoadConfigDeps,
-  LoadedConfig,
-  MergeLayer,
-  MergeResult,
-  ModelDefault,
-  SkipFlag,
-  SkillBinding,
-  ThinkingLevel,
-} from "./config.ts";
+// The document a generator is fed is projected from readings alone, so it is a
+// pure module of its own rather than a bridge this file has to hold.
+import { generatorInput, type KnownReadings } from "./generator-input.ts";
 
-// The identifier newtypes and their checked producers are re-exported here for
-// the same reason the config module is: this is the extension's one import
-// surface, and a consumer of the config types needs the brands those types name.
+// The identifier newtypes are produced only by their checked parsers, so a
+// wrong-role value does not compile.
 import type { AgentName, ModelId } from "./identifiers.ts";
 import { parseAgentName, parseModelId } from "./identifiers.ts";
 import { validatedEntries, validatedKeys } from "./validated-keys.ts";
-export { parseAgentName, parseModelId, parseSkillName } from "./identifiers.ts";
-export type { AgentName, ModelId, SkillName } from "./identifiers.ts";
 
+// The models module resolves a config's model ids against the pi that is running.
 import { checkModels, modelLookup, type DroppedAlternate, type ModelMiss, unknownModelNote } from "./models.ts";
+
+// The coordination module is where a write to a shared agent file is made safe,
+// and the only thing in this extension that takes a lock.
 import {
-  type Coordination,
-  type FileWritePacing,
   errnoIs,
   replaceFileAtomically,
   withFileLock,
+  type Coordination,
+  type FileWritePacing,
 } from "./agent-file.ts";
 
-// The coordination module is where a write to a shared agent file is made safe;
-// re-exported here for the same reason as the config and models modules.
-export {
-  ABANDONED_LOCK_MS,
-  DEFAULT_FILE_WRITE,
-  agentFileTarget,
-  lockPathFor,
-  replaceFileAtomically,
-  withFileLock,
-} from "./agent-file.ts";
-export type { Coordination, FileWritePacing, LockAttempt, LockHolder } from "./agent-file.ts";
-
+// The readings module is where the rail cache lives and is shared with every
+// other pi process under this OS user.
 import {
   DEFAULT_SHARED_READINGS,
   createSharedReadings,
-  type AntigravityReadings,
   type SharedReadingsPacing,
   type SingleFetchRail,
   type StickyHalt,
 } from "./readings-file.ts";
 
-// The readings module is where the rail cache lives and is shared across
-// processes; re-exported here for the same reason as the config and models
-// modules.
-export {
-  DEFAULT_SHARED_READINGS,
-  READINGS_FILE_VERSION,
-  asReadings,
-  createSharedReadings,
-} from "./readings-file.ts";
-export type {
-  AntigravityReadings,
-  CachedReadings,
-  CredentialGates,
-  GatePatch,
-  RefreshGates,
-  SharedReadings,
-  SharedReadingsDeps,
-  SharedReadingsPacing,
-  SingleFetchRail,
-  StickyHalt,
-} from "./readings-file.ts";
-
-// The models module is where a config's model ids are resolved against the pi
-// that is running; re-exported here for the same reason as the config module.
-export {
-  checkModels,
-  modelLookup,
-  splitModelId,
-  unknownModelClause,
-} from "./models.ts";
-export type {
-  DroppedAlternate,
-  ModelCheckResult,
-  ModelLookup,
-  ModelMiss,
-  ModelRegistryLike,
-} from "./models.ts";
-
-import { type AgentFileSelection, applySkillBinding, explicitSkill } from "./skill-binding.ts";
-
 // The skill-binding module is where an explicit `/skill:` invocation selects the
-// session's model; re-exported here for the same reason as the config module.
-export { applySkillBinding, explicitSkill } from "./skill-binding.ts";
-export type { AgentFileSelection, SessionSelection, SkillBindingDeps } from "./skill-binding.ts";
+// session's model from the agent file it names.
+import { applySkillBinding, explicitSkill, type AgentFileSelection } from "./skill-binding.ts";
 
+// The refresh module owns the subprocess and the loopback listener, not the
+// gates or the report.
 import {
   CLAUDE_PING_COOLDOWN_MS,
   CLAUDE_PING_TIMEOUT_MS,
+  isDefaultClaudeCredsPath,
+  refreshPlan,
   type ClaudePing,
   type ClaudeRefresh,
-  execFileRunner,
-  isDefaultClaudeCredsPath,
-  refreshPlan,
 } from "./refresh.ts";
 
-// The refresh module owns the subprocess and loopback listener, not the gates
-// or the report; re-exported here so index.ts remains the extension's one import
-// path for this surface.
-export {
-  CLAUDE_PING_COOLDOWN_MS,
-  CLAUDE_PING_TIMEOUT_MS,
-  claudePingArgs,
-  claudePingEnv,
-  claudeRefresher,
-  execFileRunner,
-  isDefaultClaudeCredsPath,
-  loopbackListener,
-  refreshPlan,
-} from "./refresh.ts";
-export type {
-  ClaudePing,
-  ClaudeRefresh,
-  PingListener,
-  PingListenerFactory,
-  RefreshPlan,
-} from "./refresh.ts";
-
+// The credentials module is where a store's text becomes a token, and where
+// the Claude token, the Codex credential and the single-flight Antigravity
+// refresh are acquired. It deliberately does not own every acquisition: the
+// Claude gates and the paid ping need this dispatcher's state, so they stay in
+// this entry point, which names the module's types in its deps and asks it for
+// tokens.
 import {
+  PROVIDER_TOKEN_TIMEOUT_MS,
+  claudeInstall,
+  createAntigravityToken,
+  keychainReader,
+  readClaudeToken,
+  readCodexCredential,
+  type ClaudeIdentity,
+  type KeychainRead,
+} from "./credentials.ts";
+
+// The rail-gauge module is where the footer line is rendered.
+import {
+  GAUGE_ORDER,
+  renderRailGauge,
   type BudgetGauge,
   type GaugeEntry,
   type GaugeStyle,
   type StaleBudgetGauge,
-  GAUGE_ORDER,
-  renderRailGauge,
 } from "./rail-gauge.ts";
 
-// The rail-gauge module is where the footer line is rendered; re-exported here
-// for the same reason as the config module, so a consumer (and a test) reaches
-// the renderer through the extension's one import path.
-export { GAUGE_LABELS, GAUGE_ORDER, renderRailGauge, resetText } from "./rail-gauge.ts";
-export type { BudgetGauge, GaugeEntry, GaugeStyle, StaleBudgetGauge } from "./rail-gauge.ts";
-
-// ---------------------------------------------------------------- types
-
-/**
- * Every rail's readings as the dispatcher already holds them, keyed by the rail
- * itself so a reader needs no case for a missing rail and none for "is this one
- * metered". The policy's `Map<Rail, RailReading>` cannot promise which arm a rail
- * carries; this can, because its keys are the rails.
- */
-export interface KnownReadings {
-  readonly claude: VendorRailReadings;
-  readonly codex: VendorRailReadings;
-  readonly "antigravity-argon": VendorRailReadings;
-  readonly "antigravity-gemini": VendorRailReadings;
-  readonly "antigravity-3p": VendorRailReadings;
-  readonly deepseek: MeteredRailReadings;
-}
-
-/**
- * One vendor rail projected onto the wire, or the reason there is nothing to
- * send. Tagged rather than `undefined` for the absent case, so the refusal
- * carries the failure note with the type proving a note exists: only a failed
- * newest read with no last good reading behind it produces `no-reading`.
- */
-type VendorRailProjection =
-  | { readonly kind: "reading"; readonly reading: GeneratorReadingInput }
-  | { readonly kind: "no-reading"; readonly note: string };
-
-/**
- * An epoch instant as the wire document states it.
- *
- * Safe by construction: a `resetsAt` that reaches here passed
- * `representableInstant`, and a `readAt` comes from the dispatcher's clock.
- * A throw is still left to propagate rather than clamped into a plausible-
- * looking instant — the `input` seam turns it into a failed run, which is the
- * honest report for a reading this process cannot write out.
- */
-function isoInstant(ms: number): string {
-  return new Date(ms).toISOString();
-}
-
-/**
- * One report window in the wire's text form. `budget` and `resetsAt` are spread
- * in only when the reading carries them, because an absent key and a key whose
- * value is `null` are different documents: a generator testing for the key
- * would read a judgment out of the second that the reading never made.
- */
-function windowInput(w: RailWindow): GeneratorWindowInput {
-  return {
-    label: w.label,
-    used: w.used,
-    ...(w.budget === undefined ? {} : { budget: w.budget }),
-    ...(w.resetsAt === undefined ? {} : { resetsAt: isoInstant(w.resetsAt) }),
-  };
-}
-
-/** One reading in the wire's shape, apart from the failure that may qualify it. */
-function readingInput(sent: GoodReading): GeneratorReadingInput {
-  return {
-    ok: true,
-    readAt: isoInstant(sent.readAt),
-    windows: sent.windows.map(windowInput),
-    raw: sent.raw,
-    ...(sent.note === undefined ? {} : { note: sent.note }),
-  };
-}
-
-/**
- * The document for one capped rail, or why there is none to send.
- *
- * A newest read that failed sends the last good reading marked `latestFailure`,
- * rather than its own empty windows: the generator routes on the vendor's last
- * word, and the marker is what keeps it from reading that word as current. The
- * `note` is the sent reading's — a qualifier explaining `used: 100` (Codex's
- * `limit_reached=true`) travels with the reading it qualifies, never with the
- * failure that made an older one stand in.
- */
-function projectVendorRail(readings: VendorRailReadings): VendorRailProjection {
-  const { latest } = readings;
-  if (latest.ok) return { kind: "reading", reading: readingInput(latest) };
-  const { lastGood } = readings;
-  if (lastGood === undefined) return { kind: "no-reading", note: latest.note };
-  return {
-    kind: "reading",
-    reading: {
-      ...readingInput(lastGood),
-      latestFailure: { at: isoInstant(latest.readAt), note: latest.note },
-    },
-  };
-}
-
-/**
- * The generator's stdin document, or the refusal when a capped rail has never
- * been read successfully.
- *
- * Pure: the readings are its only input, so the shape a generator sees is
- * testable without a dispatcher, a clock or a subprocess. Facts only, and every
- * rail key present — see `GeneratorInput` for the document and
- * docs/adr/0015-configuration-generation.md for the contract and its reasons.
- *
- * The refusal is stated as facts too: one sentence per rail naming it and the
- * note its latest read left, so the reason is the vendor's own account rather
- * than this process's opinion about it. A rail that has never been read cannot
- * be filled with a placeholder instead — a generator would route on a guess,
- * which is the guess ADR 0006's hold exists to refuse.
- */
-export function generatorInput(known: KnownReadings): GeneratorInputOutcome {
-  const claude = projectVendorRail(known.claude);
-  const codex = projectVendorRail(known.codex);
-  const argon = projectVendorRail(known["antigravity-argon"]);
-  const gemini = projectVendorRail(known["antigravity-gemini"]);
-  const threeParty = projectVendorRail(known["antigravity-3p"]);
-  // Canonical order, and the order the refusal names a failing rail in: a
-  // generator reads one document, so the five capped rails are one list rather
-  // than five independent chances to be the one that is missing.
-  const capped: ReadonlyArray<readonly [VendorRail, VendorRailProjection]> = [
-    ["claude", claude],
-    ["codex", codex],
-    ["antigravity-argon", argon],
-    ["antigravity-gemini", gemini],
-    ["antigravity-3p", threeParty],
-  ];
-  if (
-    claude.kind === "no-reading" ||
-    codex.kind === "no-reading" ||
-    argon.kind === "no-reading" ||
-    gemini.kind === "no-reading" ||
-    threeParty.kind === "no-reading"
-  ) {
-    return {
-      kind: "refused",
-      reason: [
-        "the generator was not run: a quota-capped rail has no successful reading yet.",
-        ...capped.flatMap(([rail, projection]) => refusalLine(rail, projection)),
-        // Advice, not a fact about the readings, but the refusal is the only
-        // place the user learns the run was skipped before the vendor was
-        // asked — and an unforced read is exactly what would clear it. A
-        // credential that is missing rather than stale is not something a
-        // refresh can fix, which is why the sentence is conditional.
-        "Run /quota-dispatch refresh once the rail can be read, then generate again.",
-      ],
-    };
-  }
-  return {
-    kind: "ready",
-    input: {
-      version: GENERATOR_INPUT_VERSION,
-      rails: {
-        claude: claude.reading,
-        codex: codex.reading,
-        "antigravity-argon": argon.reading,
-        "antigravity-gemini": gemini.reading,
-        "antigravity-3p": threeParty.reading,
-        deepseek: { metered: true, windows: [], raw: null },
-      },
-    },
-  };
-}
-
-/** A rail's one line in a refusal, or nothing when it has a reading to send. */
-function refusalLine(rail: VendorRail, projection: VendorRailProjection): string[] {
-  return projection.kind === "no-reading" ? [`the ${rail} rail has no valid reading yet (${projection.note}).`] : [];
-}
+// ---------------------------------------------------------------- decisions
 
 export type Outcome =
   | "written"
@@ -2012,135 +1732,11 @@ export function describeDecisionLines(decision: Decision, outcome: Outcome): str
   ];
 }
 
-// ---------------------------------------------------------------- rails
+// ---------------------------------------------------------------- readings
 
-/**
- * How long one quota read may stall, and how many times it is asked again
- * before the rail reads as unreadable.
- *
- * Both numbers are small on purpose. The read is awaited by `session_start`, so
- * the point of the bound is that a vendor which has gone quiet costs a session
- * a few seconds rather than the rest of the session. The retry is the other
- * half: without it a single dropped connection reads as an outage and holds
- * every agent on the route, which is a decision made on evidence a second
- * request would have supplied.
- *
- * They are a seam rather than config-file keys: how long to wait for a socket
- * is a fact about this network, not a routing preference, and the two timings
- * only mean anything together.
- *
- * See docs/adr/0006-bounded-quota-reads.md for why the retry does not soften the
- * hold rule.
- */
-export interface QuotaReadPacing {
-  /** One attempt is abandoned after this long, signal and all. */
-  timeoutMs: number;
-  /** Attempts per rail, the first one included. */
-  attempts: number;
-  /** Wait between attempts. */
-  backoffMs: number;
-}
-
-/** The shipped timings — see `QuotaReadPacing`. */
-export const DEFAULT_QUOTA_READ: QuotaReadPacing = {
-  timeoutMs: 5_000,
-  attempts: 2,
-  backoffMs: 250,
-};
-
-/**
- * The `User-Agent` Antigravity's own current client sends, and the reason it is
- * pinned rather than borrowed from whatever called pi.
- *
- * Load-bearing, not cosmetic: Google omits the Argon group from
- * `retrieveUserQuotaSummary` for older agent strings, so a request that looks
- * like an old CLI silently reports two pools instead of three — an honest failed
- * Argon rail whose cause is nowhere in the body. Bumping the version is a change
- * to what the vendor is willing to tell us, so it is one constant with one
- * documented override.
- */
-export const DEFAULT_ANTIGRAVITY_USER_AGENT =
-  "antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=982146307; auth_method=consumer)";
-
-/**
- * The `User-Agent` one request carries: the pinned default, unless the
- * environment overrides it.
- *
- * The override exists so a machine behind a proxy that rewrites the header — or
- * a future vendor build that demands a newer string — does not need a release of
- * this extension. It is read per request rather than at import, so a session
- * that sets it before its first quota read is honoured.
- */
-export function antigravityUserAgent(env: NodeJS.ProcessEnv = process.env): string {
-  return env.ANTIGRAVITY_USER_AGENT?.trim() || DEFAULT_ANTIGRAVITY_USER_AGENT;
-}
-
-/**
- * How long a delegated provider-token refresh is waited for, in milliseconds.
- *
- * Generous because the refresh is a real OAuth exchange under pi's own file lock,
- * and deliberately finite because the registry exposes no cancellation: when the
- * bound passes, the wait ends and the refresh is left to finish in the
- * background. The next credential read is what finds out whether it did.
- */
-export const PROVIDER_TOKEN_TIMEOUT_MS = 10_000;
-
-/** Waits `ms`, for the pause between two attempts at the same endpoint. */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * What one failed attempt is reported as, in the single line a note has room
- * for.
- *
- * A timeout is reported by its budget rather than by the exception's own text
- * ("The operation was aborted due to timeout"), because the number is the
- * actionable part — it is the one the pacing chose and the one someone would
- * change. A body that is not JSON is named as such: a reply truncated without
- * framing and a captive portal both arrive looking like this, and the parser's
- * message is the only thing that can hint at which one it was.
- *
- * A failed request is reported by the code its cause carries — `ECONNREFUSED`,
- * `ENOTFOUND`, a TLS failure — and never by its message. undici flattens a
- * network failure to a bare "fetch failed" anyway, while an error thrown while
- * *building* the request quotes the header value it rejected — and one of those
- * headers is the credential. Not repeating what a request error says about
- * itself is how this file keeps its promise that no credential is ever logged.
- */
-function attemptFailure(err: unknown, timeoutMs: number): string {
-  if ((err as { name?: unknown } | null)?.name === "TimeoutError") {
-    return `no answer within ${timeoutMs}ms`;
-  }
-  if (err instanceof SyntaxError) return `unreadable body (${err.message})`;
-  const cause = err instanceof Error ? (err.cause as { code?: unknown } | undefined) : undefined;
-  const code = typeof cause?.code === "string" ? cause.code : undefined;
-  return code ? `request failed (${code})` : "request failed";
-}
-
-/**
- * Whether asking again could get a different answer. A 4xx is the endpoint's
- * reply — an expired token stays expired and a moved endpoint stays moved — so
- * only a server-side failure is worth a second request. A 429 is deliberately
- * not on this list: it says "too many requests", and asking again 250ms later
- * without honouring `Retry-After` is the thing it is asking us not to do.
- */
-function retryableStatus(status: number): boolean {
-  return status >= 500;
-}
-
-/**
- * The note a rail reads as when a failure worth retrying outlived its attempts.
- *
- * The count is said out loud only when there was more than one, so the report
- * separates the two failures `unreadable` used to cover: a reading another
- * request would not have fixed — a 401, a 429, a credential store with nothing
- * to give — from one that was asked again and given up on. Both hold, but only
- * the second is about the request rather than about what the endpoint said.
- */
-function afterAttempts(note: string, attempts: number): string {
-  return attempts > 1 ? `${note} after ${attempts} attempts` : note;
-}
+// The two readings the policy itself builds: the metered rail's, which no
+// request produces, and the projection that drops last-good history before a
+// decision sees it. Everything else a rail reads comes from `rail-read.ts`.
 
 /**
  * DeepSeek is metered per token rather than quota-capped, so it never blocks a
@@ -2160,368 +1756,11 @@ function latestReadings(readings: ReadonlyMap<Rail, RailReadings>): Map<Rail, Ra
   return new Map([...readings].map(([rail, r]) => [rail, r.latest]));
 }
 
-// ---------------------------------------------------------------- credentials
-
-/**
- * One credential store's answer: the text it held, or why it could not be read.
- *
- * A store is read for its *text* rather than for a parsed token because the
- * credential file and the login keychain hold the same JSON shape, so both are
- * judged by the same parser instead of by two that could disagree.
- */
-export type CredentialRead = { text: string } | { error: string };
-
-/**
- * The raw JSON text of the macOS login keychain item Claude Code keeps its
- * subscription credential in.
- */
-export type KeychainRead = () => Promise<CredentialRead>;
-
-/**
- * Runs one command and resolves its stdout as text, or the reason it failed.
- * The seam `keychainReader` needs so that the argv it passes to `security` can
- * be tested without a keychain on the machine running the tests.
- */
-export type CommandRunner = (file: string, args: string[]) => Promise<CredentialRead>;
-
-/** The keychain item Claude Code writes its subscription credential to. */
-export const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
-
-/**
- * The macOS login keychain reader, or `undefined` on a platform that has no
- * such store — so that no caller can consult one that does not exist, and a
- * Linux install pays neither a subprocess nor an error line for it.
- *
- * On darwin it runs `security find-generic-password -a $USER -w -s "Claude
- * Code-credentials"`: the same call Claude Code and the Agent SDK make, against
- * the same item they write. `run` exists so that this argv is testable; the
- * real runner passes `security` a timeout, because a wedged keychain must not
- * stall the session start this is awaited from.
- */
-export function keychainReader(
-  platform: NodeJS.Platform = process.platform,
-  run: CommandRunner = execFileRead,
-): KeychainRead | undefined {
-  if (platform !== "darwin") return undefined;
-  return () => run("security", keychainArgs());
-}
-
-/**
- * `security find-generic-password -a <user> -w -s "Claude Code-credentials"`,
- * the call that reads back what Claude Code wrote. `-a` is omitted only when
- * the user cannot be determined at all, in which case searching by service
- * alone is still the right guess; the keychain is per-user either way.
- */
-function keychainArgs(): string[] {
-  const account = currentUser();
-  return [
-    "find-generic-password",
-    ...(account ? ["-a", account] : []),
-    "-w",
-    "-s",
-    CLAUDE_KEYCHAIN_SERVICE,
-  ];
-}
-
-/** `$USER` first, as the SDK does, then the passwd entry — which can be absent. */
-function currentUser(): string | undefined {
-  try {
-    return process.env.USER || userInfo().username;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * A stalled keychain must not stall the session start this read is awaited
- * from, so the read is bounded the way the vendors' own clients bound it.
- */
-const CLAUDE_KEYCHAIN_TIMEOUT_MS = 5_000;
-
-/** The keychain read: `security`'s stdout is the credential JSON itself. */
-const execFileRead: CommandRunner = execFileRunner(CLAUDE_KEYCHAIN_TIMEOUT_MS);
-
-/**
- * Why no store supplied a token, as the one distinction the caller acts on.
- *
- *   `expired`   a store answered and the token it holds has run out. Claude
- *               Code refreshing that store is exactly the fix, so this is the
- *               one failure a refresh ping is started for.
- *   `unusable`  no store answered, or none held a token at all. A ping would
- *               leave every one of those reasons standing.
- *
- * The message names the store and the cause; the tag exists so that nothing has
- * to read the message to know whether a ping is worth trying.
- */
-export type TokenFailure = "expired" | "unusable";
-
-/** One store's refusal, or both stores' refusals joined into one message. */
-export interface ClaudeTokenError {
-  error: string;
-  reason: TokenFailure;
-}
-
-/** The Claude rail's token, or why no store supplied one. */
-export type ClaudeToken = { token: string } | ClaudeTokenError;
-
-/**
- * A store that answered with a failure of its own — a keychain read that could
- * not run, a file that could not be opened. Nothing a refresh ping fixes, which
- * is what makes it `unusable` rather than `expired`: the store never got as far
- * as a token whose age could be the problem.
- */
-function storeFailure(error: string): ClaudeTokenError {
-  return { error, reason: "unusable" };
-}
-
-/**
- * Pulls `claudeAiOauth.accessToken` out of one store's JSON text.
- *
- * `now` is a parameter rather than a call to `Date.now()` so that the expiry
- * comparison stays a pure function of its inputs. A token carrying no
- * `expiresAt` is used: the shaping Claude Code writes always carries one, and a
- * missing field is not evidence of expiry.
- *
- * The expiry message is the *fact* only — "claude token expired" — because it
- * is the first half of the note `fetchClaude` composes, and the second half is
- * whatever decision was made about it. Naming an action here would tell a
- * bridge user to run a command that only refreshes a credential the bridge
- * already owns.
- */
-export function parseClaudeToken(text: string, now: number): ClaudeToken {
-  let oauth: any;
-  try {
-    oauth = JSON.parse(text)?.claudeAiOauth;
-  } catch (err) {
-    return storeFailure(`unreadable claude credentials: ${(err as Error).message}`);
-  }
-  if (!oauth?.accessToken) return storeFailure("no claudeAiOauth.accessToken");
-  // Claude Code refreshes this on use; we only read it.
-  if (typeof oauth.expiresAt === "number" && oauth.expiresAt < now) {
-    return { error: "claude token expired", reason: "expired" };
-  }
-  return { token: oauth.accessToken };
-}
-
-/**
- * What `auth.json`'s `antigravity` entry yielded: a usable credential, or why not.
- *
- * `expired` is separated from `unusable` for the same reason Claude's are: an
- * expiry is the one failure a delegated refresh can fix, and a missing entry or
- * an unreadable file is not.
- *
- * `projectId` rides along because the vendor's own client sends it in the
- * request body, and a user on a project-scoped account needs the quota summary
- * of *that* project.
- */
-export type AntigravityToken =
-  | { readonly token: string; readonly projectId?: string }
-  | { readonly error: string; readonly reason: TokenFailure };
-
-/**
- * Pulls the Antigravity credential out of `auth.json`'s text.
- *
- * `pi-antigravity` registers an OAuth provider with pi, and pi persists what it
- * obtained in exactly this shape: `access`, an optional `expires` in epoch
- * milliseconds, and an optional `projectId`. Reading it is all this parser does
- * — no refresh token is handled here, and nothing is written back.
- *
- * The expiry test is `<=` rather than Claude's `<`: a token whose expiry *is*
- * this instant has no remaining life, and using it would spend a request on a
- * credential that is already gone. An absent `expires` is not evidence of
- * expiry, so the token is used; an `expires` that is present but not a number is
- * a shape this cannot judge, and inventing a lifetime for it is worse than
- * saying so.
- *
- * The expired check comes *before* the access check on purpose: an entry the
- * provider has expired may have had its `access` cleared already, and the
- * expiry is still the reason a delegated refresh is worth attempting.
- */
-export function parseAntigravityToken(text: string, context: { now: number }): AntigravityToken {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    // Deliberately fixed text: a JSON syntax error's own message quotes the
-    // document, and this document is a credential file.
-    return { error: "unreadable pi auth: it is not valid JSON", reason: "unusable" };
-  }
-  const entry = jsonObject(jsonObject(parsed)?.["antigravity"]);
-  if (entry === undefined) return { error: "no antigravity.access", reason: "unusable" };
-  const expires = entry.expires;
-  if (expires !== undefined) {
-    if (typeof expires !== "number" || !Number.isFinite(expires)) {
-      return { error: "antigravity credential has no usable expiry", reason: "unusable" };
-    }
-    if (expires <= context.now) return { error: "antigravity token expired", reason: "expired" };
-  }
-  const access = entry.access;
-  if (typeof access !== "string" || access === "") {
-    return { error: "no antigravity.access", reason: "unusable" };
-  }
-  const project = entry.projectId;
-  const projectId = typeof project === "string" && project !== "" ? project : undefined;
-  return { token: access, ...(projectId === undefined ? {} : { projectId }) };
-}
-
-/** The Codex credential one read must supply: the bearer token, and the account whose usage it asks about. */
-export interface CodexCredential {
-  readonly access: string;
-  readonly accountId: string;
-}
-
-/** A Codex credential, or why the document could not supply one. */
-export type CodexCredentialRead = CodexCredential | { readonly error: string };
-
-/** One document shape a Codex credential arrives in, and the field each part is spelled under. */
-interface CodexShape {
-  /** The top-level section that claims the document for this shape. */
-  readonly section: string;
-  readonly access: string;
-  readonly account: string;
-}
-
-/** pi's `auth.json`, which is where a Codex login obtained by pi lands. */
-const PI_CODEX: CodexShape = { section: "openai-codex", access: "access", account: "accountId" };
-
-/**
- * The Codex CLI's own `auth.json`.
- *
- * Read and never written: the CLI owns that file, and a launcher that shields
- * the host's credentials publishes this one when it may not publish pi's — see
- * `docs/adr/0020-codex-credential-seam.md`.
- */
-const CLI_CODEX: CodexShape = { section: "tokens", access: "access_token", account: "account_id" };
-
-/**
- * The shapes a file is read in, in the order they are tried.
- *
- * pi's first because it is the default file's own shape, so the common case
- * finds its credential on the first try. Neither is an alias for the other and
- * a shape is recognised by its section's presence, not by the file's name: one
- * path is a credential file whatever wrote it.
- */
-const CODEX_SHAPES: readonly CodexShape[] = [PI_CODEX, CLI_CODEX];
-
-/** One shape's verdict: the credential, the reason it is unusable, or `undefined` when the section is absent. */
-function codexCredentialIn(document: Record<string, unknown>, shape: CodexShape): CodexCredentialRead | undefined {
-  const entry = jsonObject(document[shape.section]);
-  if (entry === undefined) return undefined;
-  const access = entry[shape.access];
-  if (typeof access !== "string" || access === "") return { error: `no ${shape.section}.${shape.access}` };
-  const accountId = entry[shape.account];
-  if (typeof accountId !== "string" || accountId === "") {
-    return { error: `no ${shape.section}.${shape.account}` };
-  }
-  return { access, accountId };
-}
-
-/**
- * Pulls a Codex credential out of a credential file's text.
- *
- * Both shapes are tried and the first usable one wins, so a document carrying a
- * half-written `openai-codex` section beside a usable `tokens` one still
- * answers: the shapes are two spellings of one fact, not a precedence.
- *
- * The account id is required rather than defaulted. It is not a secret, but it
- * selects *which* account's usage the request asks about, so a guessed one would
- * report another account's headroom — what the per-credential key in
- * `docs/adr/0016-shared-rail-readings.md` exists to prevent.
- *
- * Every message is fixed text or built from field names alone: a JSON syntax
- * error's own message quotes the document, and this document is a credential.
- */
-export function parseCodexCredential(text: string): CodexCredentialRead {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return { error: "codex credential is not valid JSON" };
-  }
-  const document = jsonObject(parsed) ?? {};
-  const refusals: string[] = [];
-  for (const shape of CODEX_SHAPES) {
-    const found = codexCredentialIn(document, shape);
-    if (found === undefined) continue;
-    if ("access" in found) return found;
-    refusals.push(found.error);
-  }
-  // A section that is there but unusable names what it was missing, which is
-  // the actionable answer; a document with neither section names both fields a
-  // file could carry, which is the one that says "this is the wrong file".
-  return {
-    error:
-      refusals[0] ??
-      `no ${PI_CODEX.section}.${PI_CODEX.access} or ${CLI_CODEX.section}.${CLI_CODEX.access}`,
-  };
-}
-
-export interface ClaudeTokenDeps {
-  /**
-   * Fallback store, consulted only when the file yields no usable token.
-   *
-   * On macOS the file is the store Claude Code *used* to write: the live token
-   * lives in the login keychain, and only Claude Code refreshes it there. A file
-   * that has gone stale is therefore the normal state for a machine driven
-   * through a bridge rather than through `claude` directly.
-   */
-  keychain?: KeychainRead;
-  /** Epoch milliseconds for the expiry comparison. Defaults to `Date.now()`. */
-  now?: number;
-}
-
-/**
- * The Claude rail's token, or why no store could supply one.
- *
- * The credential file is read first, so a healthy file behaves exactly as it
- * did before the keychain was consulted at all and an install with no keychain
- * pays nothing for it. Only when the file cannot answer — absent, unreadable,
- * shapeless, or holding an expired token — is the fallback read, and either
- * store's token wins on equal terms: the first one that yields an unexpired
- * token is the answer.
- *
- * When neither yields a token the error names both reasons, the file's first
- * and the keychain's as `; keychain: <reason>`, because "why can't the Claude
- * rail be read" is only answerable if the user learns that both stores were
- * tried and how each failed. With no fallback the note is the file's reason
- * alone.
- *
- * The reason the read failed travels beside that message. A ping is worth
- * starting when *any* store answered with an expiry — Claude Code refreshes the
- * store it writes, which on Linux is this file and on macOS is the login
- * keychain, and either one expiring is the case the ping fixes. A store that
- * could not be read at all is a different problem, a locked keychain or a
- * permission, and does not on its own call for one.
- */
-export async function readClaudeToken(
-  path: string,
-  deps: ClaudeTokenDeps = {},
-): Promise<ClaudeToken> {
-  const now = deps.now ?? Date.now();
-
-  let file: CredentialRead;
-  if (!existsSync(path)) {
-    file = { error: "no claude credentials file" };
-  } else {
-    try {
-      file = { text: await readFile(path, "utf8") };
-    } catch (err) {
-      file = { error: `unreadable claude credentials: ${(err as Error).message}` };
-    }
-  }
-  const fromFile: ClaudeToken = "text" in file ? parseClaudeToken(file.text, now) : storeFailure(file.error);
-  if ("token" in fromFile) return fromFile;
-  if (!deps.keychain) return fromFile;
-
-  const read = await deps.keychain();
-  const fromKeychain: ClaudeToken =
-    "text" in read ? parseClaudeToken(read.text, now) : storeFailure(read.error);
-  if ("token" in fromKeychain) return fromKeychain;
-  return {
-    error: `${fromFile.error}; keychain: ${fromKeychain.error}`,
-    reason: fromFile.reason === "expired" || fromKeychain.reason === "expired" ? "expired" : "unusable",
-  };
-}
+// The line a refresh verdict, or the absence of one, adds to the Claude rail's
+// note. They stay in this file rather than in `credentials.ts` because each is a
+// statement about what was *decided* — a ping skipped, a halt armed, a verdict
+// read back — and the gates that decide are still here, until they have a module
+// of their own.
 
 /** Why no ping was run, in the shape an expired rail's note carries it. */
 function skippedNote(reason: string): string {
@@ -2574,66 +1813,22 @@ function describePing(result: ClaudePing): string {
   return `refresh ping ${result.outcome}: ${result.note}`;
 }
 
-export interface ClaudeIdentity {
-  path: string;
-  mtimeMs: number;
-}
-
-/**
- * The `claude` executable name, and the extensions a Windows PATH lookup tries
- * beside it when `PATHEXT` says nothing.
- */
-const CLAUDE_EXE = "claude";
-const DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD";
-
-/**
- * Resolve the `claude` this machine's ping would run, by PATH scan (never
- * spawning it), and its mtime. Skips directories and non-executable files.
- * Returns undefined when nothing resolves.
- *
- * A scan rather than a spawn because this runs on the path that decides whether
- * a ping may run at all: asking by running would be the very request the gates
- * exist to bound. `stat` follows a symlink on purpose — the mtime that moves
- * when an install is upgraded is the target's — while `realpath` is deliberately
- * not applied, so the identity is the name this PATH would select.
- *
- * Executability is part of the identity because it is part of the lookup: the
- * shell and `execvp` skip a `claude` they cannot run and take the next name on
- * PATH, so accepting a non-executable file here would key a halt to a file no
- * ping would ever reach.
- *
- * The scan mirrors the lookup the ping's own runner performs, `execvp`'s: an
- * empty segment is the working directory and a relative one is relative to it,
- * so both are resolved against the cwd and the answer is always absolute.
- */
-export async function claudeInstall(env: NodeJS.ProcessEnv = process.env): Promise<ClaudeIdentity | undefined> {
-  const extensions =
-    process.platform === "win32"
-      ? ["", ...(env.PATHEXT ?? DEFAULT_PATHEXT).split(";").filter((ext) => ext !== "")]
-      : [""];
-  for (const segment of (env.PATH ?? "").split(delimiter)) {
-    // An empty segment means the working directory to `execvp` (and so to the
-    // ping's `execFile`), resolved here against this process's cwd; skipping it
-    // would key the halt to a different binary than the ping runs.
-    const base = segment === "" ? "." : segment;
-    for (const extension of extensions) {
-      const candidate = resolve(base, `${CLAUDE_EXE}${extension}`);
-      let found: Stats;
-      try {
-        found = await stat(candidate);
-      } catch {
-        continue;
-      }
-      if (!found.isFile()) continue;
-      if (process.platform !== "win32" && (found.mode & 0o111) === 0) continue;
-      return { path: candidate, mtimeMs: found.mtimeMs };
-    }
-  }
-  return undefined;
-}
-
 export interface DispatcherDeps {
-  fetchImpl?: typeof fetch;
+  /**
+   * The three reads, by credential shape, or `undefined` for the real ones.
+   *
+   * The seam every test above a request crosses: a policy, report or gauge test
+   * hands back a reading and never learns a vendor's URL, its document shape,
+   * or how many attempts a failure is worth. Left unset, the dispatcher builds
+   * `createRailRead` over `transport`.
+   */
+  read?: RailRead;
+  /**
+   * The one network seam, used only to build the default reads. A test that
+   * wants the real classification — the retry, the notes, a 429 — injects here;
+   * one that wants a reading injects `read`.
+   */
+  transport?: Transport;
   now?: () => number;
   /**
    * Seam: the claude install the sticky halt is keyed to. Defaults to
@@ -2722,7 +1917,7 @@ export interface DispatcherDeps {
    * The returned string is opaque provider output — not a bearer token this
    * dispatcher sends. It is used only as the signal that a refresh was
    * attempted, after which the credential file is read again; see
-   * `antigravityToken`.
+   * `createAntigravityToken`.
    *
    * Left unset, nothing is delegated and an expired credential is simply
    * unavailable. Production wires it from the extension context; a test injects
@@ -2849,7 +2044,6 @@ export function createDispatcher(
   cfg: DispatcherConfig = DEFAULT_CONFIG,
   deps: DispatcherDeps = {},
 ): Dispatcher {
-  const doFetch = deps.fetchImpl ?? fetch;
   const now = deps.now ?? (() => Date.now());
   // Merged field by field rather than spread, so an injected `undefined` reads
   // as "not stated" instead of replacing a shipped timing with one that has no
@@ -2877,24 +2071,28 @@ export function createDispatcher(
   const providerTokenTimeoutMs = deps.providerTokenTimeoutMs ?? PROVIDER_TOKEN_TIMEOUT_MS;
   const fetchWaitMs =
     deps.readings?.fetchWaitMs ??
-    pacing.attempts * pacing.timeoutMs +
-      (pacing.attempts - 1) * pacing.backoffMs +
-      Math.max(CLAUDE_PING_TIMEOUT_MS, providerTokenTimeoutMs);
+    readBoundMs(pacing) + Math.max(CLAUDE_PING_TIMEOUT_MS, providerTokenTimeoutMs);
   const readings = createSharedReadings({
     path: cfg.readingsPath,
     now,
     ...(deps.sleep === undefined ? {} : { sleep: deps.sleep }),
     pacing: { ...DEFAULT_SHARED_READINGS, ...deps.readings, fetchWaitMs },
   });
-  /**
-   * A failed read, stamped with the dispatcher's own clock at the moment it
-   * gave up. That is `readAt` — when the read gave up — not the TTL origin: the
-   * TTL counts from the cache entry's `at`, stamped at insertion after this
-   * returns.
-   */
-  function unavailable(rail: Rail, note: string): FailedReading {
-    return { rail, ok: false, windows: [], readAt: now(), note };
-  }
+  // A failed read, stamped with the dispatcher's own clock at the moment it gave
+  // up. That is `readAt` — when the read gave up — not the TTL origin: the TTL
+  // counts from the cache entry's `at`, stamped at insertion after this returns.
+  const unavailable = (rail: VendorRail, note: string) => failedReading(rail, note, now());
+
+  // The reads are the one thing a test above a request replaces. Built from the
+  // same pacing the store's waiter bound is derived from, so the numbers a
+  // caller can see cannot disagree about how long a read may take.
+  const railRead: RailRead =
+    deps.read ??
+    createRailRead({
+      pacing,
+      now,
+      ...(deps.transport === undefined ? {} : { transport: deps.transport }),
+    });
   // A `claudeCredsPath` naming anything but the default file belongs to another
   // profile, whose credential the login keychain never holds — so the fallback
   // is not offered to it.
@@ -2904,6 +2102,17 @@ export function createDispatcher(
   // The mode and the default-path rule are resolved once, here, so the read that
   // skips a ping and the plan that would run one cannot disagree about why.
   const plan = refreshPlan(cfg, deps.refreshClaude);
+  // The Antigravity credential reads its file and, when that token is expired,
+  // asks pi to renew it. Built here rather than per read so the delegated
+  // refresh is single-flight for this dispatcher, and handed the paths and the
+  // resolver the rest of this closure would otherwise have had to supply.
+  const antigravity = createAntigravityToken({
+    path: cfg.piAuthPath,
+    defaultPath: cfg.piAuthPath === DEFAULT_CONFIG.piAuthPath,
+    now,
+    ...(deps.resolveProviderToken === undefined ? {} : { resolver: deps.resolveProviderToken }),
+    ...(deps.providerTokenTimeoutMs === undefined ? {} : { timeoutMs: deps.providerTokenTimeoutMs }),
+  });
 
   // One ping in flight at a time, however many callers race `railReadings`.
   let inFlight: Promise<ClaudePing> | undefined;
@@ -2919,74 +2128,6 @@ export function createDispatcher(
   // so an `undiverted` verdict can be recorded against the install that actually
   // ran. Not tied to expiry: a usable-token read validates an existing halt too.
   const claudeIdentity = deps.claudeIdentity ?? (() => claudeInstall());
-
-  /**
-   * A vendor's usage document, read under a timeout and retried while the
-   * failure is one another attempt could fix.
-   *
-   * Every attempt carries its own `AbortSignal.timeout`, because a stalled
-   * endpoint is the worst case rather than a mild one: a request that never
-   * answers is not a request that failed, so without the bound it would hold
-   * the evaluation that `session_start` awaits for as long as the vendor felt
-   * like staying quiet.
-   *
-   * The body read is inside the attempt on purpose. The signal stays attached
-   * to the response, so a body that stalls mid-stream is abandoned by the same
-   * deadline instead of hanging past it.
-   *
-   * What comes back is either the parsed document or the note the rail is
-   * unreadable for. The note carries an attempt count only when the read was
-   * given up on: an answer another request would only repeat — a 4xx, a 429 —
-   * is reported as that answer alone. The shape problem ("no usage windows
-   * returned") is left to the caller, because a well-formed answer we cannot use
-   * is still an answer.
-   */
-  async function readUsage(
-    url: string,
-    init: RequestInit,
-  ): Promise<{ json: unknown } | { note: string }> {
-    for (let attempt = 1; ; attempt++) {
-      if (attempt > 1) await sleep(pacing.backoffMs);
-      let note: string;
-      let retry: boolean;
-      try {
-        const res = await doFetch(url, {
-          ...init,
-          signal: AbortSignal.timeout(pacing.timeoutMs),
-        });
-        if (res.ok) return { json: await res.json() };
-        note = `HTTP ${res.status}`;
-        retry = retryableStatus(res.status);
-      } catch (err) {
-        // Everything thrown here is a failure of the request or of its payload:
-        // a dropped connection, a timeout — the signal stays attached to the
-        // response, so even a body that stalls mid-stream is abandoned by the
-        // same deadline — or a body that is not JSON at all, which is what a
-        // truncated reply and a captive portal both look like.
-        note = attemptFailure(err, pacing.timeoutMs);
-        retry = true;
-      }
-      if (!retry) return { note };
-      if (attempt >= pacing.attempts) return { note: afterAttempts(note, attempt) };
-    }
-  }
-
-  /** The Claude rail's ordinary read, once a token has been supplied. */
-  async function claudeUsage(token: string): Promise<VendorReading> {
-    const read = await readUsage(CLAUDE_USAGE_URL, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "anthropic-beta": "oauth-2025-04-20",
-        Accept: "application/json",
-      },
-    });
-    if ("note" in read) return unavailable("claude", read.note);
-
-    const readAt = now();
-    const windows = parseClaudeUsage(read.json);
-    if (!windows.length) return unavailable("claude", "no usage windows returned");
-    return { rail: "claude", ok: true, windows, readAt, raw: read.json };
-  }
 
   /**
    * The line one verdict earns, and the gate it arms. `undefined` for a verdict
@@ -3152,249 +2293,28 @@ export function createDispatcher(
     return { note: expiredNote(reread.error, decision) };
   }
 
+  async function fetchCodex(): Promise<VendorReading> {
+    const credential = await readCodexCredential(cfg.codexCredsPath);
+    if ("error" in credential) return unavailable("codex", credential.error);
+    return railRead.codex(credential);
+  }
+
+  /**
+   * The one vendor request that answers for all three Antigravity pools. The
+   * credential is acquired first — including pi's delegated refresh, which is
+   * why it is not the read's job — and the read is handed the result so a
+   * credential failure is one group-wide failure rather than three.
+   */
+  async function fetchAntigravity(): Promise<AntigravityReadings> {
+    return railRead.antigravity(await antigravity.read());
+  }
+
   async function fetchClaude(): Promise<VendorReading> {
     const outcome = await claudeToken();
     if (!("token" in outcome)) return unavailable("claude", outcome.note);
-    const reading = await claudeUsage(outcome.token);
+    const reading = await railRead.claude(outcome.token);
     if (outcome.note === undefined) return reading;
     return { ...reading, note: reading.note === undefined ? outcome.note : `${reading.note}; ${outcome.note}` };
-  }
-
-  /**
-   * The Codex credential, or why the file named by `codexCredsPath` gave none.
-   *
-   * Read fresh on every fetch rather than cached here: the file belongs to
-   * whichever client writes it, and a token this process remembered would be
-   * exactly the stale one the next read has to notice.
-   *
-   * A read failure is reported by its errno, never by the error's message: the
-   * message quotes the path, and a parse failure's message could quote the
-   * document, which is a credential.
-   */
-  async function readCodexCredential(): Promise<CodexCredentialRead> {
-    if (!existsSync(cfg.codexCredsPath)) return { error: "no codex credential file" };
-    let text: string;
-    try {
-      text = await readFile(cfg.codexCredsPath, "utf8");
-    } catch (err) {
-      return {
-        error: `unreadable codex credential file: ${(err as NodeJS.ErrnoException).code ?? "read failed"}`,
-      };
-    }
-    return parseCodexCredential(text);
-  }
-
-  async function fetchCodex(): Promise<VendorReading> {
-    const credential = await readCodexCredential();
-    if ("error" in credential) return unavailable("codex", credential.error);
-
-    const read = await readUsage(CODEX_USAGE_URL, {
-      headers: {
-        Authorization: `Bearer ${credential.access}`,
-        "ChatGPT-Account-Id": credential.accountId,
-        Accept: "application/json",
-        Origin: "https://chatgpt.com",
-        Referer: "https://chatgpt.com/",
-        "User-Agent": "Mozilla/5.0",
-      },
-    });
-    if ("note" in read) return unavailable("codex", read.note);
-
-    const readAt = now();
-    const { windows, limited } = parseCodexUsage(read.json, { readAt });
-    if (!windows.length) return unavailable("codex", "no rate_limit windows returned");
-    if (!limited) return { rail: "codex", ok: true, windows, readAt, raw: read.json };
-    // `limit_reached` means blocked outright, not merely close, so every budget
-    // reads full rather than leaving a comfortable-looking percentage behind.
-    return {
-      rail: "codex",
-      ok: true,
-      windows: windows.map((w) => ({ ...w, used: 100 })),
-      readAt,
-      raw: read.json,
-      note: "limit_reached=true",
-    };
-  }
-
-  /**
-   * `auth.json`'s Antigravity entry, or why there is none.
-   *
-   * Read fresh every time, never cached here: pi is the credential's writer, and
-   * a token this process remembered would be exactly the stale one the next read
-   * has to notice.
-   *
-   * A file that cannot be read is reported by its errno rather than by the error
-   * message — the message quotes the path and, for a parse failure, could quote
-   * the document, which is a credential file.
-   */
-  async function readAntigravityFile(): Promise<AntigravityToken> {
-    if (!existsSync(cfg.piAuthPath)) return { error: "no pi auth file", reason: "unusable" };
-    let text: string;
-    try {
-      text = await readFile(cfg.piAuthPath, "utf8");
-    } catch (err) {
-      return { error: `unreadable pi auth: ${(err as NodeJS.ErrnoException).code ?? "read failed"}`, reason: "unusable" };
-    }
-    return parseAntigravityToken(text, { now: now() });
-  }
-
-  /**
-   * The one delegated provider-token refresh this dispatcher has in flight.
-   *
-   * Single-flight until the resolver *actually settles*, not until a caller stops
-   * waiting: a wait that hits `providerTokenTimeoutMs` must not start a second
-   * refresh, because pi is already doing one under its own lock and a second
-   * attempt would be a second writer racing the first. The rejection is caught
-   * here and reduced to `failed`, since an OAuth error body is not text this
-   * report may echo.
-   */
-  let delegating: Promise<"done" | "failed"> | undefined;
-  function delegatedRefresh(): Promise<"done" | "failed"> {
-    const resolver = deps.resolveProviderToken;
-    if (resolver === undefined) return Promise.resolve("failed");
-    delegating ??= (async (): Promise<"done" | "failed"> => {
-      try {
-        await resolver("antigravity");
-        return "done";
-      } catch {
-        return "failed";
-      }
-    })().finally(() => {
-      delegating = undefined;
-    });
-    return delegating;
-  }
-
-  /**
-   * Wait out one delegated refresh, but no longer than the bound.
-   *
-   * The registry offers no cancellation, so the choice is between waiting
-   * forever and leaving the refresh to finish without us. The timer is cleared
-   * either way, and the unsettled promise keeps its single-flight slot, so the
-   * refresh this process stopped waiting for is still the only one it started.
-   */
-  async function waitForProviderToken(): Promise<"done" | "failed" | "timed out"> {
-    const attempt = delegatedRefresh();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const bound = new Promise<"timed out">((done) => {
-      timer = setTimeout(() => done("timed out"), providerTokenTimeoutMs);
-      timer.unref?.();
-    });
-    try {
-      return await Promise.race([attempt, bound]);
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-    }
-  }
-
-  /**
-   * The Antigravity credential, refreshing it only by delegating to pi.
-   *
-   * Three facts decide whether a refresh may be attempted, and all three are
-   * required: the stored token is expired (the one failure a refresh fixes), the
-   * auth file is the default one (the one pi's registered provider owns), and a
-   * resolver is wired. A non-default path names somebody else's profile, and
-   * refreshing *this* machine's provider says nothing about it — the same
-   * restriction ADR 0007 puts on the Claude ping.
-   *
-   * What is returned after a delegation is the re-read file, not the resolver's
-   * own string: the refresh is only useful if it persisted something this
-   * process can use, and the provider's return value is a JSON credential
-   * document in pi's internal shape rather than a token.
-   */
-  async function antigravityToken(): Promise<AntigravityToken> {
-    const first = await readAntigravityFile();
-    if ("token" in first) return first;
-    if (first.reason !== "expired") return first;
-    if (deps.resolveProviderToken === undefined) {
-      return { error: `${first.error}; no provider token resolver is available`, reason: "expired" };
-    }
-    if (cfg.piAuthPath !== DEFAULT_CONFIG.piAuthPath) {
-      return {
-        error: `${first.error}; the pi auth file is not the default one, so no refresh was delegated`,
-        reason: "expired",
-      };
-    }
-    const outcome = await waitForProviderToken();
-    const reread = await readAntigravityFile();
-    if ("token" in reread) return reread;
-    const decision =
-      outcome === "failed"
-        ? "the delegated refresh failed"
-        : outcome === "timed out"
-          ? "the delegated refresh did not finish in time"
-          : "the delegated refresh produced no usable token";
-    // The re-read's own reason, not the first read's: a file that became
-    // unreadable, or lost its `antigravity` entry, while the refresh ran is what
-    // the user has to act on now.
-    return { error: `${reread.error}; ${decision}`, reason: "expired" };
-  }
-
-  /** The three pools one summary describes; a pool it said nothing about is that pool's own failure. */
-  function antigravityReadings(
-    windows: Record<AntigravityRail, RailWindow[]>,
-    readAt: number,
-    raw: unknown,
-  ): AntigravityReadings {
-    const pool = <R extends AntigravityRail>(rail: R): VendorReading & { rail: R } => {
-      const found = windows[rail];
-      if (!found.length) return { rail, ok: false, windows: [], readAt, note: "no usage windows returned" };
-      return { rail, ok: true, windows: found, readAt, raw };
-    };
-    return {
-      "antigravity-argon": pool("antigravity-argon"),
-      "antigravity-gemini": pool("antigravity-gemini"),
-      "antigravity-3p": pool("antigravity-3p"),
-    };
-  }
-
-  /**
-   * One failure for the whole group, stamped once.
-   *
-   * A credential or transport failure happened once, at one instant; giving each
-   * pool its own `now()` would date one failure three ways. `raw` is absent, not
-   * carried from an earlier read: a failure reports why it failed and nothing
-   * else.
-   */
-  function antigravityFailedGroup(note: string, readAt: number): AntigravityReadings {
-    const pool = <R extends AntigravityRail>(rail: R): VendorReading & { rail: R } => ({
-      rail,
-      ok: false,
-      windows: [],
-      readAt,
-      note,
-    });
-    return {
-      "antigravity-argon": pool("antigravity-argon"),
-      "antigravity-gemini": pool("antigravity-gemini"),
-      "antigravity-3p": pool("antigravity-3p"),
-    };
-  }
-
-  /**
-   * The one vendor request that answers for all three Antigravity pools.
-   *
-   * The body carries the project only when the credential names one, an empty
-   * object otherwise: a `{"project": ""}` would ask the vendor about a project
-   * that has no id. The `User-Agent` is the pinned one, whose default is what
-   * makes the vendor report the Argon pool at all.
-   */
-  async function fetchAntigravity(): Promise<AntigravityReadings> {
-    const credential = await antigravityToken();
-    if (!("token" in credential)) return antigravityFailedGroup(credential.error, now());
-    const read = await readUsage(ANTIGRAVITY_QUOTA_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${credential.token}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "User-Agent": antigravityUserAgent(),
-      },
-      body: JSON.stringify(credential.projectId === undefined ? {} : { project: credential.projectId }),
-    });
-    const readAt = now();
-    if ("note" in read) return antigravityFailedGroup(read.note, readAt);
-    return antigravityReadings(parseAntigravityUsage(read.json), readAt, read.json);
   }
 
   /**
@@ -3455,7 +2375,7 @@ export function createDispatcher(
       try {
         return await fetchAntigravity();
       } catch {
-        return antigravityFailedGroup("antigravity read failed", now());
+        return poolFailure("antigravity read failed", now());
       }
     };
   }

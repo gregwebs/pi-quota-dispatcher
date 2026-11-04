@@ -11,9 +11,6 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import extension, {
   type AgentFile,
   type NamedAgentFile,
-  type ConfigFile,
-  type ConfigFileFault,
-  type ModelMiss,
   agentTableSnippet,
   describeAgentFiles,
   readAgentFiles,
@@ -21,6 +18,13 @@ import extension, {
   unknownModelsNotice,
   unusableConfigNotice,
 } from "../src/index.ts";
+import {
+  type ConfigFile,
+  type ConfigFileFault,
+} from "../src/config.ts";
+import {
+  type ModelMiss,
+} from "../src/models.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
 // documented literal directly.

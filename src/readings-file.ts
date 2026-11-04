@@ -52,6 +52,7 @@ import { READINGS_FILE_NAME } from "./config.ts";
 import { ANTIGRAVITY_RAILS, isAntigravityRail, isRail, type AntigravityRail } from "./rail.ts";
 import {
   decodeReading,
+  type AntigravityReadings,
   type GoodReading,
   type VendorRail,
   type VendorRailReadings,
@@ -126,19 +127,6 @@ export const DEFAULT_SHARED_READINGS: Omit<SharedReadingsPacing, "fetchWaitMs"> 
   writeWaitMs: 3_000,
   pollMs: 25,
   staleMs: 10_000,
-};
-
-/**
- * What one Antigravity fetch answers: all three pool rails, each correlated with
- * its own rail.
- *
- * One type for three results because one vendor request produces them — the
- * buckets of a single `retrieveUserQuotaSummary` body are partitioned across the
- * pools. It is the *fetch*'s answer, not history: which of a pool's earlier
- * readings survives is the store's business.
- */
-export type AntigravityReadings = {
-  readonly [R in AntigravityRail]: VendorReading & { readonly rail: R };
 };
 
 /**

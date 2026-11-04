@@ -5,18 +5,27 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import {
-  type CommandRunner,
+  createDispatcher,
+} from "../src/index.ts";
+import {
+  DEFAULT_CONFIG,
+} from "../src/config.ts";
+import {
   type KeychainRead,
   CLAUDE_KEYCHAIN_SERVICE,
-  DEFAULT_CONFIG,
-  createDispatcher,
-  isDefaultClaudeCredsPath,
   keychainReader,
   parseClaudeToken,
   parseCodexCredential,
   readClaudeToken,
-} from "../src/index.ts";
+} from "../src/credentials.ts";
+import {
+  type CommandRunner,
+} from "../src/exec.ts";
+import {
+  isDefaultClaudeCredsPath,
+} from "../src/refresh.ts";
 import { agentTable, routeOf } from "./helpers/identifiers.ts";
+import { fakeReads, readingOf } from "./helpers/rails.ts";
 
 // This file pins the credential-store contract: the macOS login keychain is the
 // live home of the Claude subscription credential, the on-disk file is a legacy
@@ -367,46 +376,6 @@ async function fixture(models: Record<string, string>): Promise<Fixture> {
   return { agentDir, claudeCredsPath, piAuthPath, codexCredsPath: piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
 }
 
-interface StubReadings {
-  claude?: { session?: number; weekly?: number };
-  codex?: { session?: number; weekly?: number };
-}
-
-/** The only network boundary; records the bearer token and account each call carried. */
-function stubFetch(opts: StubReadings = {}, seenAuth: string[] = [], seenAccount: string[] = []) {
-  return (async (url: string | URL, init?: { headers?: Record<string, string> }) => {
-    const u = String(url);
-    const auth = init?.headers?.Authorization;
-    if (auth) seenAuth.push(auth);
-    const account = init?.headers?.["ChatGPT-Account-Id"];
-    if (account) seenAccount.push(account);
-    if (u.includes("anthropic.com")) {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
-          five_hour: { utilization: opts.claude?.session ?? 0 },
-          seven_day: { utilization: opts.claude?.weekly ?? 0 },
-        }),
-      };
-    }
-    if (u.includes("chatgpt.com")) {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
-          rate_limit: {
-            limit_reached: false,
-            primary_window: { used_percent: opts.codex?.session ?? 0, limit_window_seconds: 18000, reset_after_seconds: 3600 },
-            secondary_window: { used_percent: opts.codex?.weekly ?? 0, limit_window_seconds: 604800, reset_after_seconds: 400000 },
-          },
-        }),
-      };
-    }
-    throw new Error(`unexpected url ${u}`);
-  }) as unknown as typeof fetch;
-}
-
 test("a stale file with a working keychain leaves the claude rail available", async () => {
   const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
   await writeFile(
@@ -423,7 +392,18 @@ test("a stale file with a working keychain leaves the claude rail available", as
   };
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch({ claude: { session: 42 }, codex: { session: 10 } }, seenAuth), readKeychain },
+    {
+      // The read receives the credential, so this records the token the
+      // dispatcher ended up with — the keychain's, if the file's was stale.
+      read: fakeReads({
+        claude: (token) => {
+          seenAuth.push(token);
+          return readingOf("claude", { session: 42 });
+        },
+        codex: readingOf("codex", { session: 10 }),
+      }),
+      readKeychain,
+    },
   );
 
   const lines = await d.report({ force: true });
@@ -435,7 +415,7 @@ test("a stale file with a working keychain leaves the claude rail available", as
   );
   assert.equal(keychainCalls, 1, "the stale file must send the read to the keychain");
   // The keychain token is what actually authorized the usage call.
-  assert.ok(seenAuth.includes("Bearer live-keychain"), seenAuth.join(", "));
+  assert.ok(seenAuth.includes("live-keychain"), seenAuth.join(", "));
 });
 
 test("with both stores failing the claude rail is unavailable and its agent is held", async () => {
@@ -448,7 +428,10 @@ test("with both stores failing the claude rail is unavailable and its agent is h
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, agents: AGENT_ROUTES },
     {
-      fetchImpl: stubFetch({ claude: { session: 95 }, codex: { session: 10 } }),
+      read: fakeReads({
+        claude: readingOf("claude", { session: 95 }),
+        codex: readingOf("codex", { session: 10 }),
+      }),
       readKeychain: async () => ({ error: "keychain unavailable" }),
     },
   );
@@ -502,14 +485,25 @@ test("the codex rail reads a file codexCredsPath names, in the Codex CLI's shape
   const seenAccount: string[] = [];
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, codexCredsPath, agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch({ claude: { session: 5 }, codex: { session: 10 } }, seenAuth, seenAccount) },
+    {
+      // The account id is what selects whose usage is asked about, so it is
+      // asserted on the credential the read received rather than on a header.
+      read: fakeReads({
+        claude: readingOf("claude", { session: 5 }),
+        codex: (credential) => {
+          seenAuth.push(credential.access);
+          seenAccount.push(credential.accountId);
+          return readingOf("codex", { session: 10 });
+        },
+      }),
+    },
   );
 
   const lines = await d.report({ force: true });
   assert.ok(lines.some((l) => l.startsWith("codex: 5h 10%")), lines.join("\n"));
   // The token and the account both came from that file: one without the other
   // would read the wrong account's headroom or none.
-  assert.ok(seenAuth.includes("Bearer cli-token"), seenAuth.join(", "));
+  assert.ok(seenAuth.includes("cli-token"), seenAuth.join(", "));
   assert.ok(seenAccount.includes("cli-account"), seenAccount.join(", "));
 });
 
@@ -528,7 +522,7 @@ test("an absent codexCredsPath file is the failure, even with a usable pi auth f
       ...DEFAULT_CONFIG, ...fx, agents: AGENT_ROUTES,
       codexCredsPath: join(dirname(fx.piAuthPath), "nothing-here.json"),
     },
-    { fetchImpl: stubFetch({ codex: { session: 10 } }) },
+    { read: fakeReads({ codex: readingOf("codex", { session: 10 }) }) },
   );
 
   const lines = await d.report({ force: true });
@@ -550,7 +544,7 @@ test("a codex credential failure never quotes the document", async () => {
   await writeFile(broken, '{"tokens": {"access_token": "sk-secret-', "utf8");
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, codexCredsPath: broken, agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch({ claude: { session: 5 } }) },
+    { read: fakeReads({ claude: readingOf("claude", { session: 5 }) }) },
   );
 
   const lines = await d.report({ force: true });

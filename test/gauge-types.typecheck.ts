@@ -11,7 +11,11 @@
  * The guarantees: a stale budget cannot carry a countdown, and a fresh budget
  * cannot omit the decision about one.
  */
-import type { BudgetGauge, GaugeEntry, StaleBudgetGauge } from "../src/index.ts";
+import {
+  type BudgetGauge,
+  type GaugeEntry,
+  type StaleBudgetGauge,
+} from "../src/rail-gauge.ts";
 
 // A stale reading's reset instant came from a read that is already old, so a
 // countdown computed from it would look fresh about a figure that is not. The

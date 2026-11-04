@@ -6,22 +6,28 @@ import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 
 import {
-  DEFAULT_CONFIG,
-  READINGS_FILE_VERSION,
   createDispatcher,
   type PassReadings,
   railGauge,
 } from "../src/index.ts";
 import {
-  parseClaudeUsage,
-  parseCodexUsage,
+  DEFAULT_CONFIG,
+} from "../src/config.ts";
+import {
+  READINGS_FILE_VERSION,
+} from "../src/readings-file.ts";
+import type { AntigravityRail } from "../src/rail.ts";
+import {
+  type AntigravityReadings,
   type GoodReading,
   type MeteredReading,
   type RailReading,
   type RailReadings,
+  type VendorReading,
 } from "../src/rail-reading.ts";
 
 import { agentTable, routeOf } from "./helpers/identifiers.ts";
+import { failureOf, fakeReads, poolFailure, poolGroup, readingOf, type Used } from "./helpers/rails.ts";
 
 const NOW = 1_730_123_456_789;
 const TTL = 10_000;
@@ -42,17 +48,6 @@ const meteredWithLastGood: RailReadings = { latest: meteredReading, lastGood: de
 // name another one.
 // @ts-expect-error
 const meteredClaude: MeteredReading = { rail: "claude", ok: true, windows: [], metered: true };
-
-function bodyFor(rail: LiveRail, session = 93, weekly = 21) {
-  const account = { email: "private-reading@example.invalid", metadata: ["account-detail-never-print"] };
-  return rail === "claude"
-    ? { account, five_hour: { utilization: session }, seven_day: { utilization: weekly } }
-    : { account, rate_limit: {
-        limit_reached: false,
-        primary_window: { used_percent: session, limit_window_seconds: 18000 },
-        secondary_window: { used_percent: weekly, limit_window_seconds: 604800 },
-      } };
-}
 
 async function fixture(t: TestContext, opts: { antigravity?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), "pqd-readings-"));
@@ -75,31 +70,63 @@ async function fixture(t: TestContext, opts: { antigravity?: boolean } = {}) {
 
   const probe = {
     clock: NOW,
-    bodies: { claude: bodyFor("claude"), codex: bodyFor("codex", 3, 4) } as Record<LiveRail, unknown>,
+    /** What each rail's next read reports, by budget. */
+    used: { claude: { session: 93, weekly: 21 }, codex: { session: 3, weekly: 4 } } as Record<LiveRail, Used>,
+    /** The reading the last read produced, so a raw body's identity can be pinned. */
+    rails: {} as Record<LiveRail, VendorReading>,
     failed: { claude: false, codex: false },
     calls: { claude: 0, codex: 0 },
-    /** Antigravity requests, counted apart so the two-vendor assertions stay exact. */
+    /** Antigravity reads, counted apart so the two-vendor assertions stay exact. */
     antigravityCalls: 0,
+    /** The three pools' one answer, stamped when it is read. */
+    poolUsed: {} as Partial<Record<AntigravityRail, Used>>,
+    /** Overrides a rail's answer for one test; the counters above still run. */
+    answer: {} as Partial<Record<LiveRail | "antigravity", (call: number) => VendorReading | AntigravityReadings>>,
     // A hook the concurrency test installs; the stub awaits it before answering,
     // so a test can hold both reads in flight at once. Undefined everywhere else.
     beforeRespond: undefined as undefined | ((rail: LiveRail) => Promise<void>),
     /** The extension's observer, installed here so a test can watch each pass. */
     onReadings: undefined as undefined | ((pass: PassReadings) => void),
   };
-  // A definite HTTP answer avoids retries or real-time backoff in cache tests.
-  const fetchImpl = (async (url: string | URL) => {
-    const u = String(url);
-    if (u.includes("cloudcode-pa.googleapis.com")) {
+  const answerFor = (rail: LiveRail, call: number): VendorReading => {
+    // A failed rail fails whatever else a test installed: that is the read's
+    // answer, and what is behind it does not matter.
+    if (probe.failed[rail]) return failureOf(rail, "HTTP 429", probe.clock);
+    const override = probe.answer[rail];
+    return override === undefined
+      ? readingOf(rail, probe.used[rail], probe.clock)
+      : (override(call) as VendorReading);
+  };
+  const read = fakeReads({
+    claude: async (_token, call) => {
+      probe.calls.claude++;
+      if (probe.beforeRespond) await probe.beforeRespond("claude");
+      return (probe.rails.claude = answerFor("claude", call));
+    },
+    codex: async (_credential, call) => {
+      probe.calls.codex++;
+      if (probe.beforeRespond) await probe.beforeRespond("codex");
+      return (probe.rails.codex = answerFor("codex", call));
+    },
+    antigravity: (credential) => {
+      // A credential the fixture does not carry is a group-wide failure with no
+      // request, which is what an install without that provider gets — and the
+      // reason this fixture's pool count is zero by default.
+      if (!("token" in credential)) return poolFailure(credential.error, probe.clock);
       probe.antigravityCalls++;
-      return { ok: true, status: 200, json: async () => antigravityBody() };
-    }
-    const rail = u.includes("anthropic.com") ? "claude" : u.includes("chatgpt.com") ? "codex" : undefined;
-    assert.ok(rail, `unexpected network request: ${u}`);
-    probe.calls[rail]++;
-    if (probe.beforeRespond) await probe.beforeRespond(rail);
-    return { ok: !probe.failed[rail], status: probe.failed[rail] ? 429 : 200, json: async () => probe.bodies[rail] };
-  }) as unknown as typeof fetch;
+      const override = probe.answer.antigravity;
+      if (override !== undefined) return override(1) as AntigravityReadings;
+      return poolGroup(probe.poolUsed, probe.clock);
+    },
+  });
   const readingsPath = join(root, "quota-dispatch-readings.json");
+  // One answer for the three pools: the percentages the old document fixture
+  // reported, so a stored reading can never be mistaken for a fresh one.
+  probe.poolUsed = {
+    "antigravity-argon": { weekly: 0 },
+    "antigravity-gemini": { session: 42, weekly: 12 },
+    "antigravity-3p": { session: 0, weekly: 2 },
+  };
   const dispatcher = createDispatcher({
     // This fixture carries the Codex credential in pi's own auth file, which is
     // what `codexCredsPath` names by default (ADR 0020).
@@ -107,34 +134,12 @@ async function fixture(t: TestContext, opts: { antigravity?: boolean } = {}) {
     readingsPath,
     agents: agentTable({ planner: routeOf({ primary: { model: PRIMARY, rail: "claude" }, alternates: [{ model: ALTERNATE, rail: "codex" }] }) }),
   }, {
-    fetchImpl,
+    read,
     now: () => probe.clock,
     readKeychain: async () => ({ error: "no keychain" }),
     onReadings: (pass) => probe.onReadings?.(pass),
   });
   return { dispatcher, probe, agentFile, piAuthPath, readingsPath };
-}
-
-/**
- * One `retrieveUserQuotaSummary` body: a week and a session for each of the two
- * pools that carry both, and a week alone for Argon.
- */
-function antigravityBody(geminiSession = 42): unknown {
-  const weekly = "2026-11-05T16:46:22Z";
-  const session = "2026-10-29T21:46:22Z";
-  const bucket = (bucketId: string, window: string, used: number, resetTime: string) => ({
-    bucketId,
-    window,
-    resetTime,
-    remainingFraction: 1 - used / 100,
-  });
-  return {
-    groups: [
-      { displayName: "Gemini Models", buckets: [bucket("gemini-weekly", "weekly", 12, weekly), bucket("gemini-5h", "5h", geminiSession, session)] },
-      { displayName: "Gemini 4 Argon", buckets: [bucket("gemini-argon-wtu-weekly", "weekly", 0, weekly)] },
-      { displayName: "Claude and GPT models", buckets: [bucket("3p-weekly", "weekly", 2, weekly)] },
-    ],
-  };
 }
 
 function good(reading: RailReading): GoodReading {
@@ -152,81 +157,11 @@ function withLastGood(readings: RailReadings): { latest: RailReading; lastGood?:
   return readings;
 }
 
-test("Claude resets are absolute epoch milliseconds, including fractional +00:00 timestamps", () => {
-  const sessionReset = "2024-11-02T03:04:05.123456+00:00";
-  const weeklyReset = "2024-11-08T06:07:08Z";
-  assert.deepEqual(parseClaudeUsage({
-    five_hour: { utilization: 13, resets_at: sessionReset },
-    seven_day: { utilization: 29, resets_at: weeklyReset },
-    seven_day_sonnet: { utilization: 41, resets_at: sessionReset },
-  }), [
-    { label: "5h", used: 13, budget: "session", resetsAt: Date.parse(sessionReset) },
-    { label: "7d", used: 29, budget: "weekly", resetsAt: Date.parse(weeklyReset) },
-    { label: "7d Sonnet", used: 41, budget: "weekly", resetsAt: Date.parse(sessionReset) },
-  ]);
-});
-
-test("Claude omits absent and unparseable resets instead of undefined keys or relative resets", () => {
-  const windows = parseClaudeUsage({
-    five_hour: { utilization: 13 },
-    seven_day: { utilization: 29, resets_at: "not-a-date" },
-  });
-  assert.deepEqual(windows, [
-    { label: "5h", used: 13, budget: "session" },
-    { label: "7d", used: 29, budget: "weekly" },
-  ]);
-  for (const window of windows) assert.ok(!("resetsInSeconds" in window));
-});
-
-test("Codex anchors both resets to a nonzero readAt even when limit_reached is true", () => {
-  const readAt = NOW + 12_345;
-  assert.deepEqual(parseCodexUsage({ rate_limit: {
-    limit_reached: true,
-    primary_window: { used_percent: 17, limit_window_seconds: 18000, reset_after_seconds: 0 },
-    secondary_window: { used_percent: 38, limit_window_seconds: 604800, reset_after_seconds: 408848 },
-  } }, { readAt }), {
-    limited: true,
-    windows: [
-      { label: "5h", used: 17, budget: "session", resetsAt: readAt },
-      { label: "7d", used: 38, budget: "weekly", resetsAt: readAt + 408_848_000 },
-    ],
-  });
-});
-
-test("Codex omits an unreported reset without losing the other window's absolute reset", () => {
-  assert.deepEqual(parseCodexUsage({ rate_limit: {
-    limit_reached: false,
-    primary_window: { used_percent: 6, reset_after_seconds: 3600 },
-    secondary_window: { used_percent: 42 },
-  } }, { readAt: NOW }), {
-    limited: false,
-    windows: [
-      { label: "5h", used: 6, budget: "session", resetsAt: NOW + 3_600_000 },
-      { label: "7d", used: 42, budget: "weekly" },
-    ],
-  });
-});
-
-test("Codex drops a derived reset that is not an instant a Date can hold", () => {
-  const { windows } = parseCodexUsage({ rate_limit: {
-    limit_reached: false,
-    // `1e308` seconds overflows the product to `Infinity`; `1e13` seconds is
-    // finite but lands past the `Date` range (`8.64e15` ms). Both are valid JSON
-    // and pass `num`, so only the derived instant can reject them.
-    primary_window: { used_percent: 6, reset_after_seconds: 1e308 },
-    secondary_window: { used_percent: 42, reset_after_seconds: 1e13 },
-  } }, { readAt: NOW });
-  assert.deepEqual(windows, [
-    { label: "5h", used: 6, budget: "session" },
-    { label: "7d", used: 42, budget: "weekly" },
-  ]);
-});
-
 for (const rail of ["claude", "codex"] as const) {
   test(`${rail} successful reads keep the identical raw body that supplied their windows`, async (t) => {
     const { dispatcher, probe } = await fixture(t);
     const first = good((await dispatcher.railReadings(rail, true)).latest);
-    assert.equal(first.raw, probe.bodies[rail]);
+    assert.equal(first, probe.rails[rail], "the reading the read produced, untouched");
     assert.equal(first.readAt, NOW);
     const session = rail === "claude" ? 93 : 3;
     const weekly = rail === "claude" ? 21 : 4;
@@ -235,9 +170,9 @@ for (const rail of ["claude", "codex"] as const) {
       { label: "7d", used: weekly, budget: "weekly" },
     ]);
     probe.clock += 200;
-    probe.bodies[rail] = bodyFor(rail, 7, 11);
+    probe.used[rail] = { session: 7, weekly: 11 };
     const second = good((await dispatcher.railReadings(rail, true)).latest);
-    assert.equal(second.raw, probe.bodies[rail]);
+    assert.equal(second, probe.rails[rail]);
     assert.notEqual(second.raw, first.raw);
     assert.equal(second.readAt, NOW + 200);
     assert.deepEqual(second.windows.map((w) => w.used), [7, 11]);
@@ -246,7 +181,7 @@ for (const rail of ["claude", "codex"] as const) {
   test(`${rail} retains the earlier lastGood through failures and replaces it on recovery`, async (t) => {
     const { dispatcher, probe } = await fixture(t);
     const first = good((await dispatcher.railReadings(rail, true)).latest);
-    const earlierBody = probe.bodies[rail];
+    const earlierRaw = first.raw;
     probe.failed[rail] = true;
     probe.clock += 500;
     const failed = withLastGood(await dispatcher.railReadings(rail, true));
@@ -256,21 +191,21 @@ for (const rail of ["claude", "codex"] as const) {
     assert.ok(!("raw" in failed.latest));
     assert.equal(failed.lastGood, first);
     assert.equal(failed.lastGood.readAt, NOW);
-    assert.equal(failed.lastGood.raw, earlierBody);
+    assert.equal(failed.lastGood.raw, earlierRaw);
     assert.deepEqual(failed.lastGood.windows, first.windows);
 
     probe.clock += 500;
     const failedAgain = withLastGood(await dispatcher.railReadings(rail, true));
     assert.equal(failedAgain.lastGood, first, "consecutive failures cannot erase the success");
     probe.failed[rail] = false;
-    probe.bodies[rail] = bodyFor(rail, 8, 15);
+    probe.used[rail] = { session: 8, weekly: 15 };
     probe.clock += 500;
     const recovered = withLastGood(await dispatcher.railReadings(rail, true));
     assert.equal(recovered.latest, recovered.lastGood);
     assert.notEqual(recovered.lastGood, first);
     const latest = good(recovered.latest);
     assert.equal(latest.readAt, NOW + 1500);
-    assert.equal(latest.raw, probe.bodies[rail]);
+    assert.equal(latest, probe.rails[rail]);
     assert.deepEqual(latest.windows.map((w) => w.used), [8, 15]);
   });
 
@@ -310,25 +245,16 @@ for (const rail of ["claude", "codex"] as const) {
 
 test("the TTL starts when the finished reading is stored, not when the response arrived", async (t) => {
   const { dispatcher, probe } = await fixture(t);
-  let advanced = false;
-  const body = bodyFor("claude") as Record<string, any>;
-  Object.defineProperty(body.five_hour, "utilization", {
-    // A getter is a legitimate way to model parse time: this is the field the
-    // parser reads, and that read advances the injected clock past `ttlMs`
-    // before `railReadings` reaches its `cache.set`. A plain value could not
-    // show the difference between stamping the TTL at arrival (`readAt`) and
-    // stamping it at storage — the bug this pins.
-    get() {
-      if (!advanced) {
-        advanced = true;
-        probe.clock += TTL + 1;
-      }
-      return 93;
-    },
-    enumerable: true,
-    configurable: true,
-  });
-  probe.bodies.claude = body;
+  // The read answers with a reading stamped at NOW and then lets the clock run
+  // past `ttlMs` before `railReadings` reaches its `cache.set` — which is what a
+  // slow parse or a slow credential step looks like from the store's side. A TTL
+  // stamped at arrival (`readAt`) would already be lapsed by the time it is
+  // stored; one stamped at storage is not.
+  probe.answer.claude = () => {
+    const reading = readingOf("claude", { session: 93, weekly: 21 }, NOW);
+    probe.clock += TTL + 1;
+    return reading;
+  };
   const first = await dispatcher.railReadings("claude");
   const second = await dispatcher.railReadings("claude");
   assert.equal(probe.calls.claude, 1, "parsing must not eat into the TTL");
@@ -337,12 +263,17 @@ test("the TTL starts when the finished reading is stored, not when the response 
 
 test("a Codex limit_reached read reports every window full while raw keeps the vendor's document", async (t) => {
   const { dispatcher, probe } = await fixture(t);
-  const vendorBody = { ...bodyFor("codex"), rate_limit: {
-    limit_reached: true,
-    primary_window: { used_percent: 17, limit_window_seconds: 18000 },
-    secondary_window: { used_percent: 38, limit_window_seconds: 604800 },
-  } };
-  probe.bodies.codex = vendorBody;
+  // What the read made of a `limit_reached` document: every budget full, the
+  // note gone with it, and the vendor's document kept as `raw` — its own 17 and
+  // 38 still in there, so a reader is not promised that the windows are an
+  // arithmetic restatement of the body. The document itself is
+  // `rail-read.test.ts`'s.
+  const vendorBody = { rate_limit: { primary_window: { used_percent: 17 }, secondary_window: { used_percent: 38 } } };
+  probe.answer.codex = () => ({
+    ...readingOf("codex", { session: 100, weekly: 100 }, probe.clock),
+    raw: vendorBody,
+    note: "limit_reached=true",
+  });
 
   const readings = withLastGood(await dispatcher.railReadings("codex", true));
   const latest = good(readings.latest);
@@ -413,17 +344,29 @@ test("evaluate holds after success to failure rather than assigning an attractiv
 test("report uses latest rail lines and never exposes raw account details or absolute resets", async (t) => {
   const { dispatcher, probe } = await fixture(t);
   const resetText = "2024-11-02T03:04:05.123456+00:00";
-  probe.bodies.claude = { ...bodyFor("claude"), five_hour: { utilization: 93, resets_at: resetText } };
-  probe.bodies.codex = { ...bodyFor("codex", 3, 4), rate_limit: {
-    limit_reached: false,
-    primary_window: { used_percent: 3, reset_after_seconds: 3600 },
-    secondary_window: { used_percent: 4 },
-  } };
+  // The account details and the absolute reset are in the reading, as a real
+  // one carries them; the report is what must not repeat either.
+  const account = { email: "private-reading@example.invalid", metadata: ["account-detail-never-print"] };
+  probe.answer.claude = (): VendorReading => ({
+    ...readingOf("claude", { session: 93, weekly: 21 }, probe.clock),
+    windows: [
+      { label: "5h", used: 93, budget: "session", resetsAt: Date.parse(resetText) },
+      { label: "7d", used: 21, budget: "weekly" },
+    ],
+    raw: account,
+  } as VendorReading);
+  probe.answer.codex = (): VendorReading => ({
+    ...readingOf("codex", { session: 3, weekly: 4 }, probe.clock),
+    windows: [
+      { label: "5h", used: 3, budget: "session", resetsAt: NOW + 3_600_000 },
+      { label: "7d", used: 4, budget: "weekly" },
+    ],
+  } as VendorReading);
   const assertPrivate = (lines: string[]) => {
     const text = lines.join("\n");
     for (const secret of ["private-reading@example.invalid", "account-detail-never-print", resetText,
       String(Date.parse(resetText)), String(NOW + 3_600_000), "resetsAt", "resets_at", "reset_after_seconds",
-      JSON.stringify(probe.bodies.claude), JSON.stringify(probe.bodies.codex)]) {
+      JSON.stringify(account)]) {
       assert.ok(!text.includes(secret), `report leaked ${secret}`);
     }
   };
@@ -483,7 +426,7 @@ test("knownReadings returns an entry older than ttlMs as it is, without a fetch"
   // Far past the TTL: `railReadings` would re-read both now. What is already
   // known is what the generator is fed, whatever its age.
   probe.clock += TTL * 100;
-  probe.bodies.claude = bodyFor("claude", 1, 1);
+  probe.used.claude = { session: 1, weekly: 1 };
   const known = await dispatcher.knownReadings();
   assert.deepEqual(probe.calls, { claude: 1, codex: 1 }, "an aged entry must not be re-read");
   assert.deepEqual(known.claude, claude);
@@ -612,9 +555,9 @@ test("knownReadings warms a partial Antigravity group once, so its siblings cann
   );
   assert.deepEqual(new Set(latest.map((r) => r.readAt)), new Set([NOW]), "one vendor answer, one instant");
   assert.deepEqual(latest.map((r) => r.windows.map((w) => [w.label, w.used])), [
-    [["gemini-argon-wtu-weekly", 0]],
-    [["gemini-weekly", 12], ["gemini-5h", 42]],
-    [["3p-weekly", 2]],
+    [["7d", 0]],
+    [["5h", 42], ["7d", 12]],
+    [["5h", 0], ["7d", 2]],
   ]);
 });
 

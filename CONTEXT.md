@@ -86,8 +86,17 @@ several. A rail is per-pool, not per-provider or per-account: several model
 prefixes can draw on the same rail, and one account can back more than one rail.
 _Avoid_: provider, plan, account, budget
 
+**Rail read**:
+The one vendor request that produces a **rail reading**, and the rails it answers
+for: one rail where the vendor reports per account, or the three Antigravity
+pools together. Its unit is a source, not a rail, so a pool group's read is one
+read and never three. A read that failed still produced a reading — a failed one
+— and a read never judges what it reports.
+_Avoid_: quota read, fetch, poll, vendor call. See
+[docs/adr/0021](docs/adr/0021-a-rail-read-is-its-own-module.md).
+
 **Rail reading**:
-What one quota read reports for one rail: each window the vendor reported, how
+What one **rail read** reports for one rail: each window the vendor reported, how
 much of it is used, which budget it counts toward and when it resets — or why
 the read failed. A rail does not have to carry both budgets: one whose pool has
 no **session budget** or no **weekly budget** simply reports no window for it,

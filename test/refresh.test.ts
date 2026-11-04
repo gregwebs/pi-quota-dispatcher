@@ -6,16 +6,21 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { agentTable, routeOf } from "./helpers/identifiers.ts";
+import { fakeReads, readingOf } from "./helpers/rails.ts";
 
 // Types are erased, so this import does not evaluate `src/index.ts`; the value
 // import below is dynamic and deliberately happens after `HOME` is redirected.
-import type {
-  ClaudeRefresh,
-  CommandRunner,
-  KeychainRead,
-  PingListener,
-  PingListenerFactory,
-} from "../src/index.ts";
+import {
+  type KeychainRead,
+} from "../src/credentials.ts";
+import {
+  type CommandRunner,
+} from "../src/exec.ts";
+import {
+  type ClaudeRefresh,
+  type PingListener,
+  type PingListenerFactory,
+} from "../src/refresh.ts";
 
 // This file pins the refresh-ping contract (issue #30): the argv a ping runs,
 // the verdict each way a run can end, the loopback listener the diversion lands
@@ -77,22 +82,27 @@ async function claudeInvocations(): Promise<number> {
   }
 }
 
+// Loaded after the environment is set, and module by module: the entry point no
+// longer carries anyone else's names, and `DEFAULT_CONFIG` is a load-time
+// snapshot of the home directory this file just moved.
 const {
-  CLAUDE_PING_COOLDOWN_MS,
   CLAUDE_REFRESH_MODES,
   DEFAULT_CONFIG,
+  defaultConfig,
+  describeConfig,
+  isClaudeRefreshMode,
+  mergeConfig,
+} = await import("../src/config.ts");
+const {
+  CLAUDE_PING_COOLDOWN_MS,
   claudePingArgs,
   claudePingEnv,
   claudeRefresher,
-  createDispatcher,
-  defaultConfig,
-  describeConfig,
-  execFileRunner,
-  isClaudeRefreshMode,
   loopbackListener,
-  mergeConfig,
   refreshPlan,
-} = await import("../src/index.ts");
+} = await import("../src/refresh.ts");
+const { execFileRunner } = await import("../src/exec.ts");
+const { createDispatcher } = await import("../src/index.ts");
 
 // ---------------------------------------------------------------- fixtures
 
@@ -709,39 +719,6 @@ async function fixture(plannerModel = "claude-bridge/claude-opus-5-5"): Promise<
   return { agentDir, claudeCredsPath, piAuthPath, codexCredsPath: piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
 }
 
-/** The only network boundary; records the bearer token each call carried. */
-function stubFetch(seenAuth: string[] = [], codexLimited = false) {
-  return (async (url: string | URL, init?: { headers?: Record<string, string> }) => {
-    const u = String(url);
-    const auth = init?.headers?.Authorization;
-    if (auth) seenAuth.push(auth);
-    if (u.includes("anthropic.com")) {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
-          five_hour: { utilization: 10 },
-          seven_day: { utilization: 20 },
-        }),
-      };
-    }
-    if (u.includes("chatgpt.com")) {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
-          rate_limit: {
-            limit_reached: codexLimited,
-            primary_window: { used_percent: 5, limit_window_seconds: 18000, reset_after_seconds: 3600 },
-            secondary_window: { used_percent: 10, limit_window_seconds: 604800, reset_after_seconds: 400000 },
-          },
-        }),
-      };
-    }
-    throw new Error(`unexpected url ${u}`);
-  }) as unknown as typeof fetch;
-}
-
 test("a healthy claude credential never starts a refresh ping", async () => {
   const fx = await fixture();
   await writeFile(
@@ -756,7 +733,7 @@ test("a healthy claude credential never starts a refresh ping", async () => {
   };
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeRefresh: "offline-ping", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => NOW, refreshClaude },
+    { read: fakeReads(), readKeychain: noKeychain, now: () => NOW, refreshClaude },
   );
 
   const { latest: state } = await d.railReadings("claude", true);
@@ -775,7 +752,7 @@ test("a credential failure that is not an expiry is reported unchanged, with no 
   };
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeRefresh: "offline-ping", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(), now: () => NOW, refreshClaude },
+    { read: fakeReads(), now: () => NOW, refreshClaude },
   );
 
   const { latest: state } = await d.railReadings("claude", true);
@@ -810,7 +787,15 @@ test("an expired credential is refreshed, and the rail reads with the new token"
   };
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeRefresh: "offline-ping", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(seenAuth), readKeychain: noKeychain, now: () => NOW, refreshClaude },
+    { read: fakeReads({
+      // What this records is the token the dispatcher acquired, which is the
+      // credential the ping is supposed to change — not the header the read
+      // builds from it.
+      claude: (token) => {
+        seenAuth.push(token);
+        return readingOf("claude", { session: 10, weekly: 20 });
+      },
+    }), readKeychain: noKeychain, now: () => NOW, refreshClaude },
   );
 
   const { latest: state } = await d.railReadings("claude", true);
@@ -820,7 +805,7 @@ test("an expired credential is refreshed, and the rail reads with the new token"
   assert.equal(refreshes, 1);
   // The re-read is the point: the usage request must carry the token the ping
   // landed, not the stale one.
-  assert.deepEqual(seenAuth, ["Bearer refreshed-token"]);
+  assert.deepEqual(seenAuth, ["refreshed-token"]);
 
   // A refreshed rail is not just a green reading: the decision it unblocks must
   // actually proceed, or the whole exercise bought nothing. The agent starts on
@@ -852,7 +837,7 @@ test("an expired credential the ping cannot fix holds, and the note names the at
   });
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeRefresh: "offline-ping", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => NOW, refreshClaude },
+    { read: fakeReads(), readKeychain: noKeychain, now: () => NOW, refreshClaude },
   );
 
   const { latest: state } = await d.railReadings("claude", true);
@@ -887,7 +872,7 @@ test("claudeRefresh off skips the ping and says so in the note", async () => {
 
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeCredsPath: creds, claudeRefresh: "off", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => NOW },
+    { read: fakeReads(), readKeychain: noKeychain, now: () => NOW },
   );
 
   const { latest: state } = await d.railReadings("claude", true);
@@ -912,7 +897,7 @@ test("a non-default claudeCredsPath leaves the mode inert and says so in the not
   // not be able to start one.
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeRefresh: "offline-ping", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => NOW },
+    { read: fakeReads(), readKeychain: noKeychain, now: () => NOW },
   );
 
   const { latest: state } = await d.railReadings("claude", true);
@@ -939,7 +924,7 @@ test("a failed ping is not retried inside the cooldown, and is after it", async 
   };
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeRefresh: "offline-ping", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => clock, refreshClaude },
+    { read: fakeReads(), readKeychain: noKeychain, now: () => clock, refreshClaude },
   );
 
   for (let i = 0; i < 3; i++) {
@@ -977,7 +962,7 @@ test("a cooldown gate hit does not re-arm the cooldown", async () => {
   };
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeRefresh: "offline-ping", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => clock, refreshClaude },
+    { read: fakeReads(), readKeychain: noKeychain, now: () => clock, refreshClaude },
   );
 
   await d.railReadings("claude", true); // arms the cooldown at NOW
@@ -1013,7 +998,7 @@ test("a deferred ping does not arm the cooldown", async () => {
   };
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeRefresh: "offline-ping", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => NOW, refreshClaude },
+    { read: fakeReads(), readKeychain: noKeychain, now: () => NOW, refreshClaude },
   );
 
   const { latest: first } = await d.railReadings("claude", true);
@@ -1044,7 +1029,7 @@ test("concurrent evaluations make exactly one ping attempt", async () => {
   };
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeRefresh: "offline-ping", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => NOW, refreshClaude },
+    { read: fakeReads(), readKeychain: noKeychain, now: () => NOW, refreshClaude },
   );
 
   await Promise.all([d.railReadings("claude", true), d.railReadings("claude", true)]);
@@ -1077,7 +1062,7 @@ test("an undiverted ping halts: no second attempt, and the note says so", async 
   };
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeRefresh: "offline-ping", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => clock, refreshClaude },
+    { read: fakeReads(), readKeychain: noKeychain, now: () => clock, refreshClaude },
   );
 
   const { latest: first } = await d.railReadings("claude", true);
@@ -1109,7 +1094,7 @@ test("a pinged ping that left the token expired halts", async () => {
   };
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeRefresh: "offline-ping", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => clock, refreshClaude },
+    { read: fakeReads(), readKeychain: noKeychain, now: () => clock, refreshClaude },
   );
 
   const { latest: first } = await d.railReadings("claude", true);
@@ -1138,7 +1123,7 @@ test("a failed ping halts at once in the mode that spends budget", async () => {
   };
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeRefresh: "ping", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => clock, refreshClaude },
+    { read: fakeReads(), readKeychain: noKeychain, now: () => clock, refreshClaude },
   );
 
   const { latest: first } = await d.railReadings("claude", true);
@@ -1183,7 +1168,7 @@ test("an undiverted ping is reported on the healthy rail and never retried", asy
   };
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeRefresh: "offline-ping", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => clock, refreshClaude },
+    { read: fakeReads(), readKeychain: noKeychain, now: () => clock, refreshClaude },
   );
 
   const { latest: first } = await d.railReadings("claude", true);
@@ -1229,7 +1214,11 @@ test("a healthy rail's note reaches the report line", async () => {
   );
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch([], true), readKeychain: noKeychain, now: () => NOW },
+    { read: fakeReads({
+      // The note is the rail's own, not a blanket suffix; that a Codex document
+      // can produce this one is `rail-read.test.ts`'s business.
+      codex: { ...readingOf("codex", { session: 5, weekly: 10 }), note: "limit_reached=true" },
+    }), readKeychain: noKeychain, now: () => NOW },
   );
 
   const lines = await d.report({ force: true });
@@ -1264,7 +1253,7 @@ test("a per-episode halt is cleared once the store yields a token again", async 
   };
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeRefresh: "offline-ping", agents: AGENT_ROUTES },
-    { fetchImpl: stubFetch(), readKeychain: noKeychain, now: () => clock, refreshClaude },
+    { read: fakeReads(), readKeychain: noKeychain, now: () => clock, refreshClaude },
   );
 
   const { latest: halted } = await d.railReadings("claude", true);

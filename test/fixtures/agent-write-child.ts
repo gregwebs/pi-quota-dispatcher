@@ -25,14 +25,20 @@ import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
-  type Coordination,
-  type FileWritePacing,
-  type ThinkingLevel,
   type WriteResult,
   applyDecision,
-  parseModelId,
-  withFileLock,
 } from "../../src/index.ts";
+import {
+  type Coordination,
+  type FileWritePacing,
+  withFileLock,
+} from "../../src/agent-file.ts";
+import {
+  type ThinkingLevel,
+} from "../../src/config.ts";
+import {
+  parseModelId,
+} from "../../src/identifiers.ts";
 
 const FIXTURE = fileURLToPath(import.meta.url);
 

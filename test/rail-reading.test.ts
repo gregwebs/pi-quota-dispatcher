@@ -17,7 +17,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { Rail } from "../src/rail.ts";
-import { isTight, type GoodReading, type MeteredReading, type RailWindow } from "../src/rail-reading.ts";
+import {
+  isTight,
+  type GoodReading,
+  type MeteredReading,
+  type RailWindow,
+} from "../src/rail-reading.ts";
 
 const CLOCK = 1_730_123_456_789;
 

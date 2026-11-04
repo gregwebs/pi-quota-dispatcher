@@ -189,6 +189,19 @@ export type VendorRail = Exclude<Rail, "deepseek">;
 /** A reading that came from asking: every rail but the metered one, and the only kind the file holds. */
 export type VendorReading = GoodReading | FailedReading;
 
+/**
+ * What one Antigravity read answers: all three pool rails, each carrying its own
+ * rail.
+ *
+ * One type for three results because one vendor request produces them — the
+ * buckets of a single `retrieveUserQuotaSummary` body are partitioned across the
+ * pools. It is one answer, so a pool the vendor omitted is that pool's own
+ * failure while its neighbours are read normally.
+ */
+export type AntigravityReadings = {
+  readonly [R in AntigravityRail]: VendorReading & { readonly rail: R };
+};
+
 // ---------------------------------------------------------------- parsing
 
 function num(v: unknown): number | undefined {
