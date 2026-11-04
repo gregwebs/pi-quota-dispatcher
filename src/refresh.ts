@@ -3,12 +3,12 @@
  * listener proves diversion without inspecting credentials. See
  * docs/adr/0007-refresh-pings.md.
  *
- * The shared runner and default-profile predicate live here so index.ts can
- * call them without this module importing the extension at runtime. The
- * credential types still come back from index.ts in a form the compiler erases;
- * they are the last half of that cycle, and move with the credentials themselves.
+ * The default-profile predicate lives here because it is about which profile a
+ * ping speaks for. The runner it and the credential reads share is `exec.ts`,
+ * and the credential shapes are `credentials.ts`, so this module imports both
+ * and neither imports it: the cycle that once ran through the entry point is
+ * gone.
  */
-import { execFile } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import {
   DEFAULT_CONFIG,
@@ -16,7 +16,7 @@ import {
   type ClaudeRefreshMode,
   type DispatcherConfig,
 } from "./config.ts";
-import type { CommandRunner, CredentialRead } from "./index.ts";
+import { execFileRunner, firstLine, type CommandRunner, type CredentialRead } from "./exec.ts";
 
 /**
  * How long one refresh ping may run.
@@ -58,59 +58,6 @@ export const CLAUDE_PING_COOLDOWN_MS = 900_000;
  */
 export function isDefaultClaudeCredsPath(path: string): boolean {
   return path === DEFAULT_CONFIG.claudeCredsPath;
-}
-
-/**
- * The real runner, for one subprocess: its stdout is the value read back, and a
- * failure is reported as the one line a reader can act on — what the command
- * said, its exit code when it said nothing, or the reason the process never ran.
- *
- * `env` narrows the child's environment; left off, the child inherits this
- * process's, which is what every runner here but the refresh ping wants.
- */
-export function execFileRunner(timeoutMs: number, env?: NodeJS.ProcessEnv): CommandRunner {
-  return (file, args) =>
-    new Promise((resolve) => {
-      const child = execFile(
-        file,
-        args,
-        {
-          encoding: "utf8",
-          timeout: timeoutMs,
-          windowsHide: true,
-          ...(env === undefined ? {} : { env }),
-        },
-        (err, stdout, stderr) => {
-          if (!err) return resolve({ text: stdout.trim() });
-          resolve({ error: failureDetail(err, stderr, timeoutMs) });
-        },
-      );
-      // A child that reads stdin would otherwise wait for input that is never
-      // coming until the timeout kills it; ending the pipe hands it EOF instead.
-      //
-      // Spawn's `stdio: ["ignore", ...]` cannot do this, because `execFile`
-      // discards that option and rebuilds its own spawn options — a `cat` run
-      // through the documented form still hung for the full timeout.
-      child.stdin?.end();
-    });
-}
-
-/**
- * One line, because this ends up in a one-line report: the command's own
- * message when it printed one, otherwise the spawn failure's.
- */
-function failureDetail(err: Error, stderr: string, timeoutMs: number): string {
-  if ((err as { killed?: boolean }).killed) return `timed out after ${timeoutMs}ms`;
-  const said = firstLine(stderr) ?? firstLine(err.message);
-  const code = (err as { code?: unknown }).code;
-  return said ?? (typeof code === "number" ? `exit ${code}` : "failed");
-}
-
-function firstLine(text: string): string | undefined {
-  return text
-    .split("\n")
-    .map((line) => line.trim())
-    .find((line) => line.length > 0);
 }
 
 /**
