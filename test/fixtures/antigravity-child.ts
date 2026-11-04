@@ -106,16 +106,19 @@ async function run(job: Job) {
   if (job.auth !== undefined) await writeFile(authPath, job.auth, "utf8");
 
   const index = await import("../../src/index.ts");
+  const { DEFAULT_CONFIG, defaultConfig } = await import("../../src/config.ts");
+  const { ANTIGRAVITY_QUOTA_URL } = await import("../../src/endpoints.ts");
+  const { httpTransport } = await import("../../src/rail-read.ts");
   const { agentTable } = await import("../helpers/identifiers.ts");
-  if (index.DEFAULT_CONFIG.piAuthPath !== authPath) {
-    throw new Error(`the fixture is not on the default path: ${index.DEFAULT_CONFIG.piAuthPath} !== ${authPath}`);
+  if (DEFAULT_CONFIG.piAuthPath !== authPath) {
+    throw new Error(`the fixture is not on the default path: ${DEFAULT_CONFIG.piAuthPath} !== ${authPath}`);
   }
 
   const requests: Request[] = [];
   let resolverCalls = 0;
   const resolver = job.resolver;
   const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
-    if (String(url) !== index.ANTIGRAVITY_QUOTA_URL) {
+    if (String(url) !== ANTIGRAVITY_QUOTA_URL) {
       throw new Error(`the fixture only answers the Antigravity endpoint, not ${String(url)}`);
     }
     const headers = (init?.headers ?? {}) as Record<string, string>;
@@ -134,7 +137,7 @@ async function run(job: Job) {
 
   const dispatcher = index.createDispatcher(
     {
-      ...index.defaultConfig(job.agentDir),
+      ...defaultConfig(job.agentDir),
       claudeRefresh: "off",
       ttlMs: 1,
       readingsPath: join(job.agentDir, "quota-dispatch-readings.json"),
@@ -144,7 +147,7 @@ async function run(job: Job) {
       // The child exists to prove what reached the wire — the credential that was
       // persisted, in the header of the request — so it drives the real read
       // through a transport it can record.
-      transport: index.httpTransport(fetchImpl),
+      transport: httpTransport(fetchImpl),
       ...(job.timeoutMs === undefined ? {} : { providerTokenTimeoutMs: job.timeoutMs }),
       ...(resolver === undefined
         ? {}

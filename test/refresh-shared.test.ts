@@ -4,12 +4,27 @@ import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
-  CLAUDE_PING_COOLDOWN_MS, DEFAULT_CONFIG, claudeInstall, createDispatcher,
-  type ClaudeIdentity, type ClaudeRefresh,
+  createDispatcher,
 } from "../src/index.ts";
-import { lockPathFor, withLockPath } from "../src/agent-file.ts";
+import {
+  DEFAULT_CONFIG,
+} from "../src/config.ts";
+import {
+  claudeInstall,
+  type ClaudeIdentity,
+} from "../src/credentials.ts";
+import {
+  CLAUDE_PING_COOLDOWN_MS,
+  type ClaudeRefresh,
+} from "../src/refresh.ts";
+import {
+  lockPathFor,
+  withLockPath,
+} from "../src/agent-file.ts";
 import { fakeReads, readingOf } from "./helpers/rails.ts";
-import { createSharedReadings } from "../src/readings-file.ts";
+import {
+  createSharedReadings,
+} from "../src/readings-file.ts";
 
 const NOW = 1_730_123_456_789;
 

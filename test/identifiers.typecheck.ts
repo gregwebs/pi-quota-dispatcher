@@ -11,14 +11,30 @@
  * existential proof, not a value.
  */
 import type { AgentRoute, Candidate, ConfigBase, DispatcherConfig } from "../src/config.ts";
-import { agentKey, mergeConfig, skillKey } from "../src/config.ts";
+import {
+  agentKey,
+  mergeConfig,
+  skillKey,
+} from "../src/config.ts";
 import type { AgentName, ModelId, SkillName } from "../src/identifiers.ts";
-import { parseAgentName, parseModelId, parseSkillName } from "../src/identifiers.ts";
-import type { AgentWrite, NamedAgentFile, ScopedNameFile } from "../src/index.ts";
-import { upsertModel } from "../src/index.ts";
+import {
+  parseAgentName,
+  parseModelId,
+  parseSkillName,
+} from "../src/identifiers.ts";
+import {
+  type AgentWrite,
+  type NamedAgentFile,
+  type ScopedNameFile,
+} from "../src/index.ts";
+import {
+  upsertModel,
+} from "../src/index.ts";
 import type { ModelCheckResult, ModelMiss } from "../src/models.ts";
 import type { AgentFileSelection } from "../src/skill-binding.ts";
-import { validatedKeys } from "../src/validated-keys.ts";
+import {
+  validatedKeys,
+} from "../src/validated-keys.ts";
 
 declare const raw: string;
 declare const agent: AgentName;

@@ -4,12 +4,32 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
-  type AgentRoute, type DispatcherConfig,
-  DEFAULT_CONFIG, agentKey, agentTableSnippet, checkAgentFiles, checkModels,
-  contestedDecision, createDispatcher, decide, describeAgentFiles, heldDecision,
-  readAgentDirectory, readAgentFiles, resolveAgent,
+  agentTableSnippet,
+  checkAgentFiles,
+  contestedDecision,
+  createDispatcher,
+  decide,
+  describeAgentFiles,
+  heldDecision,
+  readAgentDirectory,
+  readAgentFiles,
+  resolveAgent,
 } from "../src/index.ts";
-import { agentNameRejection, configFilesFor, describeConfig, globalConfigPath, loadConfig, mergeConfig } from "../src/config.ts";
+import {
+  checkModels,
+} from "../src/models.ts";
+import {
+  agentNameRejection,
+  configFilesFor,
+  describeConfig,
+  globalConfigPath,
+  loadConfig,
+  mergeConfig,
+  type AgentRoute,
+  type DispatcherConfig,
+  DEFAULT_CONFIG,
+  agentKey,
+} from "../src/config.ts";
 
 import { agentName, agentTable, modelId } from "./helpers/identifiers.ts";
 

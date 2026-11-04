@@ -5,8 +5,15 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
-import { READINGS_FILE_VERSION, createSharedReadings, type StickyHalt } from "../src/readings-file.ts";
-import { lockPathFor, withLockPath } from "../src/agent-file.ts";
+import {
+  READINGS_FILE_VERSION,
+  createSharedReadings,
+  type StickyHalt,
+} from "../src/readings-file.ts";
+import {
+  lockPathFor,
+  withLockPath,
+} from "../src/agent-file.ts";
 
 const NOW = 1_730_123_456_789;
 const cooldown = { at: NOW, note: "offline failure" };

@@ -3,7 +3,15 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
-import { createDispatcher, DEFAULT_CONFIG, READINGS_FILE_VERSION } from "../src/index.ts";
+import {
+  createDispatcher,
+} from "../src/index.ts";
+import {
+  DEFAULT_CONFIG,
+} from "../src/config.ts";
+import {
+  READINGS_FILE_VERSION,
+} from "../src/readings-file.ts";
 import { failureOf, fakeReads, readingOf } from "./helpers/rails.ts";
 
 const NOW = 1_730_123_456_789;

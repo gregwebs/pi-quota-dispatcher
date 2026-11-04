@@ -6,12 +6,16 @@ import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 
 import {
-  DEFAULT_CONFIG,
-  READINGS_FILE_VERSION,
   createDispatcher,
   type PassReadings,
   railGauge,
 } from "../src/index.ts";
+import {
+  DEFAULT_CONFIG,
+} from "../src/config.ts";
+import {
+  READINGS_FILE_VERSION,
+} from "../src/readings-file.ts";
 import type { AntigravityRail } from "../src/rail.ts";
 import {
   type AntigravityReadings,

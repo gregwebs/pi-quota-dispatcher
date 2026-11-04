@@ -5,17 +5,25 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import {
-  type CommandRunner,
+  createDispatcher,
+} from "../src/index.ts";
+import {
+  DEFAULT_CONFIG,
+} from "../src/config.ts";
+import {
   type KeychainRead,
   CLAUDE_KEYCHAIN_SERVICE,
-  DEFAULT_CONFIG,
-  createDispatcher,
-  isDefaultClaudeCredsPath,
   keychainReader,
   parseClaudeToken,
   parseCodexCredential,
   readClaudeToken,
-} from "../src/index.ts";
+} from "../src/credentials.ts";
+import {
+  type CommandRunner,
+} from "../src/exec.ts";
+import {
+  isDefaultClaudeCredsPath,
+} from "../src/refresh.ts";
 import { agentTable, routeOf } from "./helpers/identifiers.ts";
 import { fakeReads, readingOf } from "./helpers/rails.ts";
 

@@ -9,7 +9,9 @@ import {
   UNREQUESTED_RAILS,
   describeOutboundRequests,
 } from "../src/endpoints.ts";
-import { RAILS } from "../src/rail.ts";
+import {
+  RAILS,
+} from "../src/rail.ts";
 
 /**
  * The list is the allow-list, so a rail missing from it would leave a user with

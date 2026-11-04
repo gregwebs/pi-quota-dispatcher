@@ -8,9 +8,12 @@ import {
   READINGS_FILE_VERSION,
   createSharedReadings,
   type SharedReadingsPacing,
-} from "../src/index.ts";
+} from "../src/readings-file.ts";
 import type { AntigravityReadings, VendorReading } from "../src/rail-reading.ts";
-import { lockPathFor, withLockPath } from "../src/agent-file.ts";
+import {
+  lockPathFor,
+  withLockPath,
+} from "../src/agent-file.ts";
 import { assertCleanExit, startHolder, waitUntil } from "./fixtures/agent-write-child.ts";
 import { spawnReadingsChild } from "./fixtures/readings-child.ts";
 

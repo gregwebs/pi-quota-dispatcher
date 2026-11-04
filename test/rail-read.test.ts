@@ -5,18 +5,24 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
+  createDispatcher,
+} from "../src/index.ts";
+import {
   ANTIGRAVITY_QUOTA_URL,
   CLAUDE_USAGE_URL,
   CODEX_USAGE_URL,
+} from "../src/endpoints.ts";
+import {
   DEFAULT_ANTIGRAVITY_USER_AGENT,
   DEFAULT_QUOTA_READ,
-  createDispatcher,
   createRailRead,
   type Transport,
   type TransportRequest,
   type TransportResult,
-} from "../src/index.ts";
-import { DEFAULT_CONFIG } from "../src/config.ts";
+} from "../src/rail-read.ts";
+import {
+  DEFAULT_CONFIG,
+} from "../src/config.ts";
 import type { AntigravityReadings, RailWindow } from "../src/rail-reading.ts";
 
 const NOW = 1_730_123_456_789;

@@ -43,6 +43,11 @@ import { type Stats } from "node:fs";
 import { open, readFile, readdir, stat } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent";
+
+// The entry point imports the module that owns each concept and re-exports none
+// of them: a name lives where it is defined, so what this file offers is what
+// the extension itself does — the dispatcher's policy and report, the agent-file
+// write path, and the pi wiring — rather than a namespace of everyone else's.
 import {
   DEFAULT_CONFIG,
   type AgentRoute,
@@ -81,73 +86,16 @@ import {
   type Rail,
 } from "./rail.ts";
 
-// The endpoints module is where the allow-list and the fetches themselves come
-// from one table; re-exported here so the `urls` form and a test reach the same
-// list as the request path.
-import {
-  ANTIGRAVITY_QUOTA_URL,
-  CLAUDE_USAGE_URL,
-  CODEX_USAGE_URL,
-  describeOutboundRequests,
-} from "./endpoints.ts";
-export {
-  ANTIGRAVITY_QUOTA_URL,
-  CLAUDE_USAGE_URL,
-  CODEX_USAGE_URL,
-  OUTBOUND_REQUESTS,
-  UNREQUESTED_RAILS,
-  describeOutboundRequests,
-} from "./endpoints.ts";
-export type { OutboundRequest, UnrequestedRail } from "./endpoints.ts";
-
-// The rail read is where a credential in hand becomes a reading: the request,
-// its deadline and retry, and the parse. Re-exported here because the
-// dispatcher's deps name its types, and because the timings and the pinned
-// Antigravity user agent were reachable from this path before they had a module.
-import {
-  DEFAULT_QUOTA_READ,
-  createRailRead,
-  failedReading,
-  readBoundMs,
-  type QuotaReadPacing,
-  type RailRead,
-  type Transport,
-} from "./rail-read.ts";
-import { poolFailure } from "./rail-read.ts";
-export {
-  DEFAULT_ANTIGRAVITY_USER_AGENT,
-  DEFAULT_QUOTA_READ,
-  antigravityUserAgent,
-  createRailRead,
-  httpTransport,
-  poolFailure,
-  readBoundMs,
-} from "./rail-read.ts";
-export type {
-  QuotaReadPacing,
-  RailRead,
-  RailReadDeps,
-  Transport,
-  TransportFailure,
-  TransportRequest,
-  TransportResult,
-} from "./rail-read.ts";
-
-// The reading is the policy's only evidence: its shape, the parsers that build
-// it from a vendor's document and the judgments about it all live here, so the
-// policy, the gauge, the readings file and the generator share one definition.
+// The reading is the policy's only evidence: its shape and the judgments about it
+// live in one module, so the policy, the gauge, the readings file and the
+// generator cannot disagree about what a reading is.
 import {
   absentBudgets,
   budgetUsed,
   isTight,
-  type AntigravityReadings,
-  parseAntigravityUsage,
-  parseClaudeUsage,
-  parseCodexUsage,
   weekSpent,
-  type FailedReading,
+  type AntigravityReadings,
   type GoodReading,
-  type MeteredRailReadings,
   type MeteredReading,
   type RailReading,
   type RailReadings,
@@ -157,99 +105,52 @@ import {
   type VendorReading,
 } from "./rail-reading.ts";
 
+// The rail read is where a credential already in hand becomes a reading: the
+// request, its deadline and retry, the parse, and the note a failure earns.
+import {
+  DEFAULT_QUOTA_READ,
+  createRailRead,
+  failedReading,
+  poolFailure,
+  readBoundMs,
+  type QuotaReadPacing,
+  type RailRead,
+  type Transport,
+} from "./rail-read.ts";
+
+// The endpoints table is the one place the `urls` form and the requests agree.
+import { describeOutboundRequests } from "./endpoints.ts";
+
 // The generator module is where a declared command's output replaces one config
 // layer. Its orchestration is a call the command handler makes, not a public
-// surface: the tests import the module directly, so nothing is re-exported here.
-// The stdin document's types come back the other way, so the projection onto
-// them can be built where the readings live without generator.ts learning about
-// dispatchers.
-import {
-  type GeneratorInputOutcome,
-  type GeneratorReadingInput,
-  type GeneratorWindowInput,
-  GENERATOR_INPUT_VERSION,
-  generateConfig,
-} from "./generator.ts";
+// surface: the tests import the module directly.
+import { generateConfig } from "./generator.ts";
 
-// Config is a separate module because it is read from disk at run time; it is
-// re-exported here so the extension's runtime surface has one import path. The
-// rail and reading vocabulary is deliberately not part of that surface: `rail.ts`
-// and `rail-reading.ts` are imported directly by everything that needs them, so
-// the entry point cannot become the definition of a reading again.
-export {
-  CLAUDE_REFRESH_MODES,
-  CONFIG_FILE_NAME,
-  DEFAULT_CONFIG,
-  DEFAULT_GENERATOR_TIMEOUT_MS,
-  THINKING_LEVELS,
-  agentKey,
-  configFilesFor,
-  defaultConfig,
-  describeConfig,
-  describeConfigLayers,
-  describeConfigWarnings,
-  globalConfigPath,
-  isClaudeRefreshMode,
-  isThinkingLevel,
-  loadConfig,
-  mergeConfig,
-  modelIdRejection,
-  parseGeneratorDeclaration,
-  projectConfigPath,
-  skillKey,
-  thinkingFor,
-} from "./config.ts";
-export type {
-  AgentRoute,
-  Candidate,
-  ClaudeRefreshMode,
-  ConfigFile,
-  ConfigFileFault,
-  ConfigFileState,
-  ConfigPosition,
-  ConfigSource,
-  DispatcherConfig,
-  GeneratorDeclaration,
-  LoadConfigDeps,
-  LoadedConfig,
-  MergeLayer,
-  MergeResult,
-  ModelDefault,
-  SkipFlag,
-  SkillBinding,
-  ThinkingLevel,
-} from "./config.ts";
+// The document a generator is fed is projected from readings alone, so it is a
+// pure module of its own rather than a bridge this file has to hold.
+import { generatorInput, type KnownReadings } from "./generator-input.ts";
 
-// The identifier newtypes and their checked producers are re-exported here for
-// the same reason the config module is: this is the extension's one import
-// surface, and a consumer of the config types needs the brands those types name.
+// The identifier newtypes are produced only by their checked parsers, so a
+// wrong-role value does not compile.
 import type { AgentName, ModelId } from "./identifiers.ts";
 import { parseAgentName, parseModelId } from "./identifiers.ts";
 import { validatedEntries, validatedKeys } from "./validated-keys.ts";
-export { parseAgentName, parseModelId, parseSkillName } from "./identifiers.ts";
-export type { AgentName, ModelId, SkillName } from "./identifiers.ts";
 
+// The models module resolves a config's model ids against the pi that is running.
 import { checkModels, modelLookup, type DroppedAlternate, type ModelMiss, unknownModelNote } from "./models.ts";
+
+// The coordination module is where a write to a shared agent file is made safe,
+// and the only thing in this extension that takes a lock.
 import {
-  type Coordination,
-  type FileWritePacing,
   errnoIs,
   replaceFileAtomically,
   withFileLock,
+  type Coordination,
+  type FileWritePacing,
 } from "./agent-file.ts";
 
-// The coordination module is where a write to a shared agent file is made safe;
-// re-exported here for the same reason as the config and models modules.
-export {
-  ABANDONED_LOCK_MS,
-  DEFAULT_FILE_WRITE,
-  agentFileTarget,
-  lockPathFor,
-  replaceFileAtomically,
-  withFileLock,
-} from "./agent-file.ts";
-export type { Coordination, FileWritePacing, LockAttempt, LockHolder } from "./agent-file.ts";
-
+// The readings module is where the rail cache lives and is shared with every
+// other pi process under this OS user.
 import {
   DEFAULT_SHARED_READINGS,
   createSharedReadings,
@@ -258,80 +159,24 @@ import {
   type StickyHalt,
 } from "./readings-file.ts";
 
-// The readings module is where the rail cache lives and is shared across
-// processes; re-exported here for the same reason as the config and models
-// modules.
-export {
-  DEFAULT_SHARED_READINGS,
-  READINGS_FILE_VERSION,
-  asReadings,
-  createSharedReadings,
-} from "./readings-file.ts";
-export type {
-  CachedReadings,
-  CredentialGates,
-  GatePatch,
-  RefreshGates,
-  SharedReadings,
-  SharedReadingsDeps,
-  SharedReadingsPacing,
-  SingleFetchRail,
-  StickyHalt,
-} from "./readings-file.ts";
-
-// The models module is where a config's model ids are resolved against the pi
-// that is running; re-exported here for the same reason as the config module.
-export {
-  checkModels,
-  modelLookup,
-  splitModelId,
-  unknownModelClause,
-} from "./models.ts";
-export type {
-  DroppedAlternate,
-  ModelCheckResult,
-  ModelLookup,
-  ModelMiss,
-  ModelRegistryLike,
-} from "./models.ts";
-
-import { type AgentFileSelection, applySkillBinding, explicitSkill } from "./skill-binding.ts";
-
 // The skill-binding module is where an explicit `/skill:` invocation selects the
-// session's model; re-exported here for the same reason as the config module.
-export { applySkillBinding, explicitSkill } from "./skill-binding.ts";
-export type { AgentFileSelection, SessionSelection, SkillBindingDeps } from "./skill-binding.ts";
+// session's model from the agent file it names.
+import { applySkillBinding, explicitSkill, type AgentFileSelection } from "./skill-binding.ts";
 
+// The refresh module owns the subprocess and the loopback listener, not the
+// gates or the report.
 import {
   CLAUDE_PING_COOLDOWN_MS,
   CLAUDE_PING_TIMEOUT_MS,
+  isDefaultClaudeCredsPath,
+  refreshPlan,
   type ClaudePing,
   type ClaudeRefresh,
-  isDefaultClaudeCredsPath,
-  refreshPlan,
 } from "./refresh.ts";
 
-// The refresh module owns the subprocess and loopback listener, not the gates
-// or the report; re-exported here so index.ts remains the extension's one import
-// path for this surface.
-export {
-  CLAUDE_PING_COOLDOWN_MS,
-  CLAUDE_PING_TIMEOUT_MS,
-  claudePingArgs,
-  claudePingEnv,
-  claudeRefresher,
-  isDefaultClaudeCredsPath,
-  loopbackListener,
-  refreshPlan,
-} from "./refresh.ts";
-export type {
-  ClaudePing,
-  ClaudeRefresh,
-  PingListener,
-  PingListenerFactory,
-  RefreshPlan,
-} from "./refresh.ts";
-
+// The credentials module is where a store's text becomes a token, and where the
+// whole of acquiring one lives; the dispatcher names its types in its deps and
+// asks it for tokens.
 import {
   PROVIDER_TOKEN_TIMEOUT_MS,
   claudeInstall,
@@ -343,218 +188,17 @@ import {
   type KeychainRead,
 } from "./credentials.ts";
 
-// The exec module is the one subprocess runner, shared by the keychain read and
-// the refresh ping; re-exported here because it was reachable from this path
-// before it had a module of its own.
-export { execFileRunner } from "./exec.ts";
-export type { CommandRunner, CredentialRead } from "./exec.ts";
-
-// The credentials module is where a store's text becomes a token. It is neither
-// the ping nor a read, so the dispatcher imports it directly for the parts of
-// its own interface that name a credential; re-exported here so a consumer of
-// those types still has one import path.
-export {
-  CLAUDE_KEYCHAIN_SERVICE,
-  PROVIDER_TOKEN_TIMEOUT_MS,
-  claudeInstall,
-  createAntigravityToken,
-  keychainReader,
-  parseAntigravityToken,
-  parseClaudeToken,
-  parseCodexCredential,
-  readClaudeToken,
-  readCodexCredential,
-} from "./credentials.ts";
-export type {
-  AntigravityToken,
-  AntigravityTokenDeps,
-  ClaudeIdentity,
-  ClaudeToken,
-  ClaudeTokenDeps,
-  ClaudeTokenError,
-  CodexCredential,
-  CodexCredentialRead,
-  KeychainRead,
-  TokenFailure,
-} from "./credentials.ts";
-
+// The rail-gauge module is where the footer line is rendered.
 import {
+  GAUGE_ORDER,
+  renderRailGauge,
   type BudgetGauge,
   type GaugeEntry,
   type GaugeStyle,
   type StaleBudgetGauge,
-  GAUGE_ORDER,
-  renderRailGauge,
 } from "./rail-gauge.ts";
 
-// The rail-gauge module is where the footer line is rendered; re-exported here
-// for the same reason as the config module, so a consumer (and a test) reaches
-// the renderer through the extension's one import path.
-export { GAUGE_LABELS, GAUGE_ORDER, renderRailGauge, resetText } from "./rail-gauge.ts";
-export type { BudgetGauge, GaugeEntry, GaugeStyle, StaleBudgetGauge } from "./rail-gauge.ts";
-
-// ---------------------------------------------------------------- types
-
-/**
- * Every rail's readings as the dispatcher already holds them, keyed by the rail
- * itself so a reader needs no case for a missing rail and none for "is this one
- * metered". The policy's `Map<Rail, RailReading>` cannot promise which arm a rail
- * carries; this can, because its keys are the rails.
- */
-export interface KnownReadings {
-  readonly claude: VendorRailReadings;
-  readonly codex: VendorRailReadings;
-  readonly "antigravity-argon": VendorRailReadings;
-  readonly "antigravity-gemini": VendorRailReadings;
-  readonly "antigravity-3p": VendorRailReadings;
-  readonly deepseek: MeteredRailReadings;
-}
-
-/**
- * One vendor rail projected onto the wire, or the reason there is nothing to
- * send. Tagged rather than `undefined` for the absent case, so the refusal
- * carries the failure note with the type proving a note exists: only a failed
- * newest read with no last good reading behind it produces `no-reading`.
- */
-type VendorRailProjection =
-  | { readonly kind: "reading"; readonly reading: GeneratorReadingInput }
-  | { readonly kind: "no-reading"; readonly note: string };
-
-/**
- * An epoch instant as the wire document states it.
- *
- * Safe by construction: a `resetsAt` that reaches here passed
- * `representableInstant`, and a `readAt` comes from the dispatcher's clock.
- * A throw is still left to propagate rather than clamped into a plausible-
- * looking instant — the `input` seam turns it into a failed run, which is the
- * honest report for a reading this process cannot write out.
- */
-function isoInstant(ms: number): string {
-  return new Date(ms).toISOString();
-}
-
-/**
- * One report window in the wire's text form. `budget` and `resetsAt` are spread
- * in only when the reading carries them, because an absent key and a key whose
- * value is `null` are different documents: a generator testing for the key
- * would read a judgment out of the second that the reading never made.
- */
-function windowInput(w: RailWindow): GeneratorWindowInput {
-  return {
-    label: w.label,
-    used: w.used,
-    ...(w.budget === undefined ? {} : { budget: w.budget }),
-    ...(w.resetsAt === undefined ? {} : { resetsAt: isoInstant(w.resetsAt) }),
-  };
-}
-
-/** One reading in the wire's shape, apart from the failure that may qualify it. */
-function readingInput(sent: GoodReading): GeneratorReadingInput {
-  return {
-    ok: true,
-    readAt: isoInstant(sent.readAt),
-    windows: sent.windows.map(windowInput),
-    raw: sent.raw,
-    ...(sent.note === undefined ? {} : { note: sent.note }),
-  };
-}
-
-/**
- * The document for one capped rail, or why there is none to send.
- *
- * A newest read that failed sends the last good reading marked `latestFailure`,
- * rather than its own empty windows: the generator routes on the vendor's last
- * word, and the marker is what keeps it from reading that word as current. The
- * `note` is the sent reading's — a qualifier explaining `used: 100` (Codex's
- * `limit_reached=true`) travels with the reading it qualifies, never with the
- * failure that made an older one stand in.
- */
-function projectVendorRail(readings: VendorRailReadings): VendorRailProjection {
-  const { latest } = readings;
-  if (latest.ok) return { kind: "reading", reading: readingInput(latest) };
-  const { lastGood } = readings;
-  if (lastGood === undefined) return { kind: "no-reading", note: latest.note };
-  return {
-    kind: "reading",
-    reading: {
-      ...readingInput(lastGood),
-      latestFailure: { at: isoInstant(latest.readAt), note: latest.note },
-    },
-  };
-}
-
-/**
- * The generator's stdin document, or the refusal when a capped rail has never
- * been read successfully.
- *
- * Pure: the readings are its only input, so the shape a generator sees is
- * testable without a dispatcher, a clock or a subprocess. Facts only, and every
- * rail key present — see `GeneratorInput` for the document and
- * docs/adr/0015-configuration-generation.md for the contract and its reasons.
- *
- * The refusal is stated as facts too: one sentence per rail naming it and the
- * note its latest read left, so the reason is the vendor's own account rather
- * than this process's opinion about it. A rail that has never been read cannot
- * be filled with a placeholder instead — a generator would route on a guess,
- * which is the guess ADR 0006's hold exists to refuse.
- */
-export function generatorInput(known: KnownReadings): GeneratorInputOutcome {
-  const claude = projectVendorRail(known.claude);
-  const codex = projectVendorRail(known.codex);
-  const argon = projectVendorRail(known["antigravity-argon"]);
-  const gemini = projectVendorRail(known["antigravity-gemini"]);
-  const threeParty = projectVendorRail(known["antigravity-3p"]);
-  // Canonical order, and the order the refusal names a failing rail in: a
-  // generator reads one document, so the five capped rails are one list rather
-  // than five independent chances to be the one that is missing.
-  const capped: ReadonlyArray<readonly [VendorRail, VendorRailProjection]> = [
-    ["claude", claude],
-    ["codex", codex],
-    ["antigravity-argon", argon],
-    ["antigravity-gemini", gemini],
-    ["antigravity-3p", threeParty],
-  ];
-  if (
-    claude.kind === "no-reading" ||
-    codex.kind === "no-reading" ||
-    argon.kind === "no-reading" ||
-    gemini.kind === "no-reading" ||
-    threeParty.kind === "no-reading"
-  ) {
-    return {
-      kind: "refused",
-      reason: [
-        "the generator was not run: a quota-capped rail has no successful reading yet.",
-        ...capped.flatMap(([rail, projection]) => refusalLine(rail, projection)),
-        // Advice, not a fact about the readings, but the refusal is the only
-        // place the user learns the run was skipped before the vendor was
-        // asked — and an unforced read is exactly what would clear it. A
-        // credential that is missing rather than stale is not something a
-        // refresh can fix, which is why the sentence is conditional.
-        "Run /quota-dispatch refresh once the rail can be read, then generate again.",
-      ],
-    };
-  }
-  return {
-    kind: "ready",
-    input: {
-      version: GENERATOR_INPUT_VERSION,
-      rails: {
-        claude: claude.reading,
-        codex: codex.reading,
-        "antigravity-argon": argon.reading,
-        "antigravity-gemini": gemini.reading,
-        "antigravity-3p": threeParty.reading,
-        deepseek: { metered: true, windows: [], raw: null },
-      },
-    },
-  };
-}
-
-/** A rail's one line in a refusal, or nothing when it has a reading to send. */
-function refusalLine(rail: VendorRail, projection: VendorRailProjection): string[] {
-  return projection.kind === "no-reading" ? [`the ${rail} rail has no valid reading yet (${projection.note}).`] : [];
-}
+// ---------------------------------------------------------------- decisions
 
 export type Outcome =
   | "written"

@@ -30,14 +30,16 @@ import { test } from "node:test";
 
 import {
   type WriteResult,
+  applyDecision,
+  readAgentFiles,
+} from "../src/index.ts";
+import {
   ABANDONED_LOCK_MS,
   agentFileTarget,
-  applyDecision,
   lockPathFor,
-  readAgentFiles,
   replaceFileAtomically,
   withFileLock,
-} from "../src/index.ts";
+} from "../src/agent-file.ts";
 import { modelId } from "./helpers/identifiers.ts";
 import {
   FAST,

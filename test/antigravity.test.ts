@@ -6,14 +6,23 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 
 import {
-  DEFAULT_ANTIGRAVITY_USER_AGENT,
-  DEFAULT_CONFIG,
   createDispatcher,
-  httpTransport,
-  parseAntigravityToken,
   providerTokenResolver,
 } from "../src/index.ts";
-import { parseAntigravityUsage, type RailReadings } from "../src/rail-reading.ts";
+import {
+  DEFAULT_CONFIG,
+} from "../src/config.ts";
+import {
+  parseAntigravityToken,
+} from "../src/credentials.ts";
+import {
+  DEFAULT_ANTIGRAVITY_USER_AGENT,
+  httpTransport,
+} from "../src/rail-read.ts";
+import {
+  parseAntigravityUsage,
+  type RailReadings,
+} from "../src/rail-reading.ts";
 import { assertCleanExit, waitUntil } from "./fixtures/agent-write-child.ts";
 import { spawnAntigravityChild } from "./fixtures/antigravity-child.ts";
 import { agentTable } from "./helpers/identifiers.ts";

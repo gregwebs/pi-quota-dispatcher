@@ -5,14 +5,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
-  type AgentRoute,
   type AgentDefinition,
   type Decision,
-  type DispatcherConfig,
-  type DroppedAlternate,
-  type QuotaReadPacing,
-  type ThinkingLevel,
-  DEFAULT_CONFIG,
   applyDecision,
   createDispatcher,
   decide,
@@ -21,6 +15,18 @@ import {
   upsertModel,
   upsertThinking,
 } from "../src/index.ts";
+import {
+  type AgentRoute,
+  type DispatcherConfig,
+  type ThinkingLevel,
+  DEFAULT_CONFIG,
+} from "../src/config.ts";
+import {
+  type DroppedAlternate,
+} from "../src/models.ts";
+import {
+  type QuotaReadPacing,
+} from "../src/rail-read.ts";
 import type { Rail } from "../src/rail.ts";
 import {
   budgetUsed,

@@ -10,18 +10,16 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ThinkingLevel } from "../src/config.ts";
 import { agentTable, candidateOf } from "./helpers/identifiers.ts";
 import extension, {
-  ANTIGRAVITY_QUOTA_URL,
-  CLAUDE_USAGE_URL,
-  CODEX_USAGE_URL,
   checkAgentFiles,
-  DEFAULT_CONFIG,
   evaluationFence,
-  explicitSkill,
   fencedEvaluation,
   parseInvocation,
   readAgentDirectory,
   unknownFormNotice,
 } from "../src/index.ts";
+import { ANTIGRAVITY_QUOTA_URL, CLAUDE_USAGE_URL, CODEX_USAGE_URL } from "../src/endpoints.ts";
+import { DEFAULT_CONFIG } from "../src/config.ts";
+import { explicitSkill } from "../src/skill-binding.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
 // documented literal directly.

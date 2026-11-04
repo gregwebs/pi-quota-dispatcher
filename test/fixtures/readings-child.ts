@@ -2,7 +2,10 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createSharedReadings, type SharedReadingsPacing } from "../../src/index.ts";
+import {
+  createSharedReadings,
+  type SharedReadingsPacing,
+} from "../../src/readings-file.ts";
 import { isAntigravityRail, type Rail } from "../../src/rail.ts";
 import { waitUntil, type ChildResult } from "./agent-write-child.ts";
 

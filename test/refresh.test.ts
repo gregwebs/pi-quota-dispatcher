@@ -10,13 +10,17 @@ import { fakeReads, readingOf } from "./helpers/rails.ts";
 
 // Types are erased, so this import does not evaluate `src/index.ts`; the value
 // import below is dynamic and deliberately happens after `HOME` is redirected.
-import type {
-  ClaudeRefresh,
-  CommandRunner,
-  KeychainRead,
-  PingListener,
-  PingListenerFactory,
-} from "../src/index.ts";
+import {
+  type KeychainRead,
+} from "../src/credentials.ts";
+import {
+  type CommandRunner,
+} from "../src/exec.ts";
+import {
+  type ClaudeRefresh,
+  type PingListener,
+  type PingListenerFactory,
+} from "../src/refresh.ts";
 
 // This file pins the refresh-ping contract (issue #30): the argv a ping runs,
 // the verdict each way a run can end, the loopback listener the diversion lands
@@ -78,22 +82,27 @@ async function claudeInvocations(): Promise<number> {
   }
 }
 
+// Loaded after the environment is set, and module by module: the entry point no
+// longer carries anyone else's names, and `DEFAULT_CONFIG` is a load-time
+// snapshot of the home directory this file just moved.
 const {
-  CLAUDE_PING_COOLDOWN_MS,
   CLAUDE_REFRESH_MODES,
   DEFAULT_CONFIG,
+  defaultConfig,
+  describeConfig,
+  isClaudeRefreshMode,
+  mergeConfig,
+} = await import("../src/config.ts");
+const {
+  CLAUDE_PING_COOLDOWN_MS,
   claudePingArgs,
   claudePingEnv,
   claudeRefresher,
-  createDispatcher,
-  defaultConfig,
-  describeConfig,
-  execFileRunner,
-  isClaudeRefreshMode,
   loopbackListener,
-  mergeConfig,
   refreshPlan,
-} = await import("../src/index.ts");
+} = await import("../src/refresh.ts");
+const { execFileRunner } = await import("../src/exec.ts");
+const { createDispatcher } = await import("../src/index.ts");
 
 // ---------------------------------------------------------------- fixtures
 

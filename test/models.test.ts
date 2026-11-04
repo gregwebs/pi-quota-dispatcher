@@ -5,18 +5,22 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
-  type AgentRoute,
   type AgentDefinition,
-  type Candidate,
-  type DispatcherConfig,
-  type ModelLookup,
-  DEFAULT_CONFIG,
-  checkModels,
   createDispatcher,
   decide,
   heldDecision,
-  modelLookup,
 } from "../src/index.ts";
+import {
+  type AgentRoute,
+  type Candidate,
+  type DispatcherConfig,
+  DEFAULT_CONFIG,
+} from "../src/config.ts";
+import {
+  type ModelLookup,
+  checkModels,
+  modelLookup,
+} from "../src/models.ts";
 import type { Rail } from "../src/rail.ts";
 import type { RailReading, RailWindow } from "../src/rail-reading.ts";
 
