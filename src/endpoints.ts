@@ -31,9 +31,21 @@ export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
  *
  * Undocumented, like the two vendor endpoints beside it, and the only place the
  * three pools' bucket ids appear. See `docs/adr/0019-antigravity-pool-rails.md`.
+ *
+ * The host is the `daily-` one on purpose, and it is the part of this URL that
+ * matters most: a release channel keeps its own ledger, and the answer on one
+ * channel says nothing about the spending recorded on another. This is the host
+ * `pi-antigravity` sends every model request to, so it is the ledger pi's own
+ * work is billed against — the only one whose numbers describe what the next
+ * spawn will cost. The unchannelled `cloudcode-pa.googleapis.com` is a different
+ * ledger that lags: there the Argon pool reports `remainingFraction: 1` with a
+ * `resetTime` that slides to `now + 7d` on every read, so an Argon week that is
+ * nine tenths spent printed as untouched and never moved. Reading the channel
+ * the traffic uses is what keeps a rail's number and its own spending the same
+ * fact.
  */
 export const ANTIGRAVITY_QUOTA_URL =
-  "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+  "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
 
 /**
  * One request in the table: what it asks, and which rails its answer reports on.

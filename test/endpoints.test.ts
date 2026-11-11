@@ -41,7 +41,7 @@ test("the table names the three vendor requests and the metered rail's absence",
       {
         rails: ["antigravity-argon", "antigravity-gemini", "antigravity-3p"],
         method: "POST",
-        url: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        url: "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
       },
     ],
   );

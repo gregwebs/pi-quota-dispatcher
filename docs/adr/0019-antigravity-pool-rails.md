@@ -19,9 +19,9 @@ they own. See the **Rail** and **Rail reading** terms in
 
 ## One request, three rails
 
-`POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` answers
-with groups of buckets, and each bucket's **id** — not its group's display name
-— says which pool owns it:
+`POST daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`
+answers with groups of buckets, and each bucket's **id** — not its group's
+display name — says which pool owns it:
 
 ```text
   auth.json[antigravity] ──▶ one POST retrieveUserQuotaSummary
