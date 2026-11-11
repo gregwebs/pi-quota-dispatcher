@@ -1097,7 +1097,7 @@ per line, so it can be used to build a firewall allow-list.
 |---|---|---|
 | Anthropic | `claude` | `GET https://api.anthropic.com/api/oauth/usage` |
 | OpenAI | `codex` | `GET https://chatgpt.com/backend-api/wham/usage` |
-| Google (Antigravity) | `antigravity-argon`, `antigravity-gemini`, `antigravity-3p` | `POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` |
+| Google (Antigravity) | `antigravity-argon`, `antigravity-gemini`, `antigravity-3p` | `POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` |
 | DeepSeek | `deepseek` | none — metered per token, so no request is made |
 
 Antigravity's three pools share a row because they share a request: one `POST`
@@ -1107,6 +1107,17 @@ bucket id — `gemini-argon-*` to `antigravity-argon`, other `gemini-*` to
 windows and percentages, and one shared answer is also why a group the vendor
 omitted costs one pool its reading rather than all three. See
 [0019](docs/adr/0019-antigravity-pool-rails.md).
+
+The `daily-` host is not a typo and not a preference for newer builds: each
+release channel keeps its **own** quota ledger, and only one of them records what
+pi spends. `pi-antigravity` sends every model request to
+`daily-cloudcode-pa.googleapis.com`, so that is the ledger these rails must read;
+the unchannelled `cloudcode-pa.googleapis.com` answers from a separate, lagging
+ledger where the Argon pool reports `remainingFraction: 1` with a `resetTime`
+that slides to `now + 7d` on every read — a week that is really nine tenths spent
+prints as untouched and never changes. Changing the host is changing which
+account's spending the number describes, so it is pinned in one constant
+(`ANTIGRAVITY_QUOTA_URL`) rather than assembled.
 
 What each request is read with:
 
