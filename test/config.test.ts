@@ -907,6 +907,10 @@ test("railFromModel classifies each family, Argon before the general gemini pref
     ["claude-bridge/claude-opus-5-5", "claude"],
     ["anthropic/claude-sonnet", "claude"],
     ["openai-codex/gpt-6-sol", "codex"],
+    // The ChatGPT sign-in's provider is `openai`, and the same id also serves
+    // API-key accounts — one prefix, two balances, so it names no rail. The
+    // rail is registered in the `models` table instead (ADR-0022).
+    ["openai/gpt-6.1-sol", undefined],
     ["deepseek/deepseek-flash", "deepseek"],
     ["antigravity/gemini-4-argon", "antigravity-argon"],
     // The pool's own models share the stem, so a suffix is still Argon — and
