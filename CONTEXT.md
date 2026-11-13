@@ -134,8 +134,11 @@ because pi's own provider rewrites it at this extension's request — pointing a
 read at another account changes whose headroom is reported and routed on, while
 pointing a write would rewrite a file nothing reads. A Codex credential file may
 hold pi's document or the Codex CLI's, so the account it names must be the one
-the configured models run on. See
-[docs/adr/0020](docs/adr/0020-codex-credential-seam.md).
+the configured models run on. Since pi 1.5 that is usually a *different* file
+from the one the model runs on — the ChatGPT sign-in's token cannot read the
+usage document — so the path is the account's whole identity there. See
+[docs/adr/0020](docs/adr/0020-codex-credential-seam.md) and
+[docs/adr/0022](docs/adr/0022-openai-routes-read-the-codex-ledger.md).
 _Avoid_: credential store, auth file, secrets file
 
 **Session budget**:

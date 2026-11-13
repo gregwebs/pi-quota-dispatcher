@@ -451,6 +451,15 @@ checked against the registered rail, and a disagreement warns, which is what
 turns a mis-pointed route — including one that names the wrong Antigravity pool
 — into a visible mistake rather than a silent route to the wrong quota.
 
+`openai/` is deliberately **not** in that list. Since pi 1.5 the ChatGPT
+subscription's sign-in is provider `openai`, and `openai-codex` — the prefix that
+still implies `codex` — is the legacy one. The same id also serves an ordinary
+API-key OpenAI account, which is a separate, token-metered balance, so an
+`openai/*` model says nothing about which pool it draws on. Register its rail
+under `models`: for those models that entry is the only statement of the account,
+and the disagreement warning cannot speak for them. See
+[0022](docs/adr/0022-openai-routes-read-the-codex-ledger.md).
+
 ### Thinking levels
 
 A **thinking level** is the `thinking:` line pi-subagents reads from an agent
@@ -616,6 +625,14 @@ never refreshes a Codex token — so naming a file here changes which account's
 numbers are read, and therefore which headroom work is routed on; it must be the
 account the configured models actually run on. See
 [0020](docs/adr/0020-codex-credential-seam.md).
+
+On pi 1.5 and later the path usually points at the Codex CLI's own
+`~/.codex/auth.json`, because pi's default file no longer holds a credential this
+rail can use: the ChatGPT sign-in is provider `openai` there, and the token it
+stores is scoped to model requests on `api.openai.com/v1`. Pointed anywhere else
+it is answered `401`, and it names no account the usage document could be asked
+about. See
+[0022](docs/adr/0022-openai-routes-read-the-codex-ledger.md).
 
 `agentDir` and `piAuthPath` (defaults `<agent dir>/agents` and
 `<agent dir>/auth.json`) are deliberately **not**
@@ -1036,7 +1053,8 @@ quietly becomes the only one that matters. A rail with a completely full session
 budget then gets abandoned for days because its *week* looks busy.
 
 Rails are per-provider or per-pool: `claude-bridge/*` and `anthropic/*` consume
-the Claude subscription, `openai-codex/*` the Codex subscription, and
+the Claude subscription, `openai/*` and `openai-codex/*` the ChatGPT subscription
+(the same plan under pi's sign-in provider and its legacy one), and
 `antigravity/*` one of the three Antigravity pools (`gemini-4-argon*`, the other
 Gemini models, and the Claude/GPT models it proxies) that share one login.
 `deepseek/*` is metered per token rather than capped, so it reports no windows at
@@ -1124,7 +1142,7 @@ What each request is read with:
 | Rail | Credential |
 |---|---|
 | Claude | the macOS login keychain (`Claude Code-credentials`), falling back to `~/.claude/.credentials.json` → `claudeAiOauth.accessToken` |
-| Codex | the file `codexCredsPath` names (default `<agent dir>/auth.json`, normally `~/.pi/agent/auth.json`) → `openai-codex.access` + `accountId`, or the Codex CLI's `tokens.access_token` + `tokens.account_id` |
+| Codex | the file `codexCredsPath` names (default `<agent dir>/auth.json`, normally `~/.pi/agent/auth.json`) → `openai-codex.access` + `accountId`, or the Codex CLI's `tokens.access_token` + `tokens.account_id`. pi 1.5's `openai` entry is neither — see below |
 | Antigravity (all three pools) | `piAuthPath` → `antigravity.access`, with `antigravity.projectId` sent when it names one |
 
 Codex joins Claude in reading its credential from a file a config can point
@@ -1139,6 +1157,20 @@ belong to the account the configured models run on — these numbers are what th
 dispatcher **rewrites agent files** on, so another account's credential would
 route work on headroom it never spends. See
 [0020](docs/adr/0020-codex-credential-seam.md).
+
+On pi 1.5 and later the ordinary case is the CLI's file rather than pi's. The
+ChatGPT sign-in is provider `openai` there, and the credential it stores is
+scoped to `api.openai.com/v1`: sent at this usage document it is answered
+`401 rejected_by_access_enforcement`, with a `ChatGPT-Account-Id` header or
+without one, and model requests on it return no rate-limit headers either. So a
+machine whose routes name `openai/*` points `codexCredsPath` at
+`~/.codex/auth.json` and reads the plan's ledger with the Codex client's
+credential — the same account, stated by the path, which is the whole of
+[0020](docs/adr/0020-codex-credential-seam.md)'s
+identity rule. That token is refreshed only when the Codex CLI runs; nothing
+here refreshes it, so a CLI left unused eventually leaves the rail unreadable
+and the policy holding. See
+[0022](docs/adr/0022-openai-routes-read-the-codex-ledger.md).
 
 The request's `User-Agent` is pinned to the string Antigravity's current CLI
 sends, and it is load-bearing rather than polite: Google omits the `Gemini 4
