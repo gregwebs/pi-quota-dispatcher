@@ -2294,7 +2294,7 @@ export function createDispatcher(
   }
 
   async function fetchCodex(): Promise<VendorReading> {
-    const credential = await readCodexCredential(cfg.codexCredsPath);
+    const credential = await readCodexCredential(cfg.codexCredsPath, now());
     if ("error" in credential) return unavailable("codex", credential.error);
     return railRead.codex(credential);
   }
