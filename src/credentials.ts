@@ -457,7 +457,7 @@ export interface CodexCredential {
   readonly accountId: string;
 }
 
-/** A Codex credential, or why the document could not supply one. */
+/** A Codex credential fit to send, or why the document supplied none that is. */
 export type CodexCredentialRead = CodexCredential | { readonly error: string };
 
 /** One document shape a Codex credential arrives in, and the field each part is spelled under. */
@@ -544,17 +544,52 @@ export function parseCodexCredential(text: string): CodexCredentialRead {
 }
 
 /**
- * The Codex credential, or why the file named by `codexCredsPath` gave none.
+ * When the token itself says it stops working, in epoch milliseconds, or
+ * `undefined` when it says nothing this can read.
+ *
+ * Taken from the JWT's payload without checking the signature: the claim is not
+ * what makes the credential trusted — the file it was read from is — it is only
+ * what spares a request whose answer is a known `401`. The token is the one
+ * place that answers for both document shapes: pi copies this claim into
+ * `openai-codex.expires`, and the Codex CLI's file states it nowhere else.
+ *
+ * A token that is not a JWT, or whose payload is not a JSON object, is not
+ * evidence of expiry and is sent — the position `parseAntigravityToken` takes on
+ * an absent `expires`.
+ */
+function codexTokenExpiry(access: string): number | undefined {
+  const payload = access.split(".")[1];
+  if (payload === undefined) return undefined;
+  let claims: unknown;
+  try {
+    claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+  } catch {
+    return undefined;
+  }
+  const exp = jsonObject(claims)?.["exp"];
+  return typeof exp === "number" && Number.isFinite(exp) ? exp * 1_000 : undefined;
+}
+
+/**
+ * The Codex credential, or why the file named by `codexCredsPath` gave none that
+ * can be used now.
  *
  * Read fresh on every fetch rather than cached here: the file belongs to
  * whichever client writes it, and a token this process remembered would be
  * exactly the stale one the next read has to notice.
  *
+ * An expired token is named rather than sent. Nothing here refreshes it — the
+ * Codex CLI is the only writer (docs/adr/0022) — so the request can only be
+ * answered `401`, and `HTTP 401` is not the sentence a user can act on while the
+ * models themselves keep working. `now` is a parameter for the reason
+ * `parseClaudeToken` takes one: the comparison stays a pure function of its
+ * inputs.
+ *
  * A read failure is reported by its errno, never by the error's message: the
  * message quotes the path, and a parse failure's message could quote the
  * document, which is a credential.
  */
-export async function readCodexCredential(path: string): Promise<CodexCredentialRead> {
+export async function readCodexCredential(path: string, now: number): Promise<CodexCredentialRead> {
   if (!existsSync(path)) return { error: "no codex credential file" };
   let text: string;
   try {
@@ -564,7 +599,10 @@ export async function readCodexCredential(path: string): Promise<CodexCredential
       error: `unreadable codex credential file: ${(err as NodeJS.ErrnoException).code ?? "read failed"}`,
     };
   }
-  return parseCodexCredential(text);
+  const credential = parseCodexCredential(text);
+  if ("error" in credential) return credential;
+  const expires = codexTokenExpiry(credential.access);
+  return expires !== undefined && expires <= now ? { error: "codex token expired" } : credential;
 }
 
 // ------------------------------------------------------------- the claude run

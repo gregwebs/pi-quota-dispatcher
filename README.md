@@ -1169,8 +1169,11 @@ credential — the same account, stated by the path, which is the whole of
 [0020](docs/adr/0020-codex-credential-seam.md)'s
 identity rule. That token is refreshed only when the Codex CLI runs; nothing
 here refreshes it, so a CLI left unused eventually leaves the rail unreadable
-and the policy holding. See
-[0022](docs/adr/0022-openai-routes-read-the-codex-ledger.md).
+and the policy holding. A token past its own expiry is reported as
+`codex token expired` — read out of the token's `exp` claim, so no request is
+made for an answer already known. See
+[0022](docs/adr/0022-openai-routes-read-the-codex-ledger.md) and
+[0023](docs/adr/0023-an-expired-codex-token-is-named.md).
 
 The request's `User-Agent` is pinned to the string Antigravity's current CLI
 sends, and it is load-bearing rather than polite: Google omits the `Gemini 4
@@ -1319,6 +1322,11 @@ single-writer principle, [0007](docs/adr/0007-refresh-pings.md).
   next read delegates the refresh (see [above](#the-antigravity-token-is-pis-to-refresh));
   otherwise the three Antigravity rails report unavailable and hold, exactly as
   a failed read does. Nothing is moved onto another plan to compensate.
+- **The Codex token expires too, and only the Codex CLI refreshes it.** On a pi
+  1.5 install the rail reads that CLI's file, so it goes as dormant as the CLI
+  does: the rail reports `codex token expired` and holds, while the models keep
+  answering on pi's own sign-in credential. Running the CLI once is the whole
+  fix; this extension never refreshes that token and never writes the file.
 - **The macOS keychain read can ask for permission.** `security` is a different
   process from the one that created the item, so macOS may prompt the first time
   and remember your answer; choose *Always Allow* if you want the poll to stay

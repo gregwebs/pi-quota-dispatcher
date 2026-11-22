@@ -69,8 +69,11 @@ account's identity.
 
 The freshness contract is 0020's too: this extension does not refresh a Codex
 token, so the file is only as current as the last Codex CLI use. An expired
-token is a `401`, the rail is unreadable, and the policy holds — it does not
-fall back to the last good reading or to a guess. If the Codex client goes away
+token makes the rail unreadable and the policy holds — it does not fall back to
+the last good reading or to a guess. The token's own `exp` claim is what says
+so, and the report names the expiry rather than sending a request that can only
+be answered `401`: see
+[0023](0023-an-expired-codex-token-is-named.md). If the Codex client goes away
 entirely, this rail has no reader left, and `unavailable` is the honest answer.
 
 ## `openai/` names no rail

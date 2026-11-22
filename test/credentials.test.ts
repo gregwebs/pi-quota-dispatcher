@@ -17,6 +17,7 @@ import {
   parseClaudeToken,
   parseCodexCredential,
   readClaudeToken,
+  readCodexCredential,
 } from "../src/credentials.ts";
 import {
   type CommandRunner,
@@ -47,6 +48,18 @@ async function credsFile(contents: string): Promise<string> {
   const path = join(dir, "credentials.json");
   await writeFile(path, contents, "utf8");
   return path;
+}
+
+/**
+ * A JWT-shaped token carrying `claims` as its payload.
+ *
+ * Unsigned and unverified on purpose: the extension reads the `exp` claim to
+ * avoid a foregone request, never to trust the token, so the signature is not
+ * part of what a fixture has to reproduce.
+ */
+function token(claims: Record<string, unknown>): string {
+  const payload = Buffer.from(JSON.stringify(claims), "utf8").toString("base64url");
+  return `eyJhbGciOiJSUzI1NiJ9.${payload}.signature`;
 }
 
 /** A path that no store has written, in its own tmp dir. */
@@ -554,6 +567,45 @@ test("a codex credential failure never quotes the document", async () => {
   assert.ok(!lines.join("\n").includes("sk-secret"), lines.join("\n"));
 });
 
+// The Codex CLI is the only thing that refreshes that token, so a file left
+// unused expires and the read can only be answered `401` — which is what the
+// rail used to report while the models themselves kept working. The note has to
+// name what happened to the credential, not what the endpoint made of it.
+test("an expired codex token is reported as expired, and never sent", async () => {
+  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+  await writeFile(
+    fx.claudeCredsPath,
+    cred({ accessToken: "live", expiresAt: Date.now() + 3_600_000 }),
+    "utf8",
+  );
+  const codexCredsPath = join(dirname(fx.piAuthPath), "codex-auth.json");
+  await writeFile(codexCredsPath, JSON.stringify({
+    OPENAI_API_KEY: null,
+    tokens: { access_token: token({ exp: Math.floor((Date.now() - 60_000) / 1000) }), account_id: "acct" },
+    last_refresh: "2026-11-03T00:00:00Z",
+  }), "utf8");
+
+  let codexReads = 0;
+  const d = createDispatcher(
+    { ...DEFAULT_CONFIG, ...fx, codexCredsPath, agents: AGENT_ROUTES },
+    {
+      read: fakeReads({
+        claude: readingOf("claude", { session: 5 }),
+        codex: () => {
+          codexReads++;
+          return readingOf("codex", { session: 10 });
+        },
+      }),
+    },
+  );
+
+  const lines = await d.report({ force: true });
+  const line = lines.find((l) => l.startsWith("codex: unavailable"));
+  assert.ok(line, lines.join("\n"));
+  assert.equal(line, "codex: unavailable — codex token expired");
+  assert.equal(codexReads, 0, "a token past its expiry must not be sent");
+});
+
 // ---------------------------------------------------------------- parseCodexCredential
 
 // The seam the Codex rail was missing: two writers publish a credential, and
@@ -634,4 +686,35 @@ test("parseCodexCredential never quotes a malformed document", () => {
   const out = parseCodexCredential('{"tokens": {"access_token": "sk-secret-');
   assert.deepEqual(out, { error: "codex credential is not valid JSON" });
   assert.ok(!JSON.stringify(out).includes("sk-secret"), JSON.stringify(out));
+});
+
+// ---------------------------------------------------------------- readCodexCredential
+
+// The expiry is the token's own claim, read on the local clock. Both shapes
+// state it only there: pi copies it into `openai-codex.expires` and the Codex
+// CLI's file states it nowhere but the token.
+test("readCodexCredential uses a token still inside its expiry", async () => {
+  const access = token({ exp: FIXED / 1000 + 60 });
+  const path = await credsFile(JSON.stringify({ tokens: { access_token: access, account_id: "acct" } }));
+  assert.deepEqual(await readCodexCredential(path, FIXED), { access, accountId: "acct" });
+});
+
+test("readCodexCredential refuses a token whose expiry has arrived", async () => {
+  // `<=`, not `<`: a token whose expiry *is* this instant has no life left in
+  // it, the rule `parseAntigravityToken` holds to.
+  for (const exp of [FIXED / 1000 - 1, FIXED / 1000]) {
+    const path = await credsFile(JSON.stringify({
+      "openai-codex": { access: token({ exp }), accountId: "acct" },
+    }));
+    assert.deepEqual(await readCodexCredential(path, FIXED), { error: "codex token expired" });
+  }
+});
+
+// A claim this cannot read is not evidence of expiry, so the token is sent and
+// the endpoint gets to answer — the position taken on an absent `expires`.
+test("readCodexCredential sends a token that states no readable expiry", async () => {
+  for (const access of [token({}), token({ exp: "soon" }), "opaque-token", "a.b"]) {
+    const path = await credsFile(JSON.stringify({ "openai-codex": { access, accountId: "acct" } }));
+    assert.deepEqual(await readCodexCredential(path, FIXED), { access, accountId: "acct" });
+  }
 });
