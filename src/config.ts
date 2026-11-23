@@ -236,9 +236,10 @@ export interface DispatcherConfig {
    * The file the Codex rail reads its credential from, defaulting to pi's own
    * `auth.json`.
    *
-   * Settable, unlike `piAuthPath`, because nothing writes it: this rail never
-   * refreshes a Codex token, so naming any readable file here can only change
-   * which account's numbers are reported. Two document shapes are accepted —
+   * Settable, unlike `piAuthPath`, because nothing in this extension writes it:
+   * this rail never refreshes a Codex token, and `/quota-dispatch refresh-codex`
+   * only makes the CLI refresh its own file (docs/adr/0024), so naming any
+   * readable file here can only change which account's numbers are reported. Two document shapes are accepted —
    * pi's `{"openai-codex": {"access", "accountId"}}` and the Codex CLI's own
    * `{"tokens": {"access_token", "account_id"}}` — because a launcher that
    * shields the host's credentials publishes the CLI's file, not pi's.

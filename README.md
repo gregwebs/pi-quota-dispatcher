@@ -297,6 +297,7 @@ The glossary term is in [CONTEXT.md](CONTEXT.md).
 |---|---|
 | `/quota-dispatch` | Show rail budgets and the current decision per agent, plus any agent files no route names. Read-only. |
 | `/quota-dispatch refresh` | Force a re-fetch, then show. Read-only. |
+| `/quota-dispatch refresh-codex` | Run the Codex CLI once so it refreshes its own `auth.json`, then say what the file holds. It does not prove the CLI saved what it redeemed, so `codex login` is the repair if a refresh does not land. See [Keeping the Codex token fresh](#keeping-the-codex-token-fresh). |
 | `/quota-dispatch config` | Print where each configured value came from. Local, so it reads no quota and touches no file. |
 | `/quota-dispatch urls` | List every outbound URL the extension can request, for a firewall allow-list. Local, so it reads no quota and touches no file. |
 | `/quota-dispatch apply` | Write the decisions out now. |
@@ -306,6 +307,14 @@ The argument is a form name and nothing else, matched whole: `/quota-dispatch
 refresh apply` is not read as `apply`, and a word that names no form is answered
 with the list above rather than silently showing the report. `generate` takes
 the single optional word `project`; nothing else is a scope.
+
+`refresh-codex` is one word, so `/quota-dispatch refresh codex` is not it — it is
+answered with the list. What makes it worth its own form is that it is the only
+form that starts the Codex CLI: that CLI is the only thing that refreshes a Codex
+token, so the command runs it once and then reports what the file holds. The
+extension still writes no credential — the run is the CLI's, and the file belongs
+to whoever wrote it. `refresh-codex` boots nothing and reads no quota: it is a
+subprocess and one file re-read, answered before the report's machinery is set up.
 
 The two reporting forms are read-only by construction — `report()` has no way to
 be asked to write, so "show me the state" cannot rewrite your agents — and
@@ -620,11 +629,13 @@ runs would be worse than doing nothing.
 `codexCredsPath` is settable for the same reason, and defaults to pi's own
 `<agent dir>/auth.json`: the file the [Codex rail](#where-the-numbers-come-from)
 reads its credential from, in either pi's document shape or the Codex CLI's. It
-is settable where `piAuthPath` is not because **nothing writes it** — this rail
-never refreshes a Codex token — so naming a file here changes which account's
-numbers are read, and therefore which headroom work is routed on; it must be the
-account the configured models actually run on. See
-[0020](docs/adr/0020-codex-credential-seam.md).
+is settable where `piAuthPath` is not because **nothing in this extension writes
+it** — the rail never refreshes a Codex token, and `/quota-dispatch refresh-codex`
+only makes the CLI refresh its own file — so naming a file here changes which
+account's numbers are read, and therefore which headroom work is routed on; it
+must be the account the configured models actually run on. See
+[0020](docs/adr/0020-codex-credential-seam.md) and
+[0024](docs/adr/0024-a-codex-token-is-refreshed-when-you-ask.md).
 
 On pi 1.5 and later the path usually points at the Codex CLI's own
 `~/.codex/auth.json`, because pi's default file no longer holds a credential this
@@ -1167,11 +1178,13 @@ machine whose routes name `openai/*` points `codexCredsPath` at
 `~/.codex/auth.json` and reads the plan's ledger with the Codex client's
 credential — the same account, stated by the path, which is the whole of
 [0020](docs/adr/0020-codex-credential-seam.md)'s
-identity rule. That token is refreshed only when the Codex CLI runs; nothing
-here refreshes it, so a CLI left unused eventually leaves the rail unreadable
-and the policy holding. A token past its own expiry is reported as
-`codex token expired` — read out of the token's `exp` claim, so no request is
-made for an answer already known. See
+identity rule. That token is refreshed only when the Codex CLI runs, so a CLI
+left unused eventually leaves the rail unreadable and the policy holding —
+`/quota-dispatch refresh-codex` is how you make it run once without leaving pi,
+and nothing here writes the file itself. A token past its own expiry is reported
+as `codex token expired` — read out of the token's `exp` claim, so no request is
+made for an answer already known — and that note names the command, or the reason
+the command would not help on this machine. See
 [0022](docs/adr/0022-openai-routes-read-the-codex-ledger.md) and
 [0023](docs/adr/0023-an-expired-codex-token-is-named.md).
 
@@ -1193,6 +1206,16 @@ Antigravity token has expired, the refresh is performed by pi's own provider
 rather than by this extension. Whatever hosts your pi install already needs for
 those flows have to stay reachable; `/quota-dispatch urls` lists only the
 requests this extension makes itself.
+
+`/quota-dispatch refresh-codex` is a third such path, and the split is worth
+being exact about. This extension's own addition is one loopback listener bound to
+`127.0.0.1` for the length of a run: it answers `400` and reads no header. What
+the spawned Codex CLI itself contacts — OpenAI's auth service for the token
+exchange, plus whatever its own configuration, managed policy, hooks or MCP
+servers point it at — is not chosen here and is not bounded by these flags. That
+is the operator's environment, and
+[0024](docs/adr/0024-a-codex-token-is-refreshed-when-you-ask.md) states it as a
+residual rather than a promise.
 
 The Claude credential has two possible homes because Claude Code has two. On
 macOS the one it actually refreshes is the login keychain; the
@@ -1293,6 +1316,73 @@ is doing the work, so the next read may try again.
 See [0007](docs/adr/0007-refresh-pings.md) for the measurements, the bounds, and
 the alternatives that were rejected.
 
+### Keeping the Codex token fresh
+
+The Codex rail reads the Codex CLI's own `auth.json`, and the Codex CLI is the
+only thing that refreshes that token. A CLI left unused for a while therefore
+leaves the rail unreadable and every route whose primary is on it holding, while
+the models themselves keep answering on pi's own sign-in. `/quota-dispatch
+refresh-codex` is the way out: it runs the CLI once, in the foreground, and then
+says what the file holds.
+
+```text
+codex exec --ephemeral --ignore-user-config --skip-git-repo-check \
+  -c chatgpt_base_url="http://127.0.0.1:<port>" -c approval_policy="never" \
+  -c sandbox_mode="read-only" hi
+```
+
+That is the measured diverted run: the model request is pointed at a loopback
+listener this extension answers itself with a `400`, so the run ends promptly and
+spends no budget — a measurement of `codex-cli 0.170.0`, not a sandbox guarantee
+— and the CLI refreshes its credential on the way up. The command
+waits up to 90 seconds for it to exit on its own, then asks it to stop and, five
+seconds later, insists; five seconds after that it stops waiting and says no exit
+was observed. The child gets a private temporary working directory, a stripped
+environment (`OPENAI_*`, `CODEX_*` except `CODEX_HOME`, and `RUST_LOG` removed,
+with `127.0.0.1` added to `NO_PROXY`) and no terminal. The launch notice says what
+is happening before the wait begins, and there is exactly one result after it.
+
+Nothing is run unless eight cheap local facts hold, and the first one that fails
+is the sentence you get:
+
+| Refuses when |
+|---|
+| the platform is Windows |
+| `CODEX_HOME` or `HOME` is not a usable absolute path |
+| `codexCredsPath` is the same file as pi's own `auth.json` |
+| `codexCredsPath` is not the Codex CLI home's own `auth.json` |
+| the Codex CLI home has a `.env`, or it could not be checked |
+| the CLI's `config.toml` chooses a credential store other than the file, or could not be checked |
+| the document is not the CLI's managed ChatGPT login |
+| no executable `codex` is on an absolute `PATH` entry |
+
+A token with more than five minutes left is not a refusal but a `not-due`: nothing
+is wrong, the run is just not worth a subprocess, and the command says so.
+
+Success is stated as what was observed and nothing more: a numeric exit before
+the deadline **and** the file now holding a new token for the same account, valid
+until an instant it prints. Everything else is a warning. An account that
+changed, a file that moved or vanished, a token already expired or stating no
+expiry, a run that timed out or died on a signal — each ends "not reported as a
+refresh". The same token unchanged is stated as exactly that, with the listener
+evidence beside it, and is not a refresh either.
+
+What neither the success nor the failure lines prove is whether the CLI saved
+what it redeemed: the command cannot see who wrote the file, it cannot see a
+token rotated on the server and lost, and managed or system configuration the
+flags do not cover can log the account out during startup. So when either of
+those has happened, the repair is the same one: **run `codex login` once.**
+[0024](docs/adr/0024-a-codex-token-is-refreshed-when-you-ask.md) states the whole
+set of residuals, and the pinned release the run was measured against.
+
+The report suggests the command when the codex rail's token has expired: the
+`codex token expired` note gains `run /quota-dispatch refresh-codex to have the
+Codex CLI refresh it` when the checks above would admit a run, or the refusal
+that says why they would not. Two cases read differently: a file whose token now
+has more than five minutes left points at `/quota-dispatch refresh` instead (the
+next read finds it), and a healthy line or an `HTTP 401` carries no hint at all,
+because neither is the expired-token fact.
+
 ### The Antigravity token is pi's to refresh
 
 `pi-antigravity` registers an OAuth provider with pi, so the token in
@@ -1326,7 +1416,10 @@ single-writer principle, [0007](docs/adr/0007-refresh-pings.md).
   1.5 install the rail reads that CLI's file, so it goes as dormant as the CLI
   does: the rail reports `codex token expired` and holds, while the models keep
   answering on pi's own sign-in credential. Running the CLI once is the whole
-  fix; this extension never refreshes that token and never writes the file.
+  fix — run it yourself, or run `/quota-dispatch refresh-codex` to have it run
+  once in the foreground (see [above](#keeping-the-codex-token-fresh)). This
+  extension still never refreshes that token itself and never writes the file,
+  and a refresh that does not land is repaired with `codex login`.
 - **The macOS keychain read can ask for permission.** `security` is a different
   process from the one that created the item, so macOS may prompt the first time
   and remember your answer; choose *Always Allow* if you want the poll to stay

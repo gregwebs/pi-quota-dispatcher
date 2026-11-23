@@ -128,18 +128,34 @@ _Avoid_: cache file, quota file, shared store, readings cache
 
 **Credential file**:
 The file a rail's credential is read from, named by that rail's own path key.
-A credential path is **settable** exactly when nothing writes it: `claudeCredsPath`
-and `codexCredsPath` are read-only seams, while `piAuthPath` is not settable
+A credential path is **settable** exactly when nothing in this extension writes
+it: `claudeCredsPath` and `codexCredsPath` are read-only seams, while `piAuthPath`
+is not settable
 because pi's own provider rewrites it at this extension's request — pointing a
 read at another account changes whose headroom is reported and routed on, while
 pointing a write would rewrite a file nothing reads. A Codex credential file may
 hold pi's document or the Codex CLI's, so the account it names must be the one
 the configured models run on. Since pi 1.5 that is usually a *different* file
 from the one the model runs on — the ChatGPT sign-in's token cannot read the
-usage document — so the path is the account's whole identity there. See
-[docs/adr/0020](docs/adr/0020-codex-credential-seam.md) and
-[docs/adr/0022](docs/adr/0022-openai-routes-read-the-codex-ledger.md).
+usage document — so the path is the account's whole identity there. The one command that causes a
+Codex credential to be refreshed, `/quota-dispatch refresh-codex`, refuses any
+path other than the **Codex CLI home**'s own `auth.json`: it runs the CLI and
+reads what the CLI wrote, so a path the CLI would not write is a path whose change
+could only be another writer's. See
+[docs/adr/0020](docs/adr/0020-codex-credential-seam.md),
+[docs/adr/0022](docs/adr/0022-openai-routes-read-the-codex-ledger.md) and
+[docs/adr/0024](docs/adr/0024-a-codex-token-is-refreshed-when-you-ask.md).
 _Avoid_: credential store, auth file, secrets file
+
+**Codex CLI home**:
+The directory the Codex CLI keeps its own `auth.json` and `config.toml` in:
+`$CODEX_HOME` when that is set, otherwise `~/.codex`. It is the CLI's location,
+not a dispatcher setting, and it is compared as the OS resolves it — `..` is
+resolved *after* symlinks, so a spelling with a link and a `..` names the same
+home as its resolved form, and a checker that collapsed it first would disagree
+with the writer about which file it had been shown. It is the only home
+`/quota-dispatch refresh-codex` will run the CLI against.
+_Avoid_: codex dir, CLI config dir, codex folder
 
 **Session budget**:
 A rail's short-window cap — the acute one that blocks work mid-task and clears

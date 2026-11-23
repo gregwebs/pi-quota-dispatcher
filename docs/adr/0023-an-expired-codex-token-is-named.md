@@ -83,13 +83,18 @@ machine whose clock is wrong is a machine to fix, not a rule to soften.
 Not refused here on its merits, but it is a separate decision with its own cost
 (the CLI is an agent, not a token refresher) and 0022's rejection of refreshing
 the token ourselves still stands. The note is what makes the human's own fix
-findable; nothing in this change touches the credential file.
+findable; nothing in this change touches the credential file. **Partly superseded
+by [0024](0024-a-codex-token-is-refreshed-when-you-ask.md)**: that separate
+decision was taken, as the command `/quota-dispatch refresh-codex`, and the note
+this ADR introduced is what names it.
 
 ## Consequences
 
 The codex line reads `codex: unavailable — codex token expired`, which names both
 what happened and, for anyone who reads the README, what to do: use the Codex
-CLI. Policy is unchanged — an expired token is a missing reading, so agents
+CLI. **Partly superseded by [0024](0024-a-codex-token-is-refreshed-when-you-ask.md)**:
+the line now carries the command to run, or the admission check's reason it would
+not help here, computed when the report is printed. The note itself is unchanged. Policy is unchanged — an expired token is a missing reading, so agents
 hold, and nothing falls back to the last good reading or onto another rail.
 
 `HTTP 401` on the codex line now means something narrower and more useful: the

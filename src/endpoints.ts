@@ -23,7 +23,7 @@ import { type Rail } from "./rail.ts";
  */
 export const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 
-/** Codex's usage document, read with `openai-codex` credentials from pi's auth file. */
+/** Codex's usage document, read with the credential `codexCredsPath` names. */
 export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 
 /**

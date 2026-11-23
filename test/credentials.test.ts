@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -571,7 +571,7 @@ test("a codex credential failure never quotes the document", async () => {
 // unused expires and the read can only be answered `401` — which is what the
 // rail used to report while the models themselves kept working. The note has to
 // name what happened to the credential, not what the endpoint made of it.
-test("an expired codex token is reported as expired, and never sent", async () => {
+test("an expired codex token is reported as expired, and never sent", async (t) => {
   const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
   await writeFile(
     fx.claudeCredsPath,
@@ -586,6 +586,12 @@ test("an expired codex token is reported as expired, and never sent", async () =
   }), "utf8");
 
   let codexReads = 0;
+  // An empty Codex CLI home, so the hint the report adds is a fact about this
+  // fixture's machine rather than about the one running the tests: no `auth.json`
+  // there, so `/quota-dispatch refresh-codex` would refuse this path, and the
+  // report says so instead of suggesting a run that would do nothing.
+  const codexHome = await mkdtemp(join(tmpdir(), "pqd-cred-codex-home-"));
+  t.after(() => rm(codexHome, { recursive: true, force: true }));
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, codexCredsPath, agents: AGENT_ROUTES },
     {
@@ -596,13 +602,20 @@ test("an expired codex token is reported as expired, and never sent", async () =
           return readingOf("codex", { session: 10 });
         },
       }),
+      codexHost: {
+        env: { PATH: process.env.PATH, HOME: process.env.HOME, CODEX_HOME: codexHome },
+        platform: "darwin",
+      },
     },
   );
 
   const lines = await d.report({ force: true });
   const line = lines.find((l) => l.startsWith("codex: unavailable"));
   assert.ok(line, lines.join("\n"));
-  assert.equal(line, "codex: unavailable — codex token expired");
+  assert.equal(
+    line,
+    "codex: unavailable — codex token expired; not refreshable from here: codexCredsPath is not the Codex CLI's own auth.json",
+  );
   assert.equal(codexReads, 0, "a token past its expiry must not be sent");
 });
 
