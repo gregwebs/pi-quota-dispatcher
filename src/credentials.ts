@@ -6,14 +6,17 @@
  * `{ token }` or `{ error, reason }` shape one rail's read needs. Deciding
  * *whether* a credential is worth renewing is not done here: the Claude token's
  * refresh gate belongs to the dispatcher, which holds the machine-wide gates and
- * the one ping, so `readClaudeToken` only ever reports what the stores said. See
+ * the one ping, so `readClaudeToken` only ever reports what the stores said, and
+ * a Codex token's refresh belongs to `codex-refresh.ts`, which decides whether
+ * the CLI may be run at all. See
  * docs/adr/0021-a-rail-read-is-its-own-module.md.
  *
  * The Antigravity credential is the one that is renewed by this extension
  * asking someone else to, and that orchestration lives here because it is
  * acquisition — but it delegates the write to pi and never posts a refresh token
  * itself, for the reason ADR 0007 gives about Claude. See
- * docs/adr/0007-refresh-pings.md and docs/adr/0020-codex-credential-seam.md.
+ * docs/adr/0007-refresh-pings.md, docs/adr/0020-codex-credential-seam.md and
+ * docs/adr/0024-a-codex-token-is-refreshed-when-you-ask.md.
  */
 import { existsSync, type Stats } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
@@ -474,9 +477,11 @@ const PI_CODEX: CodexShape = { section: "openai-codex", access: "access", accoun
 /**
  * The Codex CLI's own `auth.json`.
  *
- * Read and never written: the CLI owns that file, and a launcher that shields
- * the host's credentials publishes this one when it may not publish pi's — see
- * `docs/adr/0020-codex-credential-seam.md`.
+ * Read here and never written: the CLI owns that file, and a launcher that
+ * shields the host's credentials publishes this one when it may not publish
+ * pi's — see `docs/adr/0020-codex-credential-seam.md`. The only thing in this
+ * extension that causes a write to it is `/quota-dispatch refresh-codex`, and it
+ * writes nothing itself: it runs the CLI and re-reads this file.
  */
 const CLI_CODEX: CodexShape = { section: "tokens", access: "access_token", account: "account_id" };
 
@@ -544,6 +549,16 @@ export function parseCodexCredential(text: string): CodexCredentialRead {
 }
 
 /**
+ * What the report says about an expired Codex token: the fact, with no decision
+ * attached, because until now nothing in this extension could make one.
+ *
+ * Exported because the report has to recognise it: an expired token is the one
+ * failure the reader is offered a fix for, and the fix is a command rather than
+ * another reading. See `codexExpiredHint`.
+ */
+export const CODEX_TOKEN_EXPIRED = "codex token expired";
+
+/**
  * When the token itself says it stops working, in epoch milliseconds, or
  * `undefined` when it says nothing this can read.
  *
@@ -557,7 +572,7 @@ export function parseCodexCredential(text: string): CodexCredentialRead {
  * evidence of expiry and is sent — the position `parseAntigravityToken` takes on
  * an absent `expires`.
  */
-function codexTokenExpiry(access: string): number | undefined {
+export function codexTokenExpiry(access: string): number | undefined {
   const payload = access.split(".")[1];
   if (payload === undefined) return undefined;
   let claims: unknown;
@@ -579,9 +594,11 @@ function codexTokenExpiry(access: string): number | undefined {
  * exactly the stale one the next read has to notice.
  *
  * An expired token is named rather than sent. Nothing here refreshes it — the
- * Codex CLI is the only writer (docs/adr/0022) — so the request can only be
- * answered `401`, and `HTTP 401` is not the sentence a user can act on while the
- * models themselves keep working. `now` is a parameter for the reason
+ * Codex CLI is the only writer (docs/adr/0022), and only when it runs — so the
+ * request can only be answered `401`, and `HTTP 401` is not the sentence a user
+ * can act on while the models themselves keep working. `CODEX_TOKEN_EXPIRED` is
+ * exported so the report can recognise exactly this note and say what to do about
+ * it: see docs/adr/0024-a-codex-token-is-refreshed-when-you-ask.md. `now` is a parameter for the reason
  * `parseClaudeToken` takes one: the comparison stays a pure function of its
  * inputs.
  *
@@ -602,7 +619,7 @@ export async function readCodexCredential(path: string, now: number): Promise<Co
   const credential = parseCodexCredential(text);
   if ("error" in credential) return credential;
   const expires = codexTokenExpiry(credential.access);
-  return expires !== undefined && expires <= now ? { error: "codex token expired" } : credential;
+  return expires !== undefined && expires <= now ? { error: CODEX_TOKEN_EXPIRED } : credential;
 }
 
 // ------------------------------------------------------------- the claude run

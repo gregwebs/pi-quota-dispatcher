@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { test } from "node:test";
+import { after, test, type TestContext } from "node:test";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -20,11 +20,43 @@ import extension, {
 import { ANTIGRAVITY_QUOTA_URL, CLAUDE_USAGE_URL, CODEX_USAGE_URL } from "../src/endpoints.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { explicitSkill } from "../src/skill-binding.ts";
+import {
+  codexFixture,
+  installCodexTrap,
+  removeCodexFixtures,
+  type CodexFixture,
+} from "./helpers/codex-fixture.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
 // documented literal directly.
 const ENV_AGENT_DIR = "PI_CODING_AGENT_DIR";
 const CONFIG_FILE_NAME = "quota-dispatch.json";
+
+/**
+ * The tripwire for `/quota-dispatch refresh-codex`, which is the one form that
+ * starts another agent's CLI.
+ *
+ * A `codex` first on `PATH` records that it was started and exits 99, so a test
+ * that must spawn nothing leaves an invocation behind instead of running a real
+ * CLI against the developer's own account. The five `refresh-codex` tests put a
+ * fixture's own `bin` ahead of it for the length of one test, and put the
+ * environment back afterwards, so the check at the end measures the trap.
+ */
+const codexTrap = await installCodexTrap();
+process.env.PATH = `${codexTrap.dir}:${process.env.PATH ?? ""}`;
+// An empty Codex CLI home: nothing here may read the developer's `~/.codex` by
+// accident, and "no auth.json there" is a fact the report's hint can state.
+const CODEX_HOME_DIR = await mkdtemp(join(tmpdir(), "pqd-cmd-codex-home-"));
+process.env.CODEX_HOME = CODEX_HOME_DIR;
+
+// One hook, in this order: the trap is read before anything is removed, so a
+// spawn that fell through to it is a failure rather than an empty log, and the
+// fixtures and temp dirs this file made are then cleaned up.
+after(async () => {
+  assert.equal(await codexTrap.invocations(), 0, "no test may start a real codex");
+  await removeCodexFixtures();
+  await rm(CODEX_HOME_DIR, { recursive: true, force: true });
+});
 
 const TEMPLATE = (name: string, model: string) =>
   `---\nname: ${name}\ndescription: x\nmodel: "${model}"\nthinking: high\n---\n\nBody.\n`;
@@ -873,6 +905,10 @@ test("the argument is a whole form name, not a substring of one", () => {
   assert.deepEqual(parseInvocation(""), { form: "report", force: false });
   assert.deepEqual(parseInvocation("   "), { form: "report", force: false });
   assert.deepEqual(parseInvocation(" refresh "), { form: "report", force: true });
+  // The Codex refresh is its own form, and one word: the CLI run is the only
+  // thing here that starts another agent's process, so it is never guessed at.
+  assert.deepEqual(parseInvocation("refresh-codex"), { form: "refresh-codex" });
+  assert.deepEqual(parseInvocation("  refresh-codex  "), { form: "refresh-codex" });
   assert.deepEqual(parseInvocation("config"), { form: "config" });
   assert.deepEqual(parseInvocation("urls"), { form: "urls" });
   assert.deepEqual(parseInvocation("apply"), { form: "apply" });
@@ -899,6 +935,10 @@ test("an argument that names no form is unknown rather than a guess", () => {
   assert.deepEqual(parseInvocation("refresh apply"), { form: "unknown", arg: "refresh apply" });
   // And a typo used to fall through to the plain report without saying so.
   assert.deepEqual(parseInvocation("applyx"), { form: "unknown", arg: "applyx" });
+  // `refresh codex` is two words and `refresh-codex now` is two forms' worth of
+  // text: neither is the form, and neither may reach a spawn.
+  assert.deepEqual(parseInvocation("refresh codex"), { form: "unknown", arg: "refresh codex" });
+  assert.deepEqual(parseInvocation("refresh-codex now"), { form: "unknown", arg: "refresh-codex now" });
   assert.deepEqual(parseInvocation("frobnicate"), { form: "unknown", arg: "frobnicate" });
 });
 
@@ -911,7 +951,7 @@ test("the registered description names every form", async () => {
   const fx = await fixture();
 
   await withExtension(fx, async ({ description }) => {
-    for (const form of ["refresh", "config", "urls", "apply", "generate"]) {
+    for (const form of ["refresh", "refresh-codex", "config", "urls", "apply", "generate"]) {
       assert.ok(description?.includes(form), `the description must name ${form}: ${description}`);
     }
   });
@@ -944,6 +984,189 @@ test("an unknown form is reported, reads no quota, and writes nothing", async ()
 
   assert.equal(fetches, 0, "an unknown form must not read a quota");
   assert.equal(await readFile(fx.plannerFile, "utf8"), before, "an unknown form must not write");
+});
+
+// ---------------------------------------------------------------- refresh-codex
+
+/**
+ * Points the process at one Codex fixture, and puts the environment back after.
+ *
+ * `/quota-dispatch refresh-codex` reads its target from the live process, not
+ * from a dep, so a test that wants a runnable `codex` has to move the
+ * environment. `PATH` is *prepended* rather than replaced: the fixture's own
+ * absolute `bin` comes first, so the trap at the end of the file still sees any
+ * spawn that was not supposed to happen.
+ */
+async function withCodexFixture(t: TestContext, fx: CodexFixture): Promise<void> {
+  const previous = { PATH: process.env.PATH, HOME: process.env.HOME, CODEX_HOME: process.env.CODEX_HOME };
+  process.env.PATH = `${fx.bin}:${previous.PATH ?? ""}`;
+  process.env.HOME = fx.home;
+  process.env.CODEX_HOME = fx.codexHome;
+  t.after(() => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+}
+
+/** How many times a Codex fixture's CLI ran. */
+async function codexInvocations(fx: CodexFixture): Promise<number> {
+  try {
+    return (await readFile(join(fx.control, "invocations.jsonl"), "utf8"))
+      .split("\n")
+      .filter((line) => line.length > 0).length;
+  } catch {
+    return 0;
+  }
+}
+
+/** The mode the stand-in CLI runs in. */
+async function codexMode(fx: CodexFixture, mode: Record<string, unknown>): Promise<void> {
+  await writeFile(join(fx.control, "mode.json"), JSON.stringify(mode), "utf8");
+}
+
+test("refresh-codex runs the fixture codex once, reports the refresh, and reads no quota", async (t) => {
+  const codex = await codexFixture();
+  await withCodexFixture(t, codex);
+  await codexMode(codex, { mode: "refresh" });
+  const fx = await fixture(2_147_483_647, {}, { codexCredsPath: codex.authPath });
+
+  let fetches = 0;
+  const refused = (async (url: string | URL) => {
+    fetches += 1;
+    throw new Error(`refresh-codex must not read a quota: ${String(url)}`);
+  }) as unknown as typeof fetch;
+
+  await withExtension(
+    fx,
+    async ({ runAll }) => {
+      const notifications = await runAll("refresh-codex");
+      // Two: the notice before the wait, and one outcome after it.
+      assert.equal(notifications.length, 2, notifications.join("\n---\n"));
+      assert.equal(
+        notifications[0],
+        "quota-dispatcher: running codex once to let it refresh its own credential (usually about 15 seconds; timed out after 90).",
+      );
+      assert.match(
+        notifications[1],
+        /^quota-dispatcher: after the run the credential file holds a new token for the same account \(valid until .+\)\.\nRun \/quota-dispatch refresh to read the codex rail again\.$/,
+      );
+    },
+    () => refused,
+  );
+
+  assert.equal(fetches, 0, "the refresh command reads no quota");
+  assert.equal(await codexInvocations(codex), 1, "the CLI ran exactly once");
+});
+
+test("refresh-codex refuses pi's auth.json by name and runs nothing", async (t) => {
+  const codex = await codexFixture();
+  await withCodexFixture(t, codex);
+  await codexMode(codex, { mode: "refresh" });
+  // The fixture's global config names no `codexCredsPath`, so the shipped default
+  // stands: the file the codex rail reads, which is pi's own `auth.json`.
+  const fx = await fixture();
+
+  await withExtension(fx, async ({ run }) => {
+    assert.equal(
+      await run("refresh-codex"),
+      "quota-dispatcher: refresh-codex ran nothing: codexCredsPath is pi's own auth.json, which the Codex CLI does not write.",
+    );
+  });
+
+  assert.equal(await codexInvocations(codex), 0, "a refused run spawns nothing");
+  assert.equal(await codexTrap.invocations(), 0);
+});
+
+test("refresh-codex is answered without a boot and draws no gauge", async (t) => {
+  const codex = await codexFixture();
+  await withCodexFixture(t, codex);
+  await codexMode(codex, { mode: "refresh" });
+  const fx = await fixture(2_147_483_647, {}, { codexCredsPath: codex.authPath });
+
+  /** A model registry that fails the test if anything asks it to resolve a model. */
+  const asked: string[] = [];
+  const registry = {
+    find: (provider: string, model: string) => {
+      asked.push(`${provider}/${model}`);
+      throw new Error("refresh-codex must not boot");
+    },
+  };
+
+  await withExtension(
+    fx,
+    async ({ invoke, notifications, statuses }) => {
+      await invoke("refresh-codex");
+      assert.equal(notifications.length, 2, notifications.map((n) => n.text).join("\n---\n"));
+      // Nothing was drawn: the command answers from the file it re-read, so no
+      // footer line may move.
+      assert.deepEqual(statuses, [], "the refresh command draws nothing");
+    },
+    stubFetch,
+    { modelRegistry: registry },
+  );
+
+  assert.deepEqual(asked, [], "the refresh command runs no model check");
+});
+
+test("refresh-codex uses the codexCredsPath activated by generate", async (t) => {
+  const codex = await codexFixture();
+  await withCodexFixture(t, codex);
+  await codexMode(codex, { mode: "refresh" });
+
+  // The generated layer is the only place the fixture's CLI credential is named,
+  // so a command that read the file the load *started* with would refuse here.
+  const layer = { ...GENERATED_LAYER, codexCredsPath: codex.authPath };
+  const fx = await generateFixture(
+    layer,
+    (layerPath) =>
+      `"${process.execPath}" -e "process.stdout.write(require('node:fs').readFileSync(process.argv[1],'utf8'))" "${layerPath}"`,
+  );
+  await layerNamesFixtureCredential(fx, layer);
+
+  await withExtension(fx, async ({ run, runAll }) => {
+    const generated = await run("generate");
+    assert.ok(generated.startsWith("[generated] "), generated);
+
+    const notifications = await runAll("refresh-codex");
+    assert.equal(notifications.length, 2, notifications.join("\n---\n"));
+    assert.match(notifications[1], /holds a new token for the same account/);
+  });
+
+  assert.equal(await codexInvocations(codex), 1, "the activated config's codex path was used");
+});
+
+test("the plain report on an expired CLI login names refresh-codex and spawns nothing", async (t) => {
+  const codex = await codexFixture();
+  await withCodexFixture(t, codex);
+  const fx = await fixture(2_147_483_647, {}, { codexCredsPath: codex.authPath });
+
+  await withExtension(fx, async ({ run, statuses }) => {
+    const text = await run("");
+    assert.ok(
+      text.includes(
+        "codex: unavailable — codex token expired; run /quota-dispatch refresh-codex to have the Codex CLI refresh it",
+      ),
+      text,
+    );
+    // The hint is about what to do next, not part of the reading the gauge draws
+    // from, so no footer key may carry it.
+    assert.deepEqual(
+      statuses.filter((status) => (status.text ?? "").includes("refresh-codex")),
+      [],
+      JSON.stringify(statuses),
+    );
+  });
+
+  // Nor is it written: the reading is stored, the sentence about the next command
+  // is not.
+  const stored = await readFile(join(fx.agentDir, "quota-dispatch-readings.json"), "utf8").catch(() => "");
+  assert.ok(stored.includes("codex token expired"), "the reading itself is stored");
+  assert.ok(!stored.includes("refresh-codex"), "the hint is never stored");
+
+  assert.equal(await codexInvocations(codex), 0, "a report must not run the CLI");
+  assert.equal(await codexTrap.invocations(), 0);
 });
 
 // ---------------------------------------------------------------- generate

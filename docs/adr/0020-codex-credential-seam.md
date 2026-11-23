@@ -38,6 +38,11 @@ file `piAuthPath` names — `<agentDir>/auth.json`:
 | the three Antigravity pools | `piAuthPath` | no — pi owns it | pi's `antigravity` provider |
 | all rails' readings | `readingsPath` | no — derived from the agent dir | this extension |
 
+**Partly superseded by [0024](0024-a-codex-token-is-refreshed-when-you-ask.md)**
+on one point only: the Codex CLI can now be caused to refresh this file, by a
+command a human runs. The extension still writes nothing, and the path is still a
+read-only seam here.
+
 The distinction that decides the middle column is **read versus write**, not
 "credential versus pi's": a JSON file pointing a path the dispatcher writes
 elsewhere would only rewrite files nothing reads, while a path it reads changes
@@ -49,7 +54,11 @@ beside the first — it routes work on headroom that work will not spend, which 
 the failure [0003](0003-claude-credential-stores.md) refused when it made the
 keychain a fallback for the default Claude file only. Codex adds no writing
 seam: the rail never refreshes an OAuth token, so a stale token stays the 401 it
-is today, and nothing here can be made to act on a credential.
+is today, and nothing here can be made to act on a credential. **Partly superseded
+by [0024](0024-a-codex-token-is-refreshed-when-you-ask.md)**: a stale token is no
+longer a dead end, because `/quota-dispatch refresh-codex` runs the CLI once so
+that the CLI refreshes its own file. The rail still reads whatever that file
+holds and still writes nothing.
 
 The default is pi's own file rather than "unset means pi's file" because the
 value is then always a path: it is one row in the provenance block, one field in

@@ -3,6 +3,15 @@
  * listener proves diversion without inspecting credentials. See
  * docs/adr/0007-refresh-pings.md.
  *
+ * Two commands now use that listener, for two different reasons. A Claude ping
+ * needs it as *evidence* — the diverted request arriving is the only proof the
+ * override took effect. `/quota-dispatch refresh-codex` needs it as an
+ * *address*: the Codex run is pointed at it so the model request never reaches a
+ * model, and arrival there is a diagnostic detail rather than a success
+ * criterion (docs/adr/0024-a-codex-token-is-refreshed-when-you-ask.md). What they
+ * share is the socket and its rules: bound to `127.0.0.1`, an ephemeral port, a
+ * `400` at once, and never a look at a header.
+ *
  * The default-profile predicate lives here because it is about which profile a
  * ping speaks for. The subprocess runner it uses is `exec.ts` — which is also
  * where `CredentialRead` lives, so the ping and the credential reads in
@@ -62,7 +71,7 @@ export function isDefaultClaudeCredsPath(path: string): boolean {
 }
 
 /**
- * The loopback socket a refresh ping's model request is diverted to.
+ * The loopback socket a delegated run's model request is diverted to.
  *
  * A listener rather than an unroutable port, for two reasons measured in
  * docs/adr/0007-refresh-pings.md: it ends the run promptly, and a request

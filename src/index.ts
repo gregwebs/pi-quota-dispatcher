@@ -174,6 +174,19 @@ import {
   type ClaudeRefresh,
 } from "./refresh.ts";
 
+// The Codex CLI refresh module owns the one run this extension delegates to
+// another agent's own client, and the admission list that decides whether it may:
+// the command's own check and the report's hint are the same eight facts.
+import {
+  CODEX_REFRESH_LAUNCH_NOTICE,
+  codexExpiredHint,
+  codexRefreshReadiness,
+  createCodexRefresh,
+  describeCodexRefresh,
+  processCodexHost,
+  type CodexHost,
+} from "./codex-refresh.ts";
+
 // The credentials module is where a store's text becomes a token, and where
 // the Claude token, the Codex credential and the single-flight Antigravity
 // refresh are acquired. It deliberately does not own every acquisition: the
@@ -181,6 +194,7 @@ import {
 // this entry point, which names the module's types in its deps and asks it for
 // tokens.
 import {
+  CODEX_TOKEN_EXPIRED,
   PROVIDER_TOKEN_TIMEOUT_MS,
   claudeInstall,
   createAntigravityToken,
@@ -1831,6 +1845,17 @@ export interface DispatcherDeps {
   transport?: Transport;
   now?: () => number;
   /**
+   * Seam: the environment and platform the Codex CLI refresh is admitted from.
+   * Defaults to `processCodexHost()`.
+   *
+   * A seam because the admission list is a pure function of it: a report test
+   * that wants a Windows host, another `CODEX_HOME`, or a `PATH` with no `codex`
+   * on it states one instead of arranging this process's environment. It reaches
+   * only the report's hint — the command itself reads the live process, so a
+   * test can never make a command act on a machine it invented.
+   */
+  codexHost?: CodexHost;
+  /**
    * Seam: the claude install the sticky halt is keyed to. Defaults to
    * claudeInstall().
    */
@@ -2045,6 +2070,10 @@ export function createDispatcher(
   deps: DispatcherDeps = {},
 ): Dispatcher {
   const now = deps.now ?? (() => Date.now());
+  // Read once, like the clock: a report asks one machine what it can do about an
+  // expired Codex token, and a host that changed mid-report could answer twice
+  // with two different machines.
+  const codexHost = deps.codexHost ?? processCodexHost();
   // Merged field by field rather than spread, so an injected `undefined` reads
   // as "not stated" instead of replacing a shipped timing with one that has no
   // value at all.
@@ -2590,10 +2619,25 @@ export function createDispatcher(
     // that could disagree.
     const directory = await readAgentDirectory(cfg.agentDir);
     const lines: string[] = [];
+    // The clock and the host the hint is computed from, sampled once: the hint is
+    // a statement about *now*, and two rails or two hints read against different
+    // instants could contradict each other.
+    const hintAt = now();
+    const codexTarget = { credsPath: cfg.codexCredsPath, piAuthPath: cfg.piAuthPath, host: codexHost };
     for (const rail of RAILS) {
       const s = rails.get(rail)!;
-      if (!s.ok) lines.push(`${rail}: unavailable — ${s.note}`);
-      else if (!s.windows.length) lines.push(`${rail}: ok — ${s.note ?? "no windows"}`);
+      if (!s.ok) {
+        // An expired Codex token is the one failure with a fix outside this
+        // extension, so the note names it — computed here, from the same admission
+        // list `/quota-dispatch refresh-codex` runs, so the report cannot suggest a
+        // run that would refuse. Nothing is stored: the hint is what to do next
+        // about this reading, not part of it.
+        const hint =
+          rail === "codex" && s.note === CODEX_TOKEN_EXPIRED
+            ? expiredNote(s.note, codexExpiredHint(await codexRefreshReadiness(codexTarget, hintAt)))
+            : s.note;
+        lines.push(`${rail}: unavailable — ${hint}`);
+      } else if (!s.windows.length) lines.push(`${rail}: ok — ${s.note ?? "no windows"}`);
       else {
         const windows = s.windows.map((w) => `${w.label} ${w.used.toFixed(0)}%`).join(", ");
         // A note on an otherwise healthy rail — the sticky refresh anomaly, or
@@ -2811,6 +2855,7 @@ function announceUnknownModels(
  */
 export type Invocation =
   | { form: "report"; force: boolean }
+  | { form: "refresh-codex" }
   | { form: "config" }
   | { form: "urls" }
   | { form: "apply" }
@@ -2833,6 +2878,9 @@ export function parseInvocation(args: string): Invocation {
   const arg = args.trim();
   if (arg === "") return { form: "report", force: false };
   if (arg === "refresh") return { form: "report", force: true };
+  // One word, like every other form: `refresh codex` is not this form, because
+  // the forms are a closed set and a guess here would be a subprocess.
+  if (arg === "refresh-codex") return { form: "refresh-codex" };
   if (arg === "config") return { form: "config" };
   if (arg === "urls") return { form: "urls" };
   if (arg === "apply") return { form: "apply" };
@@ -2857,7 +2905,7 @@ export function parseInvocation(args: string): Invocation {
 export function unknownFormNotice(arg: string): string[] {
   return [
     `quota-dispatcher: "${arg}" is not a form.`,
-    "Forms: /quota-dispatch, /quota-dispatch refresh, /quota-dispatch config, /quota-dispatch urls, /quota-dispatch apply, /quota-dispatch generate [project].",
+    "Forms: /quota-dispatch, /quota-dispatch refresh, /quota-dispatch refresh-codex, /quota-dispatch config, /quota-dispatch urls, /quota-dispatch apply, /quota-dispatch generate [project].",
   ];
 }
 
@@ -2983,6 +3031,16 @@ export default function (pi: ExtensionAPI) {
    */
   let loadedPromise: Promise<LoadedConfig> | undefined;
   const loadedOnce = () => (loadedPromise ??= loadConfig());
+
+  /**
+   * The one Codex CLI refresh, with its own `busy` flag.
+   *
+   * One instance per extension load, not per invocation: the flag is what stops a
+   * second keystroke from starting a second CLI against one credential, and a
+   * fresh instance per invocation would arrive with a fresh flag and exclude
+   * nothing.
+   */
+  const refreshCodex = createCodexRefresh();
 
   /**
    * Boot the extension against a context, once per extension load.
@@ -3333,7 +3391,7 @@ export default function (pi: ExtensionAPI) {
     // a user who never opens the README would not otherwise learn that the
     // provenance form exists.
     description:
-      "Show subscription headroom and each agent's model; forms: refresh, config, urls, apply, generate",
+      "Show subscription headroom and each agent's model; forms: refresh, refresh-codex, config, urls, apply, generate",
     handler: async (args, ctx) => {
       const invocation = parseInvocation(args ?? "");
 
@@ -3352,10 +3410,28 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // The context the gauge draws on for every form below. Set after the two
-      // forms that answer themselves, so neither reads config, boots anything or
-      // touches a footer: a typo and an allow-list are both answered from text
-      // this process already has.
+      // The Codex CLI refresh is answered from the active configuration and
+      // nothing else: it boots nothing, reads no quota, and never touches the
+      // gauge. It is a subprocess and a re-read of one file, so it is answered
+      // before the boot, the way `urls` is answered before it.
+      if (invocation.form === "refresh-codex") {
+        const { config } = await loadedOnce();
+        const result = await refreshCodex(
+          { credsPath: config.codexCredsPath, piAuthPath: config.piAuthPath, host: processCodexHost() },
+          // The one notice before the wait, so the silence that follows is
+          // explained rather than suspicious.
+          { onLaunch: () => ctx.ui.notify(CODEX_REFRESH_LAUNCH_NOTICE, "info") },
+        );
+        const { level, lines: outcome } = describeCodexRefresh(result);
+        ctx.ui.notify(outcome.join("\n"), level);
+        return;
+      }
+
+      // The context the gauge draws on for every form below. Set after the forms
+      // that answer themselves: a typo and an allow-list read no config at all,
+      // and the Codex refresh reads only the active configuration through
+      // `loadedOnce()`. None of the three boots anything, and none touches a
+      // footer — so nothing is set up for a form that never draws.
       footer = ctx;
 
       // Generation runs the declared command and replaces one file, so it is

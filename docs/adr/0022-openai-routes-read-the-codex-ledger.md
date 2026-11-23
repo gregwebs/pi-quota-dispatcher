@@ -68,7 +68,11 @@ alone, which is exactly the contract 0020 chose when it made the path the
 account's identity.
 
 The freshness contract is 0020's too: this extension does not refresh a Codex
-token, so the file is only as current as the last Codex CLI use. An expired
+token, so the file is only as current as the last Codex CLI use. **Partly
+superseded by [0024](0024-a-codex-token-is-refreshed-when-you-ask.md)** on the
+recovery, not the rule: `/quota-dispatch refresh-codex` runs the CLI once at a
+human's request, which is what makes the file current again — the extension
+still posts no refresh token and writes nothing. An expired
 token makes the rail unreadable and the policy holds — it does not fall back to
 the last good reading or to a guess. The token's own `exp` claim is what says
 so, and the report names the expiry rather than sending a request that can only
