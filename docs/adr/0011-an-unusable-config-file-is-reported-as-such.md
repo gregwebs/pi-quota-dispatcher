@@ -30,7 +30,7 @@ unconfigured install is asked on:
 ```
 quota-dispatcher: a config file could not be used.
 ~/.pi/agent/quota-dispatch.json: not valid JSON (line 3, column 1: Expected double-quoted property name) — the file is skipped whole, so the layers below it still apply
-Fix the file, then /reload. Run /quota-dispatch at any time to see what it would do.
+Fix the file; the next pass picks up the edit. /quota-dispatch shows what it would do.
 ```
 
 ## It is the same state when other layers still manage agents

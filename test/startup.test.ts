@@ -333,7 +333,7 @@ test("unusableConfigNotice leads with the fault lines verbatim and ends with the
     ),
     lines.join("\n"),
   );
-  assert.match(lines.at(-1) ?? "", /\/reload/, lines.join("\n"));
+  assert.match(lines.at(-1) ?? "", /next pass picks up the edit/, lines.join("\n"));
 
   const text = lines.join("\n");
   assert.ok(!text.includes("no agents are configured"), `the ask must not be repeated:\n${text}`);
@@ -366,7 +366,7 @@ test("unknownModelsNotice names every miss once, at its key, and the file to edi
     "quota-dispatcher: a configured model is unknown to this pi.",
     `agents.reviewer.primary.model: this pi does not know model openai-codex/gpt-astra-6 ${DASH} a newer pi may`,
     `agents.reviewer.alternates[0].model: this pi does not know model openai-codex/gpt-sol-6 ${DASH} a newer pi may`,
-    "Edit /a/quota-dispatch.json, then /reload, or upgrade pi.",
+    "Edit /a/quota-dispatch.json, or upgrade pi; the next pass picks up the edit.",
   ]);
 
   const text = lines.join("\n");

@@ -29,6 +29,11 @@
  * whatever is there — so which level an agent runs at can depend on the order of
  * past passes. See docs/adr/0004-thinking-levels.md.
  *
+ * The configuration is revalidated before every pass rather than pinned for the
+ * life of the process: the two config files are stamped, and an edit is loaded,
+ * booted and activated before the pass decides anything. See
+ * docs/adr/0025-a-config-edit-is-adopted-by-the-next-pass.md.
+ *
  * Quota is read from two undocumented-but-stable endpoints the vendors' own
  * clients use. No credentials are ever logged, and every read is bounded and
  * retried before a rail is called unreadable — see `QuotaReadPacing`.
@@ -69,6 +74,10 @@ import {
   thinkingFor,
   unusableConfigFileLines,
 } from "./config.ts";
+
+// Whether an edited config file is a new configuration is the stamp module's
+// question, so "adopt the edit" and "re-read the file" cannot drift apart.
+import { changedConfigPaths, readConfigStamp, type ConfigStamp } from "./config-stamp.ts";
 
 // The rail vocabulary — identity, the guards over it, the model prefixes that
 // imply one — lives in `rail.ts`, because a configuration names a rail and does
@@ -260,6 +269,18 @@ export type Decision =
       why: string;
     })
   | { agent: AgentName; kind: "hold"; why: string };
+
+/**
+ * One agent's decision and what the write for it did.
+ *
+ * A pass reports these rather than decisions alone because "what did you decide?"
+ * and "did the file change?" are both answers the user needs, and a caller that
+ * has to pair them up by index would be reconstructing this.
+ */
+export interface PassRow {
+  readonly decision: Decision;
+  readonly outcome: Outcome;
+}
 
 // ---------------------------------------------------------------- policy
 
@@ -1507,7 +1528,7 @@ export function unconfiguredNotice(
     lines.push("", `No agent files were found in ${agentDir}.`);
   }
 
-  lines.push("", "Then /reload. Run /quota-dispatch at any time to see what it would do.");
+  lines.push("", "Then run /quota-dispatch: the next pass picks up the edit and shows what it would do.");
   return lines;
 }
 
@@ -1537,7 +1558,7 @@ export function unusableConfigNotice(files: ConfigFile[]): string[] {
   return [
     UNUSABLE_CONFIG_SUMMARY,
     ...unusableConfigFileLines(files),
-    "Fix the file, then /reload. Run /quota-dispatch at any time to see what it would do.",
+    "Fix the file; the next pass picks up the edit. /quota-dispatch shows what it would do.",
   ];
 }
 
@@ -1569,7 +1590,7 @@ export function unknownModelsNotice(misses: ModelMiss[], configPaths: string[]):
     ...misses.map(unknownModelNote),
     // The action last, so the occurrences above it read as the evidence for it
     // rather than as a list trailing off an instruction.
-    `Edit ${configPaths.join(" or ")}, then /reload, or upgrade pi.`,
+    `Edit ${configPaths.join(" or ")}, or upgrade pi; the next pass picks up the edit.`,
   ];
 }
 
@@ -2024,7 +2045,7 @@ export interface Dispatcher {
    * and the seam the generator path reads through.
    */
   knownReadings(): Promise<KnownReadings>;
-  evaluate(opts?: { force?: boolean; dry?: boolean }): Promise<Array<{ decision: Decision; outcome: Outcome }>>;
+  evaluate(opts?: { force?: boolean; dry?: boolean }): Promise<PassRow[]>;
   report(opts?: { force?: boolean }): Promise<string[]>;
   /** Clear the machine-wide sticky halt; `/quota-dispatch refresh` calls this. */
   clearStickyHalt(): Promise<void>;
@@ -2756,15 +2777,24 @@ function themeStyle(theme: ExtensionContext["ui"]["theme"]): GaugeStyle {
   };
 }
 
+/** A footer line that could not be drawn, and which line it was. */
+interface DisplayFault {
+  /** The sink that failed, in the words the report uses. */
+  readonly what: string;
+  readonly message: string;
+}
+
 /**
- * A drawing failure, in the words the log and the report's warning tail use.
+ * A display failure, in the words the log and the report's warning tail use.
  *
- * The gauge is a display, so a footer that cannot be drawn is not a failure of
- * the pass that read the numbers — but staying silent about it would leave a
- * missing line unexplained.
+ * A footer is a drawing, so a line that cannot be drawn is not a failure of the
+ * pass that read the numbers, nor of the configuration it just installed — but
+ * staying silent about it would leave a missing line unexplained. `what` is the
+ * thing that could not be drawn, so the report names the sink that failed rather
+ * than blaming the gauge for a warning line.
  */
-function gaugeFaultText(fault: { message: string }): string {
-  return `quota-dispatcher: the rail gauge could not be drawn (${fault.message})`;
+function displayFaultText(fault: DisplayFault): string {
+  return `quota-dispatcher: ${fault.what} could not be drawn (${fault.message})`;
 }
 
 /**
@@ -2910,15 +2940,15 @@ export function unknownFormNotice(arg: string): string[] {
 }
 
 /**
- * The mutual exclusion between same-extension evaluations and a generation's
- * final transition.
+ * The mutual exclusion between same-extension evaluations and every activation
+ * of a new configuration.
  *
- * An evaluation reads the current configuration and writes agent files. A
- * generation changes the configuration and then evaluates once. Without this,
- * an evaluation that started on the *old* configuration could finish its writes
- * after the new one, leaving an agent on a model the new policy would not pick.
- * `acquire` refuses new evaluations and waits for running ones to drain; its
- * release lets them through again. It is deliberately tiny — no queue, no
+ * An evaluation reads the current configuration and writes agent files. An
+ * activation changes the configuration and then that caller evaluates once.
+ * Without this, an evaluation that started on the *old* configuration could
+ * finish its writes after the new one, leaving an agent on a model the new policy
+ * would not pick. `acquire` refuses new evaluations and waits for running ones to
+ * drain; its release lets them through again. It is deliberately tiny — no
  * cancellation, no arbitration between processes — because it only has to close
  * the instant between publication and cache swap.
  */
@@ -2927,12 +2957,20 @@ export interface EvaluationFence {
    * Run one evaluation, or `undefined` while the fence is up.
    *
    * `wait` is for the one caller whose result is a promise to the session: it
-   * waits for the generation to release the fence and then runs, instead of
-   * being refused. A refusal stays the default for a poll tick (the next one
-   * catches up) and for `apply` (the user can try again).
+   * waits for the holder to release the fence and then runs, instead of being
+   * refused. A refusal stays the default for a poll tick (the next one catches
+   * up) and for `apply` (the user can try again).
    */
   run<T>(body: () => Promise<T>, options?: { wait?: boolean }): Promise<T | undefined>;
-  /** Raise the fence, wait for running evaluations, and return its release. */
+  /**
+   * Raise the fence, wait for running evaluations, and return its release.
+   *
+   * One holder at a time: a call made while the fence is up waits for the holder
+   * before it to release. Two activation paths acquire this — a generation
+   * across its file publish, and a revalidation across its read — and a flag
+   * that two callers could raise was not exclusion: the first release lifted it
+   * for both, so each could activate over the other's configuration.
+   */
   acquire(): Promise<() => void>;
 }
 
@@ -2941,12 +2979,13 @@ export function evaluationFence(): EvaluationFence {
   let running = 0;
   const idle: Array<() => void> = [];
   const cleared: Array<() => void> = [];
+  /** The tail of the acquisition queue, absent when nothing is held or waiting. */
+  let holding: Promise<void> | undefined;
   return {
     async run<T>(body: () => Promise<T>, options: { wait?: boolean } = {}): Promise<T | undefined> {
-      // The loop is not for a queue: `acquire` is the only raiser, and it waits
-      // for `running` before it hands back a release, so one release wakes every
-      // waiter at once and the re-check is only for a second generation that
-      // took the fence in the same instant.
+      // The loop is not for a queue. One release wakes every waiter at once, so
+      // the re-check is only for another holder that took the fence in the same
+      // instant.
       while (fenced) {
         if (!options.wait) return undefined;
         await new Promise<void>((done) => cleared.push(done));
@@ -2960,15 +2999,36 @@ export function evaluationFence(): EvaluationFence {
       }
     },
     async acquire(): Promise<() => void> {
+      let released = false;
+      let handOver!: () => void;
+      const mine = new Promise<void>((done) => (handOver = done));
+      const previous = holding;
+      holding = mine;
+      // Queued behind a holder: not holding yet, so waiting here must not refuse
+      // the evaluations that holder is still ordering. Uncontended, there is no
+      // `await` before the flag goes up, so a `run` started in the same tick as
+      // the acquire is still refused.
+      if (previous !== undefined) await previous;
       fenced = true;
       if (running > 0) await new Promise<void>((done) => idle.push(done));
-      let released = false;
-      return () => {
+      const release = (): void => {
         if (released) return;
         released = true;
+        // Ownership passes with the fence still up when someone is queued behind
+        // us, so no evaluation can slip between two holders — the whole reason
+        // `acquire` is exclusive. Only the last holder lowers it.
+        if (holding !== mine) {
+          handOver();
+          return;
+        }
         fenced = false;
         for (const done of cleared.splice(0)) done();
+        // Forget an empty queue, so the next uncontended acquire raises the flag
+        // synchronously rather than on a microtask turn.
+        holding = undefined;
+        handOver();
       };
+      return release;
     },
   };
 }
@@ -3004,7 +3064,7 @@ export function fencedEvaluation<T, R>(
  * evaluates it, the model occurrences it could not use, and the token that says
  * whether it is still the configuration speaking for the session.
  *
- * `bootFrom` builds one; `bootOnce` and a generation swap the whole thing at
+ * `bootFrom` builds one; `bootOnce` and every activation swap the whole thing at
  * once, so the active config and the active owner cannot disagree.
  */
 interface Runtime {
@@ -3015,22 +3075,66 @@ interface Runtime {
   readonly owner: symbol;
 }
 
+/**
+ * The configuration in force, and the files as they looked just before the read
+ * that produced it.
+ *
+ * One value rather than two caches, because the stamp is only meaningful beside
+ * the config it was taken for: a stamp from one load next to the config of
+ * another would answer "has this file changed since we read it?" with a lie.
+ *
+ * `stamp` is absent when this process did not read the configuration at all — an
+ * activation of a file a generator wrote. There is no stamp to be honest about
+ * there, so the next pass re-reads and settles instead of trusting one taken
+ * across the generator's own run.
+ */
+interface ActiveConfig {
+  readonly loaded: LoadedConfig;
+  readonly stamp: ConfigStamp | undefined;
+}
+
+/** What `activate` needs, named rather than positional: two of its four values are configurations. */
+interface Activation {
+  /** The configuration to make active. */
+  readonly next: ActiveConfig;
+  /** The runtime booted from `next`. */
+  readonly runtime: Runtime;
+  /** The configuration being replaced, for deciding whether the footer's drawing still applies. */
+  readonly previous: DispatcherConfig | undefined;
+  /** The session to draw the footer on. */
+  readonly ctx: ExtensionContext;
+}
+
 export default function (pi: ExtensionAPI) {
   /**
-   * Config is resolved once per extension load, and the command reports which
-   * layer every value came from. `/reload` is what picks up an edit, which is
-   * the same deal as any other pi config file and keeps the polling cadence
-   * from changing underfoot mid-session.
+   * The configuration is loaded once per extension load and then *revalidated*,
+   * not re-read on every use: a pass stamps the two config files and adopts an
+   * edit, so a route saved mid-session is what the next pass decides on. See
+   * `docs/adr/0025-a-config-edit-is-adopted-by-the-next-pass.md`; `/reload`
+   * remains the way to pick up a changed *extension*.
    *
    * Loading is separate from booting because the model check needs the
    * `ExtensionContext`, and the module-load timer below is the one caller with
-   * none. It only needs the cadence, so it reads the config directly. Every
-   * caller that needs the checks and the dispatcher goes through `bootOnce`; the
-   * input handler is the deliberate exception, because a skill binding needs
-   * neither.
+   * none. Every caller that needs the checks and the dispatcher goes through
+   * `bootOnce`; the input handler is the deliberate exception, because a skill
+   * binding needs neither.
    */
-  let loadedPromise: Promise<LoadedConfig> | undefined;
-  const loadedOnce = () => (loadedPromise ??= loadConfig());
+  let active: Promise<ActiveConfig> | undefined;
+  /** The one revalidation in flight, so two callers share a read instead of racing. */
+  let revalidating: Promise<void> | undefined;
+
+  /** The two paths every load consults, in layer order. */
+  const configPaths = (): string[] => [globalConfigPath(), projectConfigPath()];
+
+  // The stamp is taken before the read on purpose — see `config-stamp.ts`.
+  const loadActive = async (): Promise<ActiveConfig> => {
+    const stamp = await readConfigStamp(configPaths());
+    return { loaded: await loadConfig(), stamp };
+  };
+
+  const activeOnce = (): Promise<ActiveConfig> => (active ??= loadActive());
+
+  const loadedOnce = (): Promise<LoadedConfig> => activeOnce().then((current) => current.loaded);
 
   /**
    * The one Codex CLI refresh, with its own `busy` flag.
@@ -3043,7 +3147,7 @@ export default function (pi: ExtensionAPI) {
   const refreshCodex = createCodexRefresh();
 
   /**
-   * Boot the extension against a context, once per extension load.
+   * Boot the extension against a context, once per configuration.
    *
    * Booting is where the two checks that need more than the config file run.
    * `checkModels` consults the running pi's model registry and drops candidates
@@ -3056,9 +3160,9 @@ export default function (pi: ExtensionAPI) {
    * This is why a boot needs the context, and why the timer reads the cached
    * `boot` rather than starting one of its own: a boot without a registry skips
    * the model check silently, which would pin agents to models this pi cannot
-   * spawn. `session_start` precedes the first tick, and generation boots the same
-   * way, so the cache is warm by then; a tick with no cached boot at all is a
-   * no-op rather than a ctx-less boot.
+   * spawn. `session_start` precedes the first tick, and an activation boots the
+   * same way, so the cache is warm by then; a tick with no cached boot at all is
+   * a no-op rather than a ctx-less boot.
    */
   let boot: Promise<Runtime> | undefined;
 
@@ -3092,7 +3196,7 @@ export default function (pi: ExtensionAPI) {
   let published: { readonly owner: symbol; readonly seq: number } | undefined;
 
   /** The last display failure, held for the report until a draw succeeds. */
-  let gaugeFault: { readonly message: string } | undefined;
+  let displayFault: DisplayFault | undefined;
 
   /**
    * The gauge's one write on a live context, and its error boundary.
@@ -3110,10 +3214,10 @@ export default function (pi: ExtensionAPI) {
       // `hasUI` first: a headless context's `ui` and `theme` are never touched.
       if (!ctx.hasUI) return;
       ctx.ui.setStatus(GAUGE_STATUS_KEY, text());
-      gaugeFault = undefined;
+      displayFault = undefined;
     } catch (err) {
-      gaugeFault = { message: errorText(err) };
-      console.error(gaugeFaultText(gaugeFault));
+      displayFault = { what: "the rail gauge", message: errorText(err) };
+      console.error(displayFaultText(displayFault));
     }
   };
 
@@ -3211,10 +3315,10 @@ export default function (pi: ExtensionAPI) {
       const pending = loadedOnce()
         .then((base) => bootFrom(base, ctx))
         .then((runtime) => {
-          // `runGenerate` awaits this boot through its generator's `input`
-          // callback before it can swap, so today this always holds. It guards a
-          // future caller that swaps the runtime without awaiting the boot:
-          // only the boot that is still current may own the footer.
+          // A revalidation builds its own boot and then activates that same
+          // runtime, so a boot can still land after a *later* activation has
+          // replaced the caches — only the boot that is still current may own the
+          // footer.
           if (boot === pending) activeOwner = runtime.owner;
           return runtime;
         });
@@ -3225,11 +3329,11 @@ export default function (pi: ExtensionAPI) {
 
   let timer: ReturnType<typeof setInterval> | undefined;
   let stopped = false;
-  // Whether generation has already chosen the polling cadence. The first load's
-  // scheduling runs from a callback registered before any command could run, so
-  // this only matters if a generation somehow settles first — and then the
-  // generated cadence must not be overwritten by the older one.
-  let cadenceFromGeneration = false;
+  // Whether a configuration has been activated. The first load's scheduling runs
+  // from a callback registered before any command could run, so this only matters
+  // if an activation somehow settles first — and then the activated cadence must
+  // not be overwritten by the older one.
+  let activated = false;
   // One generation at a time. Overlap is refused rather than queued: two runs
   // would both read the file, run a script and race to publish, and the second
   // would either lose its work to the compare-and-swap or clobber a change the
@@ -3238,23 +3342,29 @@ export default function (pi: ExtensionAPI) {
 
   // ------------------------------------------------------------- evaluation fence
   //
-  // An evaluation reads the current config and writes agent files. A generation
-  // changes the config and then evaluates once. Without a fence an evaluation
-  // that started on the *old* config could finish its writes after the new
-  // evaluation, leaving an agent on a model the new policy would not pick. The
-  // fence is deliberately tiny: new evaluations are refused only for the final
-  // transition, and already-running ones are drained before the file is
-  // published. It is not a scheduler and does not arbitrate across processes.
+  // An evaluation reads the current config and writes agent files. An activation
+  // changes the config and then that caller evaluates once. Without a fence an
+  // evaluation that started on the *old* config could finish its writes after the
+  // new one, leaving an agent on a model the new policy would not pick. The fence
+  // is deliberately tiny: new evaluations are refused while a configuration is
+  // being published or swapped in, and already-running ones are drained first. It
+  // is not a scheduler and does not arbitrate across processes.
   const fence = evaluationFence();
   const acquireFence = () => fence.acquire();
 
   /**
    * (Re)schedule the periodic evaluation for `cfg`.
    *
-   * The one place a cadence is chosen, so the first load and a generation cannot
-   * each set a timer: a generation whose output changed `pollMs`, emptied the
-   * table or named different agents reschedules here rather than leaving the old
-   * interval running. A stopped extension or an empty table gets no timer.
+   * The one place a cadence is chosen, so an activation whose config changed
+   * `pollMs` reschedules here rather than leaving the old interval running. A
+   * stopped extension or an empty table gets no timer.
+   *
+   * The tick revalidates first, so a config edited with no command run is adopted
+   * within this cadence rather than at the next `/reload`. The evaluation half is
+   * refused by the fence while a generation publishes or a revalidation activates,
+   * and dropped — the next tick catches up. A tick that arrives while one is
+   * already waiting for an adoption is dropped too, so a slow wait cannot end in a
+   * burst of stale ticks from an interval that has since been replaced.
    */
   function scheduleTimer(cfg: DispatcherConfig): void {
     if (timer !== undefined) {
@@ -3263,9 +3373,200 @@ export default function (pi: ExtensionAPI) {
     }
     if (stopped || managesNothing(cfg)) return;
     timer = setInterval(() => {
-      void fencedEvaluation(fence, () => boot, ({ dispatcher }) => dispatcher.evaluate()).catch(() => {});
+      // One tick at a time. A tick that arrives while one is waiting for a
+      // revalidation (which can wait on the fence, and behind another process's
+      // agent-file lock) is dropped rather than piling a second evaluation onto
+      // the same adoption — otherwise a long wait ends in a burst of stale ticks
+      // contending for the same writes, from an interval an activation has
+      // already replaced.
+      if (stopped || revalidating !== undefined) return;
+      void (async () => {
+        // The footer's context is the session's own; a tick has none of its own.
+        // Read here rather than captured, so a tick after `session_shutdown` finds
+        // none and adopts nothing.
+        //
+        // Caught separately: a revalidation that throws — an unreadable config
+        // directory, a footer sink that refuses — must not cost this tick the
+        // evaluation of the configuration still in force. The stamp still differs,
+        // so the next tick tries the adoption again.
+        try {
+          await revalidate(footer);
+        } catch (err) {
+          console.error(`quota-dispatcher: a config edit could not be adopted (${errorText(err)})`);
+        }
+        // Shutdown may have happened during that wait. PI invalidates the context
+        // of a replaced session, and a tick that started after it would be work
+        // for a session that no longer exists.
+        if (stopped) return;
+        await fencedEvaluation(fence, () => boot, ({ dispatcher }) => dispatcher.evaluate());
+      })().catch(() => {});
     }, cfg.pollMs);
     timer.unref?.();
+  }
+
+  /**
+   * Make a configuration the active one: exchange the cached handles together,
+   * redraw the footer for the new policy, and re-time the poll.
+   *
+   * It evaluates nothing. What a new policy should now *do* belongs to whoever
+   * asked for it: a generation writes because that is what `generate` is for, a
+   * poll tick evaluates right after, `apply` forces a pass, and a report must not
+   * write at all. Evaluating here made every one of them write, and made the
+   * read-only forms write — so `/quota-dispatch` after an edit rewrote the agent
+   * files before showing what it would do.
+   *
+   * The caller holds the fence. Both entry points need the exchange to be atomic
+   * against a running pass, and each takes the fence at a different point in its
+   * own work — a generation across its file publish, a revalidation around the
+   * read that detected the edit — so taking it here would either queue behind
+   * itself or move that publish into a window it must not be in.
+   *
+   * `previous` is the configuration being replaced, and it is only read to decide
+   * whether the drawing on screen still describes the policy: no part of it is
+   * carried forward.
+   */
+  function activate(req: Activation): void {
+    const { next, runtime, previous, ctx } = req;
+    // The two handles exchange together, so the active configuration cannot
+    // disagree with itself. The file was published (or read) a moment earlier, so
+    // a reader in that instant can still see the new file beside the old cached
+    // config — harmless, because the fence's job is to order evaluations, not
+    // readers. The caller keeps it held until its own pass has started, so no
+    // poll tick can evaluate the superseded policy in between.
+    active = Promise.resolve(next);
+    boot = Promise.resolve(runtime);
+    // Activated before that pass, so that pass — and only it — is what draws the
+    // footer from here on.
+    activeOwner = runtime.owner;
+    activated = true;
+
+    const { config } = next.loaded;
+    // The gauge is a drawing of what the configuration in force reads, so it goes
+    // when the new configuration cannot or may not draw the same shape: the gauge
+    // off, a table that evaluates nothing, or routes that name a different set of
+    // rails. Leaving that last one is the case a non-evaluating activation would
+    // otherwise leave on screen — a rail no route names any more, drawn from a
+    // reading nobody is going to refresh.
+    if (!config.railGauge || managesNothing(config) || railsDrawn(previous) !== railsDrawn(config)) {
+      clearLiveGauge();
+    }
+    scheduleTimer(config);
+    // The footer is a statement about the install, and an activation can change
+    // it: the table may now be configured, or a model this pi does not know may
+    // have appeared. "resume" sets the line without a fresh notify — a generation
+    // reports in its own words, and a background adoption must not interrupt.
+    //
+    // Wrapped, because this is display: the configuration is already in force, and
+    // a footer sink that refuses — a context pi has replaced, a themed getter that
+    // throws — must not make the caller believe the adoption failed and skip the
+    // pass that would use it.
+    try {
+      if (managesNothing(config)) setFooterStatus(ctx, STATUS_TEXT);
+      else announceUnknownModels(runtime.misses, next.loaded, ctx, "resume");
+    } catch (err) {
+      displayFault = { what: "the footer", message: errorText(err) };
+      console.error(displayFaultText(displayFault));
+    }
+  }
+
+  /**
+   * The rails a configuration's routes name, as one comparable key.
+   *
+   * Only used to decide whether a drawing on screen still describes the policy in
+   * force, so the order and the separator are the gauge's own: two configurations
+   * that draw the same rails must compare equal.
+   */
+  function railsDrawn(cfg: DispatcherConfig | undefined): string {
+    return cfg === undefined ? "" : gaugedRails(cfg).join(",");
+  }
+
+  /**
+   * Adopt a config file that changed since the active configuration was read, and
+   * do nothing at all when none did.
+   *
+   * One `stat` of each file is the whole cost of "no change", which is what makes
+   * this affordable before every pass. A change is then loaded, booted and
+   * activated exactly as a generation's is, and the pass that follows decides on
+   * the edited table. See
+   * `docs/adr/0025-a-config-edit-is-adopted-by-the-next-pass.md`.
+   *
+   * `ctx` is the session to boot and draw on. A poll tick has none of its own and
+   * passes the footer's; a tick before any session started has nothing to adopt
+   * for, and is skipped rather than booted without the model check.
+   */
+  async function revalidate(ctx: ExtensionContext | undefined): Promise<void> {
+    if (ctx === undefined || stopped) return;
+    // Serialized, not shared. A caller that joins an in-flight *check* inherits a
+    // sample taken before it arrived — and a save in that window would be invisible
+    // to it even though its pass started after the save. So each caller waits for
+    // the one before it to finish and then asks the disk itself; the second answer
+    // is usually "nothing moved", which costs two `stat`s and no boot.
+    const previous = revalidating;
+    const mine = (async () => {
+      if (previous !== undefined) await previous.catch(() => {});
+      if (stopped) return;
+      await adoptChangedConfig(ctx);
+    })();
+    revalidating = mine;
+    try {
+      await mine;
+    } finally {
+      if (revalidating === mine) revalidating = undefined;
+    }
+  }
+
+  async function adoptChangedConfig(ctx: ExtensionContext): Promise<void> {
+    const current = await activeOnce();
+    // A configuration with no stamp is one this process did not read: a generation
+    // activated the file it wrote, so the next pass reads the pair once and settles
+    // rather than trusting a stamp taken across the generator's own run. That single
+    // re-read is what closes the window in which an edit to the *other* layer lands
+    // after generation read it but before it published.
+    if (current.stamp !== undefined) {
+      const moved = changedConfigPaths(current.stamp, await readConfigStamp(configPaths()));
+      // The check costs a `stat` per file and comes before the fence, because
+      // taking the fence to *ask* would park every command behind a pass already
+      // in flight — a pass that may itself be waiting minutes on another process's
+      // agent-file lock — for a question one `stat` answers.
+      if (!moved.length) return;
+    }
+
+    const release = await fence.acquire();
+    try {
+      // Shutdown may have happened while this waited. Swapping the handles and
+      // drawing on the context of a session pi has replaced would be work for a
+      // configuration nothing is going to evaluate.
+      if (stopped) return;
+
+      // Asked again inside the fence: a generation may have published this same
+      // edit while this pass waited, and re-reading both sides is what makes the
+      // answer "what is active now" rather than "what was active then".
+      const held = await activeOnce();
+      let moved: string[] = [];
+      if (held.stamp !== undefined) {
+        moved = changedConfigPaths(held.stamp, await readConfigStamp(configPaths()));
+        if (!moved.length) return;
+      }
+
+      const next = await loadActive();
+      // The read above is the last await before the swap, and shutdown can land
+      // during it: installing a configuration no session will evaluate is work
+      // against a context pi has already replaced.
+      if (stopped) return;
+
+      activate({ next, runtime: await bootFrom(next.loaded, ctx), previous: held.loaded.config, ctx });
+      if (moved.length) {
+        // One line, because a policy that changed under a running session is the
+        // kind of state a reader of the log has to be able to account for. It names
+        // the files that moved: "why did nothing happen?" and "what changed?" are
+        // the two questions this answers without a `/quota-dispatch` in hand. A
+        // settling read after a generation logs nothing — it is bookkeeping, not an
+        // edit someone made.
+        console.error(`quota-dispatcher: configuration re-read (${moved.join(", ")})`);
+      }
+    } finally {
+      release();
+    }
   }
 
   /**
@@ -3273,16 +3574,16 @@ export default function (pi: ExtensionAPI) {
    *
    * The subprocess, the strict check and the atomic publication all live in
    * `generateConfig`; what happens here is the part that only the extension can
-   * do — gather the readings the command is fed, prepare a runtime, swap the two
-   * cached handles together, choose the cadence and evaluate the new policy once.
-   * A failure is reported and changes nothing: no cache, no cadence, no footer.
+   * do — gather the readings the command is fed, prepare a runtime, activate it,
+   * choose the cadence and evaluate the new policy once. A failure is reported and
+   * changes nothing: no cache, no cadence, no footer.
    *
-   * The readings come from the runtime of the configuration active *before* the
-   * run — its credential paths — so this boots that runtime, where every other
-   * pass on this path would not have had to. It is the same cached boot a session
-   * start or a report uses, it writes nothing, and it is read lazily inside the
-   * `input` callback: a file that declares no generator, or declares one badly,
-   * still costs neither a boot nor a quota request.
+   * The readings come from the runtime of the configuration in force, so an edit
+   * is adopted before the run rather than fed to the generator from paths the user
+   * has already replaced. That boot is the same cached one a session start or a
+   * report uses, it writes nothing, and it happens lazily inside the `input`
+   * callback: a file that declares no generator, or declares one badly, still
+   * costs neither a boot nor a quota request.
    */
   async function runGenerate(scope: "global" | "project", ctx: ExtensionContext): Promise<void> {
     if (generating) {
@@ -3291,10 +3592,17 @@ export default function (pi: ExtensionAPI) {
     }
     generating = true;
     try {
-      // The initial load is awaited before committing anything: its cadence
-      // callback was registered at setup, and letting generation finish first
-      // must not leave that older cadence able to overwrite the generated one.
+      // An edited config is adopted first: the generator's input is the active
+      // dispatcher's own readings, and those come from the credential paths in
+      // force — including one the user just changed.
+      await revalidate(ctx);
+      // The initial load is awaited before committing anything, so the generator
+      // input is gathered from a configuration that has settled rather than from
+      // one that is still being read.
       await loadedOnce();
+      // The configuration this run replaces, used to decide whether the drawing on
+      // screen still describes the policy.
+      const previousConfig = (await activeOnce()).loaded.config;
       const path = scope === "global" ? globalConfigPath() : projectConfigPath();
       const result = await generateConfig({
         source: scope,
@@ -3314,38 +3622,24 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Published. The two in-memory handles swap together, so the active
-      // configuration cannot disagree with itself. The file was already
-      // published a moment earlier, so a read in that instant can still see the
-      // new file beside the old cached config — harmless, because this fence's
-      // job is to order evaluations, not readers. The fence stays held through
-      // the new evaluation so no poll tick can race it, and is released once
-      // that work is done — or once it fails.
-      loadedPromise = Promise.resolve(result.loaded);
-      boot = Promise.resolve(result.prepared);
-      // Activated before the new evaluation, so that evaluation — and only it —
-      // is what draws the footer from here on.
-      activeOwner = result.prepared.owner;
+      // Published. The fence — taken before the file lock — stays held through
+      // the activation and the pass that follows it, so no poll tick can evaluate
+      // the new policy in between, and it is released once that work is done, or
+      // once it fails.
+      //
+      // No stamp: this activation's configuration was not read off the pair of
+      // files by this process. The generated layer came from the command's stdout
+      // and the other layer was read before the fence wait, so a stamp taken here
+      // would record anything that changed during the run as already adopted. The
+      // next pass reads both files once and settles.
+      const next: ActiveConfig = { loaded: result.loaded, stamp: undefined };
       try {
-        cadenceFromGeneration = true;
-        // Only a layer that can never draw takes the old line down here: one that
-        // can draw replaces it from its first pass, and clearing first would
-        // blank the footer for the length of that pass. "Never" covers both ways
-        // a layer draws nothing — the gauge off, and an empty table whose
-        // evaluation is skipped, so no pass publishes at all.
-        if (!result.prepared.loaded.config.railGauge || managesNothing(result.prepared.loaded.config)) {
-          clearLiveGauge();
-        }
-        scheduleTimer(result.prepared.loaded.config);
-        // The footer is a statement about the install, and generation can change
-        // it: the table may now be configured, or a model this pi does not know
-        // may have appeared. "resume" sets the line without a fresh notify — the
-        // success notice below already carries every warning.
-        if (managesNothing(result.prepared.loaded.config)) {
-          setFooterStatus(ctx, STATUS_TEXT);
-        } else {
-          announceUnknownModels(result.prepared.misses, result.prepared.loaded, ctx, "resume");
-        }
+        // Checked before the swap, not after it: a shutdown during the run leaves a
+        // published file for the next session to adopt, and activating it here
+        // would only make a dead context the thing that has to draw it.
+        if (stopped) return;
+
+        activate({ next, runtime: result.prepared, previous: previousConfig, ctx });
 
         const lines: string[] = [`[generated] ${result.path}`];
         let note: string | undefined = result.cleanupNote;
@@ -3355,8 +3649,7 @@ export default function (pi: ExtensionAPI) {
           // two vendors for quota to decide about none is a request the user
           // never asked for), and unforced so it reads through the shared store
           // rather than forcing a fetch — another process, or this one's
-          // predecessor before the swap, may already have answered the rail, and
-          // activation is not a request for fresh numbers.
+          // predecessor before the activation, may already have answered the rail.
           const rows = managesNothing(result.prepared.loaded.config)
             ? []
             : await result.prepared.dispatcher.evaluate();
@@ -3411,10 +3704,13 @@ export default function (pi: ExtensionAPI) {
       }
 
       // The Codex CLI refresh is answered from the active configuration and
-      // nothing else: it boots nothing, reads no quota, and never touches the
-      // gauge. It is a subprocess and a re-read of one file, so it is answered
-      // before the boot, the way `urls` is answered before it.
+      // nothing else: it reads no quota and never touches the gauge. It is a
+      // subprocess and a re-read of one file, so it is answered before the boot,
+      // the way `urls` is answered before it — but an edit is adopted first, so
+      // the run targets the credential path the file now names rather than the one
+      // this session booted with.
       if (invocation.form === "refresh-codex") {
+        await revalidate(ctx);
         const { config } = await loadedOnce();
         const result = await refreshCodex(
           { credsPath: config.codexCredsPath, piAuthPath: config.piAuthPath, host: processCodexHost() },
@@ -3428,10 +3724,8 @@ export default function (pi: ExtensionAPI) {
       }
 
       // The context the gauge draws on for every form below. Set after the forms
-      // that answer themselves: a typo and an allow-list read no config at all,
-      // and the Codex refresh reads only the active configuration through
-      // `loadedOnce()`. None of the three boots anything, and none touches a
-      // footer — so nothing is set up for a form that never draws.
+      // that answer themselves: a typo and an allow-list read no config at all, so
+      // nothing is set up for a form that never draws.
       footer = ctx;
 
       // Generation runs the declared command and replaces one file, so it is
@@ -3443,6 +3737,10 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // An edited config is adopted before the form decides anything, so `apply`
+      // after a save acts on what was saved rather than on what the session booted
+      // with — the form is a no-op when no file moved.
+      await revalidate(ctx);
       const { loaded, dispatcher } = await bootOnce(ctx);
 
       // Only `apply` and `generate` write, and only `config` skips the quota
@@ -3485,7 +3783,7 @@ export default function (pi: ExtensionAPI) {
           ...describeConfigWarnings(loaded),
           // The report's own pass published first, so this reflects the latest
           // drawing attempt; a successful one clears the fault again.
-          ...(gaugeFault === undefined ? [] : [`  warning: ${gaugeFaultText(gaugeFault)}`]),
+          ...(displayFault === undefined ? [] : [`  warning: ${displayFaultText(displayFault)}`]),
         ];
       }
 
@@ -3514,6 +3812,14 @@ export default function (pi: ExtensionAPI) {
   // spawn is held on this evaluation.
   pi.on("session_start", async (event, ctx) => {
     footer = ctx;
+    // An edit adopted before the session's own read, so the boot this handler
+    // evaluates is built from the file that is there now. A fresh extension load
+    // makes this two `stat`s and no adoption.
+    await revalidate(ctx);
+    // The wait above can outlast this session: pi replaces the extension instance
+    // on the next session, and evaluating on the old one would be work nothing is
+    // waiting for.
+    if (stopped) return;
     await fencedEvaluation(
       fence,
       () => bootOnce(ctx),
@@ -3527,8 +3833,8 @@ export default function (pi: ExtensionAPI) {
 
         // Before the evaluation, so the warning is on screen while the quota
         // reads that follow it are still in flight. It also replaces the footer
-        // line an unconfigured install left: the table is read once per
-        // extension load, so the state has to change here or nowhere.
+        // line an unconfigured install left: the footer states the install, so the
+        // state has to change here or nowhere.
         //
         // A config file that could not be used is reported here too, not only
         // when it leaves the table empty: the layer it lost is not the whole
@@ -3554,11 +3860,11 @@ export default function (pi: ExtensionAPI) {
   // nothing at all if no session has started yet. Starting a boot here would
   // skip the check silently, which is the failure this whole change is about.
   //
-  // A cadence a generation has already chosen is not overwritten by this first
+  // A cadence an activation has already chosen is not overwritten by this first
   // callback, which was registered before any command could run.
-  void loadedOnce().then((loaded) => {
-    if (cadenceFromGeneration) return;
-    scheduleTimer(loaded.config);
+  void activeOnce().then((current) => {
+    if (activated) return;
+    scheduleTimer(current.loaded.config);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -3577,18 +3883,20 @@ export default function (pi: ExtensionAPI) {
   });
 
   // An explicit `/skill:<name>` applies its binding before pi expands the skill:
-  // input handlers run first and are awaited. The path touches only the cached
-  // config and the agent dir — no boot, no quota request, no credential, no write
-  // — and returns nothing, so the text reaches pi exactly as typed and the skill
-  // runs whatever happened here. See
-  // docs/adr/0014-skill-bindings-read-the-agent-file.md.
+  // input handlers run first and are awaited. The path touches the config and the
+  // agent dir — no quota request, no credential, no write — and returns nothing,
+  // so the text reaches pi exactly as typed and the skill runs whatever happened
+  // here. See docs/adr/0014-skill-bindings-read-the-agent-file.md.
   //
-  // `loadedOnce` rather than `bootOnce`: a boot runs the model and agent-file
-  // checks and builds the dispatcher, none of which a binding needs, and a
-  // binding must not be what triggers them.
+  // `loadedOnce` rather than `bootOnce`: a binding needs no dispatcher, so it does
+  // not build one. An edit is adopted first, though, because a binding is one of
+  // the values an edit changes and the next `/skill:` is exactly when the user
+  // expects the new one to apply — a no-change check is two `stat`s, and only a
+  // real edit pays for the boot it takes to honour it.
   pi.on("input", async (event, ctx) => {
     // Answered before the config is read, so ordinary input costs nothing.
     if (explicitSkill(event.text) === undefined) return;
+    await revalidate(ctx);
     const { config } = await loadedOnce();
     await applySkillBinding(
       {

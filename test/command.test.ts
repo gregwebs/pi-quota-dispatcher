@@ -65,6 +65,11 @@ interface Fixture {
   agentDir: string;
   projectDir: string;
   plannerFile: string;
+  claudeCredsPath: string;
+  /** The global layer as `fixture` wrote it, so a test can edit one key of it. */
+  config: Record<string, unknown>;
+  /** Replace the global layer, the way a save from an editor lands. */
+  writeConfig: (next: Record<string, unknown>) => Promise<void>;
 }
 
 /**
@@ -122,22 +127,21 @@ async function fixture(
   );
 
   // The shipped config names no agents, so the fixture has to name them itself.
-  await writeFile(
-    join(agentDir, CONFIG_FILE_NAME),
-    JSON.stringify({
-      claudeCredsPath,
-      pollMs,
-      agents,
-      ...extraGlobal,
-    }),
-    "utf8",
-  );
+  const config: Record<string, unknown> = {
+    claudeCredsPath,
+    pollMs,
+    agents,
+    ...extraGlobal,
+  };
+  const writeConfig = (next: Record<string, unknown>): Promise<void> =>
+    writeFile(join(agentDir, CONFIG_FILE_NAME), JSON.stringify(next), "utf8");
+  await writeConfig(config);
   await writeFile(join(projectDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), JSON.stringify({ margin: 10 }), "utf8");
 
   const plannerFile = join(agentsDir, "planner.md");
   await writeFile(plannerFile, TEMPLATE("planner", "claude-bridge/claude-opus-5-5"), "utf8");
 
-  return { agentDir, projectDir, plannerFile };
+  return { agentDir, projectDir, plannerFile, claudeCredsPath, config, writeConfig };
 }
 
 interface RailReadings {
@@ -457,7 +461,8 @@ interface Harness {
  * `finally`, including a final `session_shutdown` to clear the poll timer.
  */
 async function withExtension(
-  fx: Fixture,
+  /** The two directories a run relocates; nothing else about a fixture is touched. */
+  fx: Pick<Fixture, "agentDir" | "projectDir">,
   body: (h: Harness) => Promise<void>,
   fetchFactory: () => typeof fetch = stubFetch,
   opts: {
@@ -1309,6 +1314,38 @@ test("generate publishes the printed layer and activates it without a reload", a
   assert.match(await readFile(fx.plannerFile, "utf8"), /^model: "openai-codex\/gpt-6-sol"$/m);
 });
 
+/**
+ * A generation activates a configuration this process never read off the pair of
+ * files: the generated layer came from the command's stdout, and the other layer
+ * was read before the run waited for the fence — a wait that can last as long as
+ * another process holds an agent-file lock. A stamp taken at that point would
+ * record an edit landing during the wait as already adopted, and lose it until the
+ * file were saved again.
+ *
+ * So a generation activates with no stamp, and the next pass reads both files
+ * once. The observable is the boot that read forces: `reviewer` is a configured
+ * route with no agent file, so a pass that builds a runtime says so — while a pass
+ * that trusted a stamp would fold the same config and say nothing.
+ */
+test("a generation leaves the next pass to read the config files again", async (t) => {
+  const errors = t.mock.method(console, "error");
+  const fx = await generateFixture(GENERATED_LAYER, (layerPath) => `cat '${layerPath}'`);
+
+  await withExtension(fx, async ({ run }) => {
+    await run("generate");
+    const mark = errors.mock.calls.length;
+
+    const config = await run("config");
+    assert.ok(config.includes("weeklySwitchAt = 33  [global]"), config);
+    assert.ok(
+      errors.mock.calls
+        .slice(mark)
+        .some((call) => String(call.arguments[0]).includes('configured agent "reviewer" has no file')),
+      "the pass after a generation must read and boot the files, not trust a stamp",
+    );
+  });
+});
+
 test("generate project replaces only the project file", async () => {
   const fx = await generateFixture({});
   const projectLayer = { margin: 44, agents: {} };
@@ -1430,6 +1467,71 @@ test("a UI failure after publication does not undo or relabel the committed chan
   const written = JSON.parse(await readFile(fx.globalPath, "utf8"));
   assert.equal(written.weeklySwitchAt, 33);
   assert.equal(written.agents.planner.primary.model, "openai-codex/gpt-6-sol");
+});
+
+/**
+ * One holder at a time. Two activation paths acquire this fence — a generation
+ * across its file publish and a revalidation across its read — and a flag two
+ * callers could raise was not exclusion: whichever released first lifted it for
+ * both, so each could activate over the other's configuration. The second holder
+ * therefore waits, and the fence stays up until the *last* release.
+ */
+test("a second fence holder waits for the first and the fence outlives the first release", async () => {
+  const fence = evaluationFence();
+
+  const first = await fence.acquire();
+  let secondAdmitted = false;
+  const second = fence.acquire().then((release) => {
+    secondAdmitted = true;
+    return release;
+  });
+
+  // A macrotask is long enough for a queued acquire that did not wait to run.
+  await new Promise((done) => setImmediate(done));
+  assert.equal(secondAdmitted, false, "the second holder must wait for the first to release");
+  assert.equal(await fence.run(async () => "ran"), undefined, "the fence refuses while the first holds it");
+
+  first();
+  const releaseSecond = await second;
+  assert.equal(await fence.run(async () => "ran"), undefined, "the first release must not lower the fence");
+
+  releaseSecond();
+  assert.equal(await fence.run(async () => "ran"), "ran");
+});
+
+/**
+ * Ownership passes with the fence still up. A waiting evaluation must not slip in
+ * between two holders: the first release hands over to the second, and the waiter
+ * — queued *and* waiting on the fence — runs only after the last release. Before
+ * this, the first release lowered the flag and woke the waiters, so a queued edit
+ * could sit behind an evaluation that had nothing to do with it.
+ */
+test("a handoff between fence holders does not admit a waiting evaluation", async () => {
+  const fence = evaluationFence();
+  const ran: string[] = [];
+
+  const first = await fence.acquire();
+  // A `session_start`-style waiter, admitted only once the fence is down.
+  const waiting = fence.run(
+    async () => {
+      ran.push("waiting");
+    },
+    { wait: true },
+  );
+  let secondAdmitted = false;
+  const second = fence.acquire().then((release) => {
+    secondAdmitted = true;
+    return release;
+  });
+
+  first();
+  const releaseSecond = await second;
+  assert.equal(secondAdmitted, true);
+  assert.deepEqual(ran, [], "the handoff must not lower the fence for a waiter");
+
+  releaseSecond();
+  await waiting;
+  assert.deepEqual(ran, ["waiting"]);
 });
 
 test("the evaluation fence drains a running evaluation and refuses a new one", async () => {
@@ -1916,6 +2018,286 @@ test("a generation that changes pollMs reschedules the poll", async () => {
   // The first load schedules the fixture's lifted cadence; generation reschedules
   // from the generated one, and that is the cadence the extension is left on.
   assert.equal(delays.at(-1), 40, `scheduled delays: ${delays.join(", ")}`);
+});
+
+// ------------------------------------------------------------ config revalidation
+
+/**
+ * The edit these tests make: the fixture's route with its alternate swapped, which
+ * is what someone changes when a rail has moved. It exercises adoption from the
+ * one thing a stamp can see — the file — and leaves every other route, credential
+ * path and cadence alone.
+ */
+const NEON_ALTERNATE = {
+  path: "antigravity-gemini",
+  model: "antigravity/gemini-4-neon",
+};
+
+/** The `planner` route these tests edit, on the fixture's own claude primary. */
+const PLANNER_ROUTE = {
+  primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+  alternates: [{ model: NEON_ALTERNATE.model, rail: NEON_ALTERNATE.path }],
+};
+
+/**
+ * A config edit is adopted without a `/reload` (`docs/adr/0025`). The observable
+ * is the decision: the first `apply` moves the planner to the codex alternate the
+ * fixture names, the second — after the file says antigravity — moves it there
+ * instead. An extension still holding the config it booted with would write codex
+ * both times, and the second assertion is what fails.
+ */
+test("an edited config is adopted by the next command, without a reload", async () => {
+  const fx = await fixture();
+
+  await withExtension(fx, async ({ run }) => {
+    const first = await run("apply");
+    assert.ok(first.includes("choosing openai-codex/gpt-6-sol"), first);
+
+    await fx.writeConfig({ ...fx.config, agents: { planner: PLANNER_ROUTE } });
+
+    const second = await run("apply");
+    assert.ok(second.includes(`choosing ${NEON_ALTERNATE.model}`), second);
+  });
+
+  assert.match(await readFile(fx.plannerFile, "utf8"), /^model: "antigravity\/gemini-4-neon"$/m);
+});
+
+/**
+ * The tick is the one path that adopts an edit with nobody asking. A `pollMs` of
+ * 20 keeps this a short wait; the assertion is on the file the pass writes, which
+ * is the only observable a background pass leaves.
+ */
+test("the poll adopts an edited config with no command run", async () => {
+  const fx = await fixture(20);
+
+  await withExtension(fx, async ({ sessionStart }) => {
+    await sessionStart("startup");
+    assert.match(
+      await readFile(fx.plannerFile, "utf8"),
+      /^model: "openai-codex\/gpt-6-sol"$/m,
+      "precondition: the startup pass writes the codex alternate",
+    );
+
+    await fx.writeConfig({ ...fx.config, agents: { planner: PLANNER_ROUTE } });
+
+    await waitFor(
+      async () => (await readFile(fx.plannerFile, "utf8")).includes(NEON_ALTERNATE.model),
+      "the poll to adopt the edited route",
+      5_000,
+    );
+  });
+});
+
+/**
+ * An edit that routes nothing is adopted like any other, and an empty table is the
+ * one case where adoption must not reach an agent file: no route names a file, so
+ * nothing is decided and nothing is written. The footer is what says so, since a
+ * background adoption has no notification of its own.
+ */
+test("an edit that leaves no routes is adopted, and writes nothing", async () => {
+  const fx = await fixture();
+
+  await withExtension(fx, async ({ run, statuses }) => {
+    // Loaded and written first, so the adoption below is the only thing that can
+    // move either the footer or the file.
+    await run("apply");
+    const decided = await readFile(fx.plannerFile, "utf8");
+    assert.match(decided, /^model: "openai-codex\/gpt-6-sol"$/m);
+
+    await fx.writeConfig({ ...fx.config, agents: {} });
+
+    const text = await run("apply");
+    assert.ok(text.startsWith("[applied]"), text);
+    assert.equal(
+      warningStatuses(statuses).at(-1)?.text,
+      "quota-dispatcher: no agents configured",
+      JSON.stringify(statuses),
+    );
+    assert.equal(await readFile(fx.plannerFile, "utf8"), decided, "an empty table decides about nothing");
+  });
+});
+
+/**
+ * A file saved mid-edit is a real state, and adoption treats it as a reload would:
+ * the layer is skipped whole, the routes beneath it stand, and the report's warning
+ * tail names the file. Holding the old configuration instead would hide a fault the
+ * user just introduced.
+ */
+test("an edit that makes the file unusable is adopted as a reload would adopt it", async () => {
+  const fx = await fixture();
+  const configPath = join(fx.agentDir, CONFIG_FILE_NAME);
+
+  await withExtension(fx, async ({ run }) => {
+    // The session's own read, before the fault, so the warning below can only come
+    // from adopting the edit.
+    const before = await run("");
+    assert.ok(!before.includes("not valid JSON"), before);
+
+    await writeFile(configPath, '{"agents": {', "utf8");
+
+    const text = await run("");
+    assert.ok(text.includes("not valid JSON"), text);
+    assert.ok(text.includes(configPath), text);
+  });
+});
+
+/**
+ * The read-only forms stay read-only after an edit, which is the whole reason
+ * activation evaluates nothing: the decision to write belongs to the caller, and
+ * "show me the state" is not one of the callers that decides. The provenance form
+ * is the sharpest probe — it is documented as costing no request and no write, and
+ * its output proves the edit was adopted.
+ *
+ * `sessionSwitchAt` is a built-in scalar the fixture does not set, so its value on
+ * the provenance line is the adoption's own witness: 75 is what this extension
+ * ships, and 55 is what the edited file says.
+ */
+test("the read-only forms adopt an edit without writing a file or reading a quota", async () => {
+  const fx = await fixture();
+  const before = await readFile(fx.plannerFile, "utf8");
+  let fetches = 0;
+  const counting = (async (url: string | URL, init?: RequestInit) => {
+    fetches += 1;
+    return stubFetch()(url, init);
+  }) as unknown as typeof fetch;
+
+  await withExtension(
+    fx,
+    async ({ run }) => {
+      assert.ok((await run("config")).includes("sessionSwitchAt = 75"), "built-in until the file says otherwise");
+
+      await fx.writeConfig({ ...fx.config, sessionSwitchAt: 55 });
+
+      const fetchesBefore = fetches;
+      const configText = await run("config");
+      assert.ok(configText.includes("sessionSwitchAt = 55"), `the edit must be adopted:\n${configText}`);
+      assert.equal(fetches, fetchesBefore, "the provenance form reads no quota, even when it adopts");
+
+      // The claude session is tight in the fixture, so a pass that decided would
+      // move the planner. This one reports and decides nothing.
+      await run("");
+    },
+    () => counting,
+  );
+
+  assert.equal(await readFile(fx.plannerFile, "utf8"), before, "a read-only form must not write an agent file");
+});
+
+/**
+ * The footer is a drawing, and a drawing that fails must not be mistaken for an
+ * adoption that failed. The configuration is installed before the footer is
+ * touched, so a sink that refuses — a context pi has replaced, a themed getter
+ * that throws — leaves the new policy in force and the caller's pass working, and
+ * the fault reaches the report's warning tail instead.
+ */
+test("a footer sink that refuses cannot veto an adopted edit", async (t) => {
+  const errors = t.mock.method(console, "error");
+  const fx = await fixture();
+  // Only for the adoption: the shutdown clear goes through the same key, and a
+  // sink that refuses there is its own case, tested where it belongs.
+  let refusing = true;
+
+  await withExtension(
+    fx,
+    async ({ run }) => {
+      await fx.writeConfig({ ...fx.config, sessionSwitchAt: 55 });
+
+      // `apply` because it both adopts and decides: the point is that a refused
+      // footer does not stop the pass the caller asked for.
+      const text = await run("apply");
+      assert.ok(text.includes("choosing openai-codex/gpt-6-sol"), text);
+      assert.ok(
+        errors.mock.calls.some((call) => String(call.arguments[0]).includes("the footer could not be drawn")),
+        JSON.stringify(errors.mock.calls),
+      );
+      refusing = false;
+    },
+    stubFetch,
+    { statusThrows: (key) => refusing && key === WARNING_KEY },
+  );
+
+  assert.match(await readFile(fx.plannerFile, "utf8"), /^model: "openai-codex\/gpt-6-sol"$/m);
+});
+
+/**
+ * A non-evaluating activation redraws no gauge, so a drawing that names rails the
+ * new configuration does not read has to go rather than sit there until the next
+ * evaluating pass — it would describe a policy nobody is running.
+ */
+test("an edit that changes the railed routes clears the stale gauge", async () => {
+  const fx = await fixture();
+
+  await withExtension(fx, async ({ run, statuses }) => {
+    await run("");
+    assert.equal(typeof gaugeStatuses(statuses).at(-1)?.text, "string", "precondition: a gauge is on screen");
+
+    // One route, on the codex rail only: the claude rail is no longer named by
+    // anything, so drawing it would be drawing a reading nothing will refresh.
+    await fx.writeConfig({
+      ...fx.config,
+      agents: {
+        planner: {
+          primary: { model: "openai-codex/gpt-6-sol", rail: "codex" },
+          alternates: [],
+        },
+      },
+    });
+
+    // `config` reads no quota, so nothing repaints the gauge: the stale line has to
+    // be cleared by the activation itself.
+    await run("config");
+    assert.equal(gaugeStatuses(statuses).at(-1)?.text, undefined, JSON.stringify(statuses));
+  });
+});
+
+/**
+ * A `pollMs` handed to a running session by an edit has to reach the timer, or a
+ * session keeps polling at the cadence it booted with.
+ */
+test("an edit that changes pollMs re-times the poll", async () => {
+  const fx = await fixture();
+  const delays: number[] = [];
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = ((fn: () => void, ms?: number) => {
+    delays.push(ms ?? 0);
+    return realSetInterval(fn, ms);
+  }) as typeof setInterval;
+  try {
+    await withExtension(fx, async ({ run }) => {
+      await run("");
+      await fx.writeConfig({ ...fx.config, pollMs: 30 });
+      await run("");
+    });
+  } finally {
+    globalThis.setInterval = realSetInterval;
+  }
+  assert.equal(delays.at(-1), 30, `scheduled delays: ${delays.join(", ")}`);
+});
+
+/**
+ * A revalidation reads the config files and nothing else. A file that declares a
+ * generator is only ever run by the two explicit forms (ADR 0015), so adopting an
+ * edit to it must not spawn the command.
+ */
+test("a revalidation never runs a declared generator", async () => {
+  const fx = await generateFixture(
+    { ...GENERATED_LAYER, pollMs: 2_147_483_647 },
+    // The marker is the fixture's own `ran` file, beside the layer it prints.
+    (layerPath) => `cat '${layerPath}' && touch '${join(dirname(layerPath), "ran")}'`,
+  );
+
+  await withExtension(fx, async ({ run }) => {
+    await run("");
+
+    // An edit to the file that declares the generator, adopted by a plain form.
+    const current = JSON.parse(await readFile(fx.globalPath, "utf8")) as Record<string, unknown>;
+    await writeFile(fx.globalPath, JSON.stringify({ ...current, pollMs: 2_147_483_646 }), "utf8");
+
+    const text = await run("");
+    assert.ok(text.includes("config: built-in < global"), text);
+  });
+
+  await assert.rejects(readFile(fx.marker, "utf8"), /ENOENT/, "no form but generate may run the command");
 });
 
 // ---------------------------------------------------------------- session_start
@@ -3878,26 +4260,28 @@ test("a session with no previous model cannot be restored when the application s
   assert.equal(session.model, "openai-codex/gpt-6-astra");
 });
 
-test("a binding edit is not seen until the extension is reloaded", async () => {
+test("a binding edit is picked up by the next skill invocation, without a reload", async () => {
   const fx = await fixture();
   const globalConfig = join(fx.agentDir, CONFIG_FILE_NAME);
-  const first = fakeSession();
+  const session = fakeSession();
 
-  await withSkills(fx, first, async ({ input, notifications }) => {
+  await withSkills(fx, session, async ({ input, notifications }) => {
+    // No binding yet, so the skill runs on whatever the session is already on.
     assert.equal(await input("/skill:implementation-plan"), undefined);
+    assert.deepEqual(session.calls, []);
+    assert.deepEqual(notifications, []);
+
     const config: unknown = JSON.parse(await readFile(globalConfig, "utf8"));
     assert.ok(typeof config === "object" && config !== null);
     await writeFile(globalConfig, JSON.stringify({ ...config, skills: BINDINGS }));
-    assert.equal(await input("/skill:implementation-plan"), undefined);
-    assert.deepEqual(first.calls, []);
-    assert.deepEqual(notifications, []);
-  });
 
-  const reloaded = fakeSession();
-  await withSkills(fx, reloaded, async ({ input, notifications }) => {
-    await input("/skill:implementation-plan");
-    assert.deepEqual(reloaded.calls, selectionCalls("claude-bridge/claude-opus-5-5", "high"));
-    assert.deepEqual(notifications.map((n) => n.level), ["info"]);
+    // The same session. The invocation adopts the edited file — the binding is one
+    // of the values an edit changes — and applies the route it names.
+    assert.equal(await input("/skill:implementation-plan"), undefined);
+    assert.deepEqual(session.calls, selectionCalls("claude-bridge/claude-opus-5-5", "high"));
+    assert.deepEqual(notifications, [
+      { text: "Skill implementation-plan → planner: claude-bridge/claude-opus-5-5, thinking high", level: "info" },
+    ]);
   });
 });
 
