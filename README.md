@@ -123,7 +123,7 @@ Agent files found in ~/.pi/agent/agents:
   planner.md — model: claude-bridge/claude-opus-5-5
   writer.md — model: (none)
 
-Then /reload. Run /quota-dispatch at any time to see what it would do.
+Then run /quota-dispatch: the next pass picks up the edit and shows what it would do.
 ```
 
 The snippet is built from the model each agent file **already** declares, and
@@ -145,8 +145,10 @@ route names is listed by the plain and `refresh` forms. The startup ask mentions
 them only while the table is empty; a configured install does not narrate the
 files it deliberately does not manage.
 
-Config is read once per extension load, so `/reload` is what picks up a new
-route — and what stops the ask.
+Config is read once per extension load and revalidated before every pass, so a
+new route is picked up by the next `/quota-dispatch` or the next poll — and that
+is what stops the ask. See [A config edit takes effect without a
+reload](#a-config-edit-takes-effect-without-a-reload).
 
 ### When the file is there but unusable
 
@@ -158,7 +160,7 @@ on — leading with the fault and ending with the fix:
 ```
 quota-dispatcher: a config file could not be used.
 ~/.pi/agent/quota-dispatch.json: not valid JSON (line 3, column 1: Expected double-quoted property name) — the file is skipped whole, so the layers below it still apply
-Fix the file, then /reload. Run /quota-dispatch at any time to see what it would do.
+Fix the file; the next pass picks up the edit. /quota-dispatch shows what it would do.
 ```
 
 The line under the headline is the same sentence the log and `/quota-dispatch`
@@ -198,7 +200,7 @@ notification listing every occurrence and the file to edit:
 quota-dispatcher: a configured model is unknown to this pi.
 agents.reviewer.primary.model: this pi does not know model openai-codex/gpt-astra-6 — a newer pi may
 agents.reviewer.alternates[0].model: this pi does not know model openai-codex/gpt-sol-6 — a newer pi may
-Edit ~/.pi/agent/quota-dispatch.json, then /reload, or upgrade pi.
+Edit ~/.pi/agent/quota-dispatch.json, or upgrade pi; the next pass picks up the edit.
 ```
 
 One message per session however many ids are wrong, one line per occurrence, and
@@ -285,10 +287,10 @@ warning lines above stay visible beside it rather than instead of it — the
 warning normally comes first, though a line too narrow for both is truncated. If
 the footer cannot be drawn at all, `/quota-dispatch` says so in its warning tail.
 
-Set `railGauge` to `false` and `/reload` (or generate a layer that sets it): the
-line is cleared and not drawn again. The value is read once per extension load
-like every other key, so an edit takes effect on the next `/reload`, not on the
-next evaluation.
+Set `railGauge` to `false` (or generate a layer that sets it) and `/quota-dispatch`:
+the line is cleared and not drawn again. Like every other key it is read at load
+and re-read when the file changes, which the next pass notices — so a command or
+the next poll is what puts it into effect.
 The glossary term is in [CONTEXT.md](CONTEXT.md).
 
 ## Commands
@@ -313,13 +315,17 @@ answered with the list. What makes it worth its own form is that it is the only
 form that starts the Codex CLI: that CLI is the only thing that refreshes a Codex
 token, so the command runs it once and then reports what the file holds. The
 extension still writes no credential — the run is the CLI's, and the file belongs
-to whoever wrote it. `refresh-codex` boots nothing and reads no quota: it is a
-subprocess and one file re-read, answered before the report's machinery is set up.
+to whoever wrote it. `refresh-codex` reads no quota: it is a subprocess and one
+file re-read, answered before the report's machinery is set up. It boots nothing
+of its own — the only boot on that path is the one a pending config edit needs to
+be adopted, and an unchanged file costs two `stat`s and nothing else.
 
 The two reporting forms are read-only by construction — `report()` has no way to
-be asked to write, so "show me the state" cannot rewrite your agents — and
-`config` never gets as far as a rail: it is answered from the config files, so it
-works when a vendor is unreachable or you would rather not spend a request.
+be asked to write, so "show me the state" cannot rewrite your agents, even when it
+adopts a config edit on the way — while `config` never gets as far as a rail: it
+is answered from the config files, so it works when a vendor is unreachable or you
+would rather not spend a request. (The report itself reads the rails, which is what
+it has to do; `config` does not.)
 `urls` does not even read the config: it is answered from the endpoints table
 before any boot, so it works on a machine whose firewall blocks the vendors
 entirely.
@@ -560,8 +566,8 @@ skill runs. Your arguments reach the skill untouched.
   warning says so when they cannot be. The warning never claims a rollback that did not happen.
 
 Bindings layer like everything else: a project binding replaces the global one for the same skill, and the rest
-are inherited. `/quota-dispatch config` lists them as `skills.<name> = <route>  [<source>]`. Edits take effect
-on `/reload`; the agent file itself is read fresh on every invocation. See
+are inherited. `/quota-dispatch config` lists them as `skills.<name> = <route>  [<source>]`. An edit is picked up
+by the next pass, like every other key; the agent file itself is read fresh on every invocation. See
 [0014](docs/adr/0014-skill-bindings-read-the-agent-file.md).
 
 ### Adding, removing and parking an agent
@@ -746,7 +752,62 @@ with the same warning lines — the provenance block repeats them — so a confi
 that is not doing what you meant says so instead of quietly routing you
 somewhere else.
 
-Config is read once when the extension loads; `/reload` after editing.
+Config is read when the extension loads, then revalidated before every pass: an
+edit is adopted by the next `/quota-dispatch` or the next poll, whichever comes
+first. See [below](#a-config-edit-takes-effect-without-a-reload).
+
+### A config edit takes effect without a reload
+
+Before a pass decides anything it checks the two config files — the global layer
+and the project one — against the state they were in when the configuration in
+force was read. If neither moved, nothing happens: two `stat`s and the pass
+carries on. If one did, the files are read and merged exactly as they are at
+startup, and the new configuration takes over: the footer is redrawn, the poll
+cadence is retaken from `pollMs`, and the pass that noticed the edit carries on
+with the new policy — a tick evaluates it, `apply` writes those files, and a
+report shows what it would do without touching a file.
+
+So the loop is: edit the file, run `/quota-dispatch apply` (or just
+`/quota-dispatch`, to see what it would do first). Waiting also works — the poll
+tick adopts the edit within `pollMs`, five minutes by default — but a command is
+what picks it up on the spot, and it is the only thing that does when the table
+routes nothing (an unconfigured install has no tick to wait for). `/reload` is no
+longer needed for a config edit; it is still how you pick up a changed
+*extension*.
+
+A read-only form stays read-only: adopting an edit installs the new policy but
+decides nothing, which is what keeps `/quota-dispatch` and `/quota-dispatch
+config` from writing agent files or reading a quota after an edit. `/skill:` is
+the third case — it adopts an edit too, so an edited binding applies to the
+invocation that follows it rather than at some later tick.
+
+What the check costs and why it is a `stat` rather than a comparison of the
+values: [0025](docs/adr/0025-a-config-edit-is-adopted-by-the-next-pass.md). Three
+consequences are worth knowing.
+
+- **An unparseable file is adopted, not ignored.** A save that leaves the file
+  half-written is handled exactly as a `/reload` would handle it: that layer is
+  skipped whole, the layers beneath it stand, and the warning reaches the log and
+  the report. Holding the previous policy instead would leave a session running a
+  file that no longer says what it thinks, which is the state this removes. It is
+  not dangerous: a skipped layer cannot make the dispatcher write an agent file,
+  because a table with no routes decides about nothing.
+- **A generator still runs only when you run it.** Adoption re-reads the config
+  files, so a file a generator *prints into* is live, but the command that prints
+  it is not run for you. Edit the source of a generated layer and you still run
+  `/quota-dispatch generate`, or whatever writes the file.
+- **Each session adopts on its own.** Two running sessions each notice an edit at
+  their own next pass. Nothing coordinates them, so two sessions can still take
+  turns rewriting the same agent files every `pollMs` when their policies
+  disagree — the difference is that a shared edit reaches both without a
+  `/reload` in each.
+- **One shape of save can wait for the next one.** The check compares the files'
+  timestamps, size and inode, so a save that changes none of them is invisible
+  until it does. That is a same-size in-place write inside one timestamp granule,
+  which only happens on a filesystem that reports mtime to the second — HFS+, FAT,
+  some network shares. Editors and `>` redirection normally move the inode or the
+  size, and the delay is until the file is saved again; see
+  [0025](docs/adr/0025-a-config-edit-is-adopted-by-the-next-pass.md).
 
 ### Generating configuration
 
@@ -771,21 +832,25 @@ same for `.pi/quota-dispatch.json`. The `generator` declaration is preserved (as
 the same JSON value, so its spelling may be normalized), so the next run still
 knows its command. The command runs under Bash with the file's own directory as
 the working directory and your environment, and must print strictly valid
-configuration JSON — **any problem in the generated layer rejects the run** and
-leaves the file and the running configuration exactly as they were. That is
-stricter than a hand-written file, which tolerates a bad value by keeping the
+configuration JSON — **any problem in the generated layer rejects the run**, and
+that layer's file and the configuration it would have replaced are left exactly as
+they were — a hand edit the run itself adopted first is the one exception, since
+that adoption is the same thing any other form would have done. That is stricter
+than a hand-written file, which tolerates a bad value by keeping the
 one beneath it; a generator printed a whole layer, so a half-accepted one would
 activate a configuration nobody wrote. A generator's own `generator` key in its
 output is ignored: the target file's declaration is the one that governs.
 
 Generation replaces **one layer, not the merged config**, and it happens **only
-on those two commands** — never on load, `/reload`, a poll, or a session event.
-A successful run activates the new configuration immediately; there is no
-`/reload`. That immediacy is about *this* pi process, though: another running
-session keeps the configuration it read (and keeps polling and writing shared
-agent files with that policy) until it runs `/reload` too. Two sessions on
-opposing policies will take turns rewriting the same agent files every `pollMs`,
-so reload the others — or stop them — after a swap. A failure is reported with
+on those two commands** — never on load, `/reload`, a poll, a session event, or a
+config revalidation. A successful run activates the new configuration
+immediately; there is no `/reload`. That immediacy is about *this* pi process,
+though: another running session keeps the configuration it read until its own
+next pass, which adopts what this one wrote (see [A config edit takes effect
+without a reload](#a-config-edit-takes-effect-without-a-reload)). Two sessions on
+opposing policies will still take turns rewriting the same agent files every
+`pollMs`, so a generated layer that contradicts another session's is worth
+stopping that session for. A failure is reported with
 the command's own `stderr` and changes nothing. Unlike the other forms,
 generation also evaluates the new policy once, exactly as `session_start` does
 (including doing nothing when the new table manages no agents), so it writes

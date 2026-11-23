@@ -303,3 +303,39 @@ declaration that named it in place. The routes a generator emits are ordinary
 configuration, so reusable routes and model swaps are the generator's business,
 not new dispatcher behaviour. It is fed the **generator input** on stdin.
 _Avoid_: route template, generator config, config script, dynamic config
+
+**Config revalidation**:
+The check a pass makes before it decides anything: the state of the two config
+files compared with the state they were in when the active configuration was
+read. Unmoved files cost one `stat` each and change nothing; a moved file is
+*adopted* — read, booted and **activated** — so a route saved mid-session is what
+the next pass decides on. A save that leaves the file's timestamp, size and inode
+unchanged — a same-size in-place write inside one timestamp granule, on a
+filesystem that reports to the second — is not *moved*, and waits for the next
+save. It never runs a **configuration generator**, and `/reload` remains the way
+to pick up a changed extension. See
+[docs/adr/0025](docs/adr/0025-a-config-edit-is-adopted-by-the-next-pass.md).
+_Avoid_: hot reload, config watch, auto-reload, file watcher
+
+**Activation**:
+What makes a freshly loaded configuration the one in force: the cached
+configuration and the boot built from it are exchanged together, the footer is
+redrawn for the new policy, and the poll cadence is retaken. It evaluates
+nothing — what a new policy should do next belongs to the pass that asked for it,
+which is what keeps a **report** read-only — and it happens inside the
+**evaluation fence**, so a pass still running on the superseded configuration
+cannot write after it. A generation activates the file it published; a **config
+revalidation** activates the file it read.
+_Avoid_: hot swap, hot reload, reload, config reload
+
+**Evaluation fence**:
+The one-at-a-time exclusion between a pass writing agent files and the
+**activation** of a new configuration: a pass may not start while a configuration
+is being published or activated, running passes are drained first, and one
+holder at a time may raise it — a second waits for the first to release. A
+`session_start`, whose pass the session's first spawn is waiting on, waits for
+the activation to finish instead of being dropped. It orders work inside one pi
+process only and never arbitrates between processes — agent files are coordinated
+by a **lock** instead. See
+[docs/adr/0015](docs/adr/0015-configuration-generation.md).
+_Avoid_: mutex, write barrier, publish lock

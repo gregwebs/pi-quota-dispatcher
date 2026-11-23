@@ -30,9 +30,10 @@ what they meant when written by hand.
 ## What runs, and when
 
 The command runs **only** on the two explicit generate forms. It never runs on
-load, `/reload`, `session_start`, a poll tick, or `/skill:` input. A file that
-declares a generator behaves, on every other path, exactly like a file without
-one, which is what keeps an expensive or side-effecting program from being
+load, `/reload`, `session_start`, a poll tick, a config revalidation (see
+[0025](0025-a-config-edit-is-adopted-by-the-next-pass.md)), or `/skill:` input. A
+file that declares a generator behaves, on every other path, exactly like a file
+without one, which is what keeps an expensive or side-effecting program from being
 invoked by accident. This is deliberate: a generator is trusted user code, and
 the only safe trigger is the user typing its name.
 
@@ -99,8 +100,10 @@ is swapped so the two cached handles agree, the poll cadence is rescheduled from
 the new `pollMs`, and the new policy is evaluated once, exactly as
 `session_start` would — including doing nothing when the generated table manages
 no agents, so an empty table costs no vendor request. No `/reload` is needed.
-That immediacy is local to this pi process: another running session keeps its own
-configuration until it reloads. Evaluations already in flight on the old
+That immediacy is local to this pi process: another running session keeps the
+configuration it read until its own next pass adopts the new file (ADR
+[0025](0025-a-config-edit-is-adopted-by-the-next-pass.md)), which is now the
+same path a hand edit takes. Evaluations already in flight on the old
 configuration are drained just before publication and new ones are fenced for
 that instant, so an old pass cannot write after the new one. The boot a fenced
 evaluation uses is read when the evaluation starts, not when it was requested,
