@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { constants } from "node:fs";
-import { access, chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { agentTable, routeOf } from "./helpers/identifiers.ts";
 import { fakeReads, readingOf } from "./helpers/rails.ts";
+import { removeTempRoots, tempRoot } from "./helpers/temp-dir.ts";
 
 // Types are erased, so this import does not evaluate `src/index.ts`; the value
 // import below is dynamic and deliberately happens after `HOME` is redirected.
@@ -33,7 +33,14 @@ import {
 // `~/.claude/.credentials.json`, and the only way to move a load-time default is
 // to set `HOME` before the import. `node --test` runs each file in its own
 // process, so this cannot bleed into any other test file.
-const TMP_HOME = await mkdtemp(join(tmpdir(), "pqd-refresh-home-"));
+// The one removal for every directory this file makes: the `HOME` and stub below
+// are made before any test exists, and a fixture made inside a test body goes
+// into the same registry rather than threading a test context through the file.
+// Registered before the setup so nothing waits on a hook that comes after it; a
+// throw the setup does not survive is the helper's own exit flush to answer.
+after(removeTempRoots);
+
+const TMP_HOME = await tempRoot("refresh-home");
 process.env.HOME = TMP_HOME;
 
 // Spec-8: the default-path rule is the only thing between a test and the real
@@ -42,7 +49,7 @@ process.env.HOME = TMP_HOME;
 // developer's keychain (which costs money). Nothing in this file is allowed to
 // run the real binary, so every test that resolves a production refresher
 // asserts the stub was never invoked.
-const STUB_BIN = await mkdtemp(join(tmpdir(), "pqd-claude-stub-"));
+const STUB_BIN = await tempRoot("claude-stub");
 const STUB_LOG = join(STUB_BIN, "invocations");
 const STUB_CLAUDE = join(STUB_BIN, "claude");
 await writeFile(STUB_CLAUDE, `#!/bin/sh\necho "$@" >> '${STUB_LOG}'\nexit 1\n`, "utf8");
@@ -705,7 +712,7 @@ interface Fixture {
 
 /** A self-contained dispatcher fixture, so no test touches the real credential. */
 async function fixture(plannerModel = "claude-bridge/claude-opus-5-5"): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "pqd-refresh-"));
+  const root = await tempRoot("refresh");
   const agentDir = join(root, "agents");
   await mkdir(agentDir, { recursive: true });
   await writeFile(join(agentDir, "planner.md"), TEMPLATE("planner", plannerModel), "utf8");

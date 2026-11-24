@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { delimiter, join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
@@ -25,12 +24,12 @@ import { fakeReads, readingOf } from "./helpers/rails.ts";
 import {
   createSharedReadings,
 } from "../src/readings-file.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 const NOW = 1_730_123_456_789;
 
 async function fixture(t: TestContext) {
-  const root = await mkdtemp(join(tmpdir(), "pqd-refresh-shared-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir(t, "refresh-shared");
   const agentDir = join(root, "agents"); await mkdir(agentDir);
   const claudeCredsPath = join(root, "claude.json");
   const piAuthPath = join(root, "auth.json");
@@ -171,8 +170,7 @@ test("a sticky halt armed without an identity needs explicit clearing", async (t
 });
 
 async function binFixture(t: TestContext) {
-  const root = await mkdtemp(join(tmpdir(), "pqd-install-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir(t, "install");
   return root;
 }
 

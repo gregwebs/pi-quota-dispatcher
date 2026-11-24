@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
@@ -32,6 +31,7 @@ import {
 } from "../src/config.ts";
 
 import { agentName, agentTable, modelId } from "./helpers/identifiers.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 const MODEL = modelId("deepseek/deepseek-flash");
 const route: AgentRoute = { primary: { model: MODEL, rail: "deepseek" }, alternates: [] };
@@ -42,8 +42,7 @@ const config = (dir: string, names: string[]): DispatcherConfig => ({
   agents: agentTable(Object.fromEntries(names.map((n) => [n, route]))),
 });
 async function fixture(t: TestContext, entries: Record<string, string>) {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-names-"));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dir = await tempDir(t, "names");
   for (const [file, contents] of Object.entries(entries)) await writeFile(join(dir, file), contents);
   return dir;
 }

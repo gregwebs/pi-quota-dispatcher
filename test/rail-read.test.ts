@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 
@@ -27,6 +26,7 @@ import {
   DEFAULT_CONFIG,
 } from "../src/config.ts";
 import type { AntigravityReadings, RailWindow } from "../src/rail-reading.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 const NOW = 1_730_123_456_789;
 const STORED_ACCESS = { token: "stored-access", projectId: "stored-project" };
@@ -821,8 +821,7 @@ test("a credential that was never acquired is one group-wide failure, not a requ
  * no pause at all, where the shipped 250ms is unmissable.
  */
 test("an unstated timing reads as the shipped one, not as undefined", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "pqd-rail-read-pacing-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir(t, "rail-read-pacing");
   const claudeCredsPath = join(root, "claude.json");
   await writeFile(claudeCredsPath, JSON.stringify({
     claudeAiOauth: { accessToken: "tok", expiresAt: NOW + 3_600_000 },

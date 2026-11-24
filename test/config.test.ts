@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { mkdir, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -42,6 +42,7 @@ import {
   type Rail,
 } from "../src/rail.ts";
 import { agentName, modelId, skillName, agentTable, modelTable, skillTable } from "./helpers/identifiers.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
 // documented literal directly.
@@ -1625,8 +1626,8 @@ test("loadConfig never rejects when readFile fails with a non-ENOENT error", asy
   assert.ok(loaded.warnings.some((w) => w.includes(PROJECT_PATH)), loaded.warnings.join("\n"));
 });
 
-test("loadConfig with no deps resolves the relocated agent dir from PI_CODING_AGENT_DIR", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pqd-load-"));
+test("loadConfig with no deps resolves the relocated agent dir from PI_CODING_AGENT_DIR", async (t) => {
+  const root = await tempDir(t, "load");
   const agentDir = join(root, "agent");
   const projectDir = join(root, "project");
   await mkdir(agentDir, { recursive: true });

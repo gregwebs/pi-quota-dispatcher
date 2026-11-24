@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { findRuntimeDependencyProblems } from "../scripts/check-runtime-deps.js";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 const run = promisify(execFile);
 const REPO = fileURLToPath(new URL("..", import.meta.url));
@@ -82,8 +82,8 @@ test("running the script as CI does exits 0 and names what it checked", async ()
  * The exit code is the half of the contract CI actually consumes: a detector
  * that finds a problem but still exits 0 would let a bad package.json ship.
  */
-async function runAgainst(manifest: Record<string, unknown>) {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-deps-"));
+async function runAgainst(t: TestContext, manifest: Record<string, unknown>) {
+  const dir = await tempDir(t, "deps");
   const path = join(dir, "package.json");
   await writeFile(path, JSON.stringify(manifest), "utf8");
   try {
@@ -95,20 +95,20 @@ async function runAgainst(manifest: Record<string, unknown>) {
   }
 }
 
-test("the script exits non-zero and explains why for a real dependency", async () => {
-  const result = await runAgainst(packageJson({ dependencies: { zod: "^3" } }));
+test("the script exits non-zero and explains why for a real dependency", async (t) => {
+  const result = await runAgainst(t, packageJson({ dependencies: { zod: "^3" } }));
   assert.equal(result.code, 1);
   assert.match(result.stderr, /dependencies\.zod/);
 });
 
-test("the script exits non-zero for a peer that is not optional", async () => {
-  const result = await runAgainst(packageJson({ peerDependenciesMeta: {} }));
+test("the script exits non-zero for a peer that is not optional", async (t) => {
+  const result = await runAgainst(t, packageJson({ peerDependenciesMeta: {} }));
   assert.equal(result.code, 1);
   assert.match(result.stderr, /@earendil-works\/pi-coding-agent/);
 });
 
-test("the script exits 0 for an intact manifest", async () => {
-  const { code, stdout } = await runAgainst(packageJson());
+test("the script exits 0 for an intact manifest", async (t) => {
+  const { code, stdout } = await runAgainst(t, packageJson());
   assert.equal(code, 0);
   assert.match(stdout, /dependencies: none/);
 });

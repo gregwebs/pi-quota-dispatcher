@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, link, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -23,30 +23,31 @@ import {
   installCodexTrap,
   jwt,
   managedLogin,
-  removeCodexFixtures,
   type CodexFixture,
 } from "./helpers/codex-fixture.ts";
+import { removeTempRoots, tempRoot } from "./helpers/temp-dir.ts";
 
 // The admission list and the argv this command runs, pinned as values. Nothing in
 // this file may spawn: the trap below is the only `codex` on `PATH` outside a
 // fixture, and a correct run never runs one.
 
 const trap = await installCodexTrap();
-const EMPTY_HOME = await mkdtemp(join(tmpdir(), "pqd-codex-home-"));
-const EMPTY_CODEX_HOME = await mkdtemp(join(tmpdir(), "pqd-codex-ch-"));
+const EMPTY_HOME = await tempRoot("codex-home");
+const EMPTY_CODEX_HOME = await tempRoot("codex-ch");
 process.env.PATH = trap.dir;
 process.env.HOME = EMPTY_HOME;
 process.env.CODEX_HOME = EMPTY_CODEX_HOME;
 
 // One hook, in this order: the trap is read before anything is removed, so a
 // spawn that fell through to it is a failure rather than an empty log, and every
-// fixture and temp dir this file made is then cleaned up.
+// fixture and temp dir this file made is then cleaned up — including when that
+// read fails, which is why the removal is in a `finally`.
 after(async () => {
-  assert.equal(await trap.invocations(), 0, "no test may start a real codex");
-  await removeCodexFixtures();
-  await Promise.all(
-    [EMPTY_HOME, EMPTY_CODEX_HOME].map((dir) => rm(dir, { recursive: true, force: true })),
-  );
+  try {
+    assert.equal(await trap.invocations(), 0, "no test may start a real codex");
+  } finally {
+    await removeTempRoots();
+  }
 });
 
 // Loaded after the environment is redirected: `refresh.ts` and `config.ts` build
@@ -902,7 +903,7 @@ test("failed run setup is reported as itself, and nothing is launched", async ()
   const reassessed = await createCodexRefresh({
     makeWorkdir: async () => {
       await writeFile(fx.authPath, "{ not a login", "utf8");
-      return mkdtemp(join(tmpdir(), "pqd-codex-late-"));
+      return tempRoot("codex-late");
     },
     run: async () => {
       ran += 1;

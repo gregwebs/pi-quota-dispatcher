@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 
 import {
   type AgentDefinition,
@@ -37,6 +36,7 @@ import {
 } from "../src/rail-reading.ts";
 import { agentName, modelId, routeOf, agentTable, modelTable } from "./helpers/identifiers.ts";
 import { failureOf, fakeReads, readingOf } from "./helpers/rails.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 import { startHolder } from "./fixtures/agent-write-child.ts";
 
 const definitionOf = (agent: string, cfg: DispatcherConfig): AgentDefinition => ({ agent: agentName(agent), file: join(cfg.agentDir, `${agent}.md`) });
@@ -230,8 +230,8 @@ test("upsertModel still inserts a model line when there is none", () => {
   assert.match(out, /^model: "openai-codex\/gpt-6-sol"$/m);
 });
 
-test("applyDecision reports unchanged, and writes nothing, when only the quoting differs", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-unchanged-"));
+test("applyDecision reports unchanged, and writes nothing, when only the quoting differs", async (t) => {
+  const dir = await tempDir(t, "unchanged");
   const file = join(dir, "agent.md");
   // The active line is quoted; the target is bare. They name the same model, so
   // the difference is punctuation only and the file must be left alone.
@@ -247,8 +247,8 @@ test("applyDecision reports unchanged, and writes nothing, when only the quoting
 
 // The same decoding runs through `applyDecision`, so a commented line the
 // policy already agrees with is left byte-for-byte alone.
-test("applyDecision leaves a commented model line alone", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-unchanged-"));
+test("applyDecision leaves a commented model line alone", async (t) => {
+  const dir = await tempDir(t, "unchanged");
   const file = join(dir, "agent.md");
   const src = `---\nname: agent\nmodel: claude-bridge/claude-opus-5-5 # pinned\n---\n\nBody.\n`;
   await writeFile(file, src, "utf8");
@@ -260,8 +260,8 @@ test("applyDecision leaves a commented model line alone", async () => {
   assert.equal(await readFile(file, "utf8"), src, "a commented line already naming the model must not change");
 });
 
-test("applyDecision reports would-write on a dry run when the model differs", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-unchanged-"));
+test("applyDecision reports would-write on a dry run when the model differs", async (t) => {
+  const dir = await tempDir(t, "unchanged");
   const file = join(dir, "agent.md");
   const src = `---\nname: agent\nmodel: "claude-bridge/claude-opus-5-5"\n---\n\nBody.\n`;
   await writeFile(file, src, "utf8");
@@ -315,8 +315,8 @@ test("upsertThinking has nothing to write without usable frontmatter", () => {
   assert.equal(upsertThinking("---\nother: 1\n---\n", "high"), "---\nother: 1\n---\n");
 });
 
-test("applyDecision writes the model and its level together", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-thinking-"));
+test("applyDecision writes the model and its level together", async (t) => {
+  const dir = await tempDir(t, "thinking");
   const file = join(dir, "agent.md");
   await writeFile(file, `---\nname: agent\nmodel: "a/b"\nthinking: low\n---\n\nBody.\n`, "utf8");
 
@@ -330,8 +330,8 @@ test("applyDecision writes the model and its level together", async () => {
   assert.match(after, /Body\./);
 });
 
-test("applyDecision is unchanged when the file already says both", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-thinking-"));
+test("applyDecision is unchanged when the file already says both", async (t) => {
+  const dir = await tempDir(t, "thinking");
   const file = join(dir, "agent.md");
   const src = `---\nname: agent\nmodel: "a/b"\nthinking: high\n---\n\nBody.\n`;
   await writeFile(file, src, "utf8");
@@ -351,8 +351,8 @@ test("applyDecision is unchanged when the file already says both", async () => {
   assert.equal(await readFile(file, "utf8"), src);
 });
 
-test("a level already in the file survives a pass that resolves none", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-thinking-"));
+test("a level already in the file survives a pass that resolves none", async (t) => {
+  const dir = await tempDir(t, "thinking");
   const file = join(dir, "agent.md");
   await writeFile(file, `---\nname: agent\nmodel: "a/b"\n---\n\nBody.\n`, "utf8");
 
@@ -373,8 +373,8 @@ test("a level already in the file survives a pass that resolves none", async () 
   assert.match(after, /^thinking: low$/m);
 });
 
-test("a level that has to be inserted lands beside the model line", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-thinking-"));
+test("a level that has to be inserted lands beside the model line", async (t) => {
+  const dir = await tempDir(t, "thinking");
   const file = join(dir, "agent.md");
   await writeFile(file, `---\nname: agent\nmodel: "a/b"\ntools: read\n---\n\nBody.\n`, "utf8");
 
@@ -1327,8 +1327,8 @@ interface Fixture {
  * same statement about the shared rail cache: unset, a test would read and write
  * the developer's own readings.
  */
-async function fixture(models: Record<string, string>): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "pqd-"));
+async function fixture(t: TestContext, models: Record<string, string>): Promise<Fixture> {
+  const root = await tempDir(t, "dispatch");
   const agentDir = join(root, "agents");
   await mkdir(agentDir, { recursive: true });
   for (const [name, model] of Object.entries(models)) {
@@ -1393,8 +1393,8 @@ function dispatcherFor(fx: Fixture, opts: StubReadings = {}) {
   );
 }
 
-test("a dry run reports would-write and leaves files alone", async () => {
-  const fx = await fixture({
+test("a dry run reports would-write and leaves files alone", async (t) => {
+  const fx = await fixture(t, {
     planner: "claude-bridge/claude-opus-5-5",
     reviewer: "openai-codex/gpt-6-astra",
     implementer: "deepseek/deepseek-flash",
@@ -1412,8 +1412,8 @@ test("a dry run reports would-write and leaves files alone", async () => {
   assert.match(planner, /^model: "claude-bridge\/claude-opus-5-5"$/m);
 });
 
-test("a real run rewrites the frontmatter and nothing else", async () => {
-  const fx = await fixture({
+test("a real run rewrites the frontmatter and nothing else", async (t) => {
+  const fx = await fixture(t, {
     planner: "claude-bridge/claude-opus-5-5",
     reviewer: "openai-codex/gpt-6-astra",
     implementer: "deepseek/deepseek-flash",
@@ -1434,8 +1434,8 @@ test("a real run rewrites the frontmatter and nothing else", async () => {
   assert.equal(reviewer, TEMPLATE("reviewer", "openai-codex/gpt-6-astra"));
 });
 
-test("re-evaluation is idempotent and reports unchanged", async () => {
-  const fx = await fixture({ planner: "openai-codex/gpt-6-sol" });
+test("re-evaluation is idempotent and reports unchanged", async (t) => {
+  const fx = await fixture(t, { planner: "openai-codex/gpt-6-sol" });
   const d = dispatcherFor(fx, { claude: { session: 90 }, codex: { session: 10 } });
   const results = await d.evaluate({ force: true });
   assert.equal(results.find((r) => r.decision.agent === "planner")!.outcome, "unchanged");
@@ -1448,8 +1448,8 @@ test("re-evaluation is idempotent and reports unchanged", async () => {
  * this pass had an answer. The lock is held the way a second pi holds one — by a
  * second process, on the real file.
  */
-test("a pass holds, and says why, when another process holds the file's lock", async () => {
-  const fx = await fixture({
+test("a pass holds, and says why, when another process holds the file's lock", async (t) => {
+  const fx = await fixture(t, {
     planner: "claude-bridge/claude-opus-5-5",
     reviewer: "openai-codex/gpt-6-astra",
     implementer: "deepseek/deepseek-flash",
@@ -1488,16 +1488,16 @@ test("a pass holds, and says why, when another process holds the file's lock", a
   }
 });
 
-test("a missing agent file is skipped, not created", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+test("a missing agent file is skipped, not created", async (t) => {
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   const d = dispatcherFor(fx);
   const results = await d.evaluate({ force: true });
   const impl = results.find((r) => r.decision.agent === "implementer")!;
   assert.equal(impl.outcome, "skipped (no file)");
 });
 
-test("an unreadable api holds every agent in place", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+test("an unreadable api holds every agent in place", async (t) => {
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   const failing = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, agents: agentTable(AGENT_ROUTES) },
     {
@@ -1521,8 +1521,8 @@ test("an unreadable api holds every agent in place", async () => {
  * claim is visible from a test that states its own answer, so both are asserted
  * here through the dispatcher's own `railReadings`.
  */
-test("an undescribed rail is a readable one, and a missing Antigravity credential is not", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+test("an undescribed rail is a readable one, and a missing Antigravity credential is not", async (t) => {
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   // Two installs, each with its own store and its own readings file: a warm
   // cache from the first must not be mistaken for a second install's answer.
   const antigravity = async (name: string, auth: Record<string, unknown>) => {
@@ -1551,8 +1551,8 @@ test("an undescribed rail is a readable one, and a missing Antigravity credentia
   assert.equal(budgetUsed(healthy, "weekly"), 0);
 });
 
-test("limit_reached on codex moves the reviewer onto claude", async () => {
-  const fx = await fixture({ reviewer: "openai-codex/gpt-6-astra" });
+test("limit_reached on codex moves the reviewer onto claude", async (t) => {
+  const fx = await fixture(t, { reviewer: "openai-codex/gpt-6-astra" });
   const d = dispatcherFor(fx, { codex: { session: 20 }, codexLimited: true });
   const results = await d.evaluate({ force: true });
   const reviewer = results.find((r) => r.decision.agent === "reviewer")!;
@@ -1566,8 +1566,8 @@ test("limit_reached on codex moves the reviewer onto claude", async () => {
  * was blocked outright looked like the roomiest place to send work — and the
  * planner was duly moved onto it, reporting "codex session 0%".
  */
-test("a partial reading is held rather than read as headroom", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+test("a partial reading is held rather than read as headroom", async (t) => {
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   const d = dispatcherFor(fx, {
     claude: { session: 80 },
     codex: { weekly: 100 },
@@ -1588,8 +1588,8 @@ test("a partial reading is held rather than read as headroom", async () => {
  * locally by accident and failed on CI, where no such file exists and the rail
  * is correctly reported unreadable.
  */
-test("a missing credential file holds every agent, even when a switch looks due", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+test("a missing credential file holds every agent, even when a switch looks due", async (t) => {
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeCredsPath: join(fx.agentDir, "absent.json"), agents: agentTable(AGENT_ROUTES) },
     { read: readsFor({ claude: { session: 95 } }) },
@@ -1608,8 +1608,8 @@ test("a missing credential file holds every agent, even when a switch looks due"
  * unreadable quota rewrote any agent a previous evaluation had moved onto the
  * alternate — dragging work back onto the rail that was under pressure.
  */
-test("an unreadable quota leaves an agent on the alternate untouched", async () => {
-  const fx = await fixture({ planner: "openai-codex/gpt-6-sol" });
+test("an unreadable quota leaves an agent on the alternate untouched", async (t) => {
+  const fx = await fixture(t, { planner: "openai-codex/gpt-6-sol" });
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, claudeCredsPath: join(fx.agentDir, "absent.json"), agents: agentTable(AGENT_ROUTES) },
     { read: readsFor({ claude: { session: 95 } }) },
@@ -1630,8 +1630,8 @@ test("an unreadable quota leaves an agent on the alternate untouched", async () 
  * plain `/quota-dispatch` "show me the state" command silently rewrote agent
  * files whenever a switch happened to be due.
  */
-test("report never writes, even when a switch is due", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+test("report never writes, even when a switch is due", async (t) => {
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   const d = dispatcherFor(fx, { claude: { session: 90 }, codex: { session: 10 } }); // claude tight: a switch to codex is due
 
   const path = join(fx.agentDir, "planner.md");
@@ -1645,8 +1645,8 @@ test("report never writes, even when a switch is due", async () => {
   assert.ok(lines.some((l) => l.includes("[would-write]")));
 });
 
-test("a forced report fetches each rail exactly once", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+test("a forced report fetches each rail exactly once", async (t) => {
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   const read = readsFor();
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, agents: agentTable(AGENT_ROUTES) },
@@ -1657,8 +1657,8 @@ test("a forced report fetches each rail exactly once", async () => {
   assert.equal(read.reads.claude + read.reads.codex, 2, "the two live rails, once each");
 });
 
-test("an expired claude token counts as unreadable rather than switching", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+test("an expired claude token counts as unreadable rather than switching", async (t) => {
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   await writeFile(
     fx.claudeCredsPath,
     JSON.stringify({ claudeAiOauth: { accessToken: "stale", expiresAt: Date.now() - 1000 } }),

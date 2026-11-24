@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test, type TestContext } from "node:test";
@@ -23,9 +23,9 @@ import { explicitSkill } from "../src/skill-binding.ts";
 import {
   codexFixture,
   installCodexTrap,
-  removeCodexFixtures,
   type CodexFixture,
 } from "./helpers/codex-fixture.ts";
+import { removeTempRoots, tempRoot } from "./helpers/temp-dir.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
 // documented literal directly.
@@ -46,16 +46,19 @@ const codexTrap = await installCodexTrap();
 process.env.PATH = `${codexTrap.dir}:${process.env.PATH ?? ""}`;
 // An empty Codex CLI home: nothing here may read the developer's `~/.codex` by
 // accident, and "no auth.json there" is a fact the report's hint can state.
-const CODEX_HOME_DIR = await mkdtemp(join(tmpdir(), "pqd-cmd-codex-home-"));
+const CODEX_HOME_DIR = await tempRoot("cmd-codex-home");
 process.env.CODEX_HOME = CODEX_HOME_DIR;
 
 // One hook, in this order: the trap is read before anything is removed, so a
 // spawn that fell through to it is a failure rather than an empty log, and the
-// fixtures and temp dirs this file made are then cleaned up.
+// fixtures and temp dirs this file made are then cleaned up — including when
+// that read fails, which is why the removal is in a `finally`.
 after(async () => {
-  assert.equal(await codexTrap.invocations(), 0, "no test may start a real codex");
-  await removeCodexFixtures();
-  await rm(CODEX_HOME_DIR, { recursive: true, force: true });
+  try {
+    assert.equal(await codexTrap.invocations(), 0, "no test may start a real codex");
+  } finally {
+    await removeTempRoots();
+  }
 });
 
 const TEMPLATE = (name: string, model: string) =>
@@ -101,7 +104,7 @@ async function fixture(
   agents: Record<string, unknown> = CONFIGURED_AGENTS,
   extraGlobal: Record<string, unknown> = {},
 ): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "pqd-cmd-"));
+  const root = await tempRoot("cmd");
   const agentDir = join(root, "agent");
   const projectDir = join(root, "project");
   const agentsDir = join(agentDir, "agents");
@@ -1191,7 +1194,7 @@ async function generateFixture(
   command: (layerPath: string) => string = (layerPath) => `cat '${layerPath}'`,
   pollMs = MAX_POLL_MS,
 ): Promise<GenerateFixture> {
-  const root = await mkdtemp(join(tmpdir(), "pqd-gen-cmd-"));
+  const root = await tempRoot("gen-cmd");
   const agentDir = join(root, "agent");
   const projectDir = join(root, "project");
   const agentsDir = join(agentDir, "agents");

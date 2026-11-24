@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
@@ -16,6 +15,7 @@ import {
 } from "../src/agent-file.ts";
 import { assertCleanExit, startHolder, waitUntil } from "./fixtures/agent-write-child.ts";
 import { spawnReadingsChild } from "./fixtures/readings-child.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 const TTL = 100;
 const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -31,8 +31,7 @@ function failure(readAt: number): VendorReading {
   return { rail: "claude", ok: false, windows: [], readAt, note: "HTTP 429" };
 }
 async function fixture(t: TestContext) {
-  const root = await mkdtemp(join(tmpdir(), "pqd-shared-store-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir(t, "shared-store");
   const path = join(root, "quota-dispatch-readings.json");
   const credential = join(root, "credentials.json");
   let clock = 1_730_123_456_789;

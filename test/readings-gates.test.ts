@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
@@ -14,14 +13,14 @@ import {
   lockPathFor,
   withLockPath,
 } from "../src/agent-file.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 const NOW = 1_730_123_456_789;
 const cooldown = { at: NOW, note: "offline failure" };
 const sticky: StickyHalt = { note: "undiverted", claudePath: "/test/bin/claude", claudeMtimeMs: 123 };
 
 async function fixture(t: TestContext) {
-  const root = await mkdtemp(join(tmpdir(), "pqd-gates-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir(t, "gates");
   const path = join(root, "readings.json");
   const credential = join(root, "claude.json");
   let clock = NOW;
