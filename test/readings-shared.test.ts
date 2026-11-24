@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
@@ -13,6 +12,7 @@ import {
   READINGS_FILE_VERSION,
 } from "../src/readings-file.ts";
 import { failureOf, fakeReads, readingOf } from "./helpers/rails.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 const NOW = 1_730_123_456_789;
 const PRIMARY = "claude-bridge/claude-opus-5-5";
@@ -23,8 +23,7 @@ function gate() {
   return { promise, release };
 }
 async function fixture(t: TestContext) {
-  const root = await mkdtemp(join(tmpdir(), "pqd-shared-dispatcher-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir(t, "shared-dispatcher");
   const agentDir = join(root, "agents"); await mkdir(agentDir);
   const agentFile = join(agentDir, "planner.md");
   await writeFile(agentFile, `---\nname: planner\nmodel: "${PRIMARY}"\n---\n\nBody.\n`);

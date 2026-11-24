@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir, userInfo } from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { userInfo } from "node:os";
 import { dirname, join } from "node:path";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 
 import {
   createDispatcher,
@@ -27,6 +27,7 @@ import {
 } from "../src/refresh.ts";
 import { agentTable, routeOf } from "./helpers/identifiers.ts";
 import { fakeReads, readingOf } from "./helpers/rails.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 // This file pins the credential-store contract: the macOS login keychain is the
 // live home of the Claude subscription credential, the on-disk file is a legacy
@@ -43,8 +44,8 @@ function cred(oauth: unknown): string {
 }
 
 /** Write a credential file in a fresh tmp dir and return its path. */
-async function credsFile(contents: string): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-cred-"));
+async function credsFile(t: TestContext, contents: string): Promise<string> {
+  const dir = await tempDir(t, "cred");
   const path = join(dir, "credentials.json");
   await writeFile(path, contents, "utf8");
   return path;
@@ -63,8 +64,8 @@ function token(claims: Record<string, unknown>): string {
 }
 
 /** A path that no store has written, in its own tmp dir. */
-async function absentPath(): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-cred-"));
+async function absentPath(t: TestContext): Promise<string> {
+  const dir = await tempDir(t, "cred");
   return join(dir, "absent.json");
 }
 
@@ -232,8 +233,8 @@ test("isDefaultClaudeCredsPath is true only for the default credential path", ()
 
 // ---------------------------------------------------------------- readClaudeToken
 
-test("readClaudeToken uses the file and never reads the keychain when the file is usable", async () => {
-  const path = await credsFile(cred({ accessToken: "file-token", expiresAt: FIXED + 60_000 }));
+test("readClaudeToken uses the file and never reads the keychain when the file is usable", async (t) => {
+  const path = await credsFile(t, cred({ accessToken: "file-token", expiresAt: FIXED + 60_000 }));
   let keychainCalls = 0;
   const out = await readClaudeToken(path, {
     now: FIXED,
@@ -249,16 +250,16 @@ test("readClaudeToken uses the file and never reads the keychain when the file i
   assert.equal(keychainCalls, 0, "a usable file must not consult the keychain");
 });
 
-test("readClaudeToken falls back to the keychain when the file is missing", async () => {
-  const out = await readClaudeToken(await absentPath(), {
+test("readClaudeToken falls back to the keychain when the file is missing", async (t) => {
+  const out = await readClaudeToken(await absentPath(t), {
     now: FIXED,
     keychain: async () => ({ text: cred({ accessToken: "keychain-token", expiresAt: FIXED + 60_000 }) }),
   });
   assert.deepEqual(out, { token: "keychain-token" });
 });
 
-test("readClaudeToken falls back to the keychain when the file holds an expired token", async () => {
-  const path = await credsFile(cred({ accessToken: "stale", expiresAt: FIXED - 1 }));
+test("readClaudeToken falls back to the keychain when the file holds an expired token", async (t) => {
+  const path = await credsFile(t, cred({ accessToken: "stale", expiresAt: FIXED - 1 }));
   const out = await readClaudeToken(path, {
     now: FIXED,
     keychain: async () => ({ text: cred({ accessToken: "keychain-token", expiresAt: FIXED + 60_000 }) }),
@@ -266,8 +267,8 @@ test("readClaudeToken falls back to the keychain when the file holds an expired 
   assert.deepEqual(out, { token: "keychain-token" });
 });
 
-test("readClaudeToken falls back to the keychain when the file is not JSON", async () => {
-  const path = await credsFile("legacy non-JSON credentials");
+test("readClaudeToken falls back to the keychain when the file is not JSON", async (t) => {
+  const path = await credsFile(t, "legacy non-JSON credentials");
   const out = await readClaudeToken(path, {
     now: FIXED,
     keychain: async () => ({ text: cred({ accessToken: "keychain-token", expiresAt: FIXED + 60_000 }) }),
@@ -275,8 +276,8 @@ test("readClaudeToken falls back to the keychain when the file is not JSON", asy
   assert.deepEqual(out, { token: "keychain-token" });
 });
 
-test("readClaudeToken falls back to the keychain when the file has no accessToken", async () => {
-  const path = await credsFile(JSON.stringify({}));
+test("readClaudeToken falls back to the keychain when the file has no accessToken", async (t) => {
+  const path = await credsFile(t, JSON.stringify({}));
   const out = await readClaudeToken(path, {
     now: FIXED,
     keychain: async () => ({ text: cred({ accessToken: "keychain-token", expiresAt: FIXED + 60_000 }) }),
@@ -284,10 +285,10 @@ test("readClaudeToken falls back to the keychain when the file has no accessToke
   assert.deepEqual(out, { token: "keychain-token" });
 });
 
-test("readClaudeToken falls back to the keychain when the file cannot be read", async () => {
+test("readClaudeToken falls back to the keychain when the file cannot be read", async (t) => {
   // A directory at the credential path makes readFile fail with EISDIR, the
   // "unreadable" case distinct from "shapeless".
-  const dir = await mkdtemp(join(tmpdir(), "pqd-cred-"));
+  const dir = await tempDir(t, "cred");
   const out = await readClaudeToken(dir, {
     now: FIXED,
     keychain: async () => ({ text: cred({ accessToken: "keychain-token", expiresAt: FIXED + 60_000 }) }),
@@ -295,8 +296,8 @@ test("readClaudeToken falls back to the keychain when the file cannot be read", 
   assert.deepEqual(out, { token: "keychain-token" });
 });
 
-test("readClaudeToken names both reasons when neither store yields a token", async () => {
-  const path = await credsFile(cred({ accessToken: "stale", expiresAt: FIXED - 1 }));
+test("readClaudeToken names both reasons when neither store yields a token", async (t) => {
+  const path = await credsFile(t, cred({ accessToken: "stale", expiresAt: FIXED - 1 }));
   const out = await readClaudeToken(path, {
     now: FIXED,
     keychain: async () => ({ error: "no claudeAiOauth.accessToken" }),
@@ -310,8 +311,8 @@ test("readClaudeToken names both reasons when neither store yields a token", asy
   });
 });
 
-test("readClaudeToken names a keychain token's own expiry", async () => {
-  const out = await readClaudeToken(await absentPath(), {
+test("readClaudeToken names a keychain token's own expiry", async (t) => {
+  const out = await readClaudeToken(await absentPath(t), {
     now: FIXED,
     keychain: async () => ({ text: cred({ accessToken: "stale", expiresAt: FIXED - 1 }) }),
   });
@@ -321,21 +322,21 @@ test("readClaudeToken names a keychain token's own expiry", async () => {
   });
 });
 
-test("readClaudeToken keeps the pre-keychain single-store message with no keychain", async () => {
+test("readClaudeToken keeps the pre-keychain single-store message with no keychain", async (t) => {
   // A missing file stays exactly "no claude credentials file", unchanged from
   // before the keychain existed.
-  assert.deepEqual(await readClaudeToken(await absentPath()), {
+  assert.deepEqual(await readClaudeToken(await absentPath(t)), {
     error: "no claude credentials file",
     reason: "unusable",
   });
 
-  const expired = await credsFile(cred({ accessToken: "stale", expiresAt: FIXED - 1 }));
+  const expired = await credsFile(t, cred({ accessToken: "stale", expiresAt: FIXED - 1 }));
   assert.deepEqual(await readClaudeToken(expired, { now: FIXED }), {
     error: "claude token expired",
     reason: "expired",
   });
 
-  const shapeless = await credsFile(JSON.stringify({}));
+  const shapeless = await credsFile(t, JSON.stringify({}));
   assert.deepEqual(await readClaudeToken(shapeless, { now: FIXED }), {
     error: "no claudeAiOauth.accessToken",
     reason: "unusable",
@@ -372,8 +373,8 @@ interface Fixture {
  * auth file, all under tmp. Nothing here reads the developer's real
  * `~/.claude/.credentials.json` or `~/.pi/agent/auth.json`.
  */
-async function fixture(models: Record<string, string>): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "pqd-cred-"));
+async function fixture(t: TestContext, models: Record<string, string>): Promise<Fixture> {
+  const root = await tempDir(t, "cred");
   const agentDir = join(root, "agents");
   await mkdir(agentDir, { recursive: true });
   for (const [name, model] of Object.entries(models)) {
@@ -389,8 +390,8 @@ async function fixture(models: Record<string, string>): Promise<Fixture> {
   return { agentDir, claudeCredsPath, piAuthPath, codexCredsPath: piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
 }
 
-test("a stale file with a working keychain leaves the claude rail available", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+test("a stale file with a working keychain leaves the claude rail available", async (t) => {
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   await writeFile(
     fx.claudeCredsPath,
     cred({ accessToken: "stale", expiresAt: Date.now() - 1000 }),
@@ -431,8 +432,8 @@ test("a stale file with a working keychain leaves the claude rail available", as
   assert.ok(seenAuth.includes("live-keychain"), seenAuth.join(", "));
 });
 
-test("with both stores failing the claude rail is unavailable and its agent is held", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+test("with both stores failing the claude rail is unavailable and its agent is held", async (t) => {
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   await writeFile(
     fx.claudeCredsPath,
     cred({ accessToken: "stale", expiresAt: Date.now() - 1000 }),
@@ -481,8 +482,8 @@ test("with both stores failing the claude rail is unavailable and its agent is h
 // The reported fault (issue #89): a shielded install publishes the Codex CLI's
 // own auth.json and may not publish pi's, so the rail needs a file it can be
 // pointed at, and the CLI's document shape has to be readable.
-test("the codex rail reads a file codexCredsPath names, in the Codex CLI's shape", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+test("the codex rail reads a file codexCredsPath names, in the Codex CLI's shape", async (t) => {
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   await writeFile(
     fx.claudeCredsPath,
     cred({ accessToken: "live", expiresAt: Date.now() + 3_600_000 }),
@@ -523,8 +524,8 @@ test("the codex rail reads a file codexCredsPath names, in the Codex CLI's shape
 // A named path is the whole answer: the pi auth file sitting beside it still
 // holds a usable `openai-codex` entry, and reading it anyway would report an
 // account the config did not name.
-test("an absent codexCredsPath file is the failure, even with a usable pi auth file beside it", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+test("an absent codexCredsPath file is the failure, even with a usable pi auth file beside it", async (t) => {
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   await writeFile(
     fx.claudeCredsPath,
     cred({ accessToken: "live", expiresAt: Date.now() + 3_600_000 }),
@@ -546,8 +547,8 @@ test("an absent codexCredsPath file is the failure, even with a usable pi auth f
 
 // The document is a credential store: a read failure is reported by its errno
 // and a parse failure by fixed text, never by a message that quotes the file.
-test("a codex credential failure never quotes the document", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+test("a codex credential failure never quotes the document", async (t) => {
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   await writeFile(
     fx.claudeCredsPath,
     cred({ accessToken: "live", expiresAt: Date.now() + 3_600_000 }),
@@ -572,7 +573,7 @@ test("a codex credential failure never quotes the document", async () => {
 // rail used to report while the models themselves kept working. The note has to
 // name what happened to the credential, not what the endpoint made of it.
 test("an expired codex token is reported as expired, and never sent", async (t) => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   await writeFile(
     fx.claudeCredsPath,
     cred({ accessToken: "live", expiresAt: Date.now() + 3_600_000 }),
@@ -590,8 +591,7 @@ test("an expired codex token is reported as expired, and never sent", async (t) 
   // fixture's machine rather than about the one running the tests: no `auth.json`
   // there, so `/quota-dispatch refresh-codex` would refuse this path, and the
   // report says so instead of suggesting a run that would do nothing.
-  const codexHome = await mkdtemp(join(tmpdir(), "pqd-cred-codex-home-"));
-  t.after(() => rm(codexHome, { recursive: true, force: true }));
+  const codexHome = await tempDir(t, "cred-codex-home");
   const d = createDispatcher(
     { ...DEFAULT_CONFIG, ...fx, codexCredsPath, agents: AGENT_ROUTES },
     {
@@ -706,17 +706,17 @@ test("parseCodexCredential never quotes a malformed document", () => {
 // The expiry is the token's own claim, read on the local clock. Both shapes
 // state it only there: pi copies it into `openai-codex.expires` and the Codex
 // CLI's file states it nowhere but the token.
-test("readCodexCredential uses a token still inside its expiry", async () => {
+test("readCodexCredential uses a token still inside its expiry", async (t) => {
   const access = token({ exp: FIXED / 1000 + 60 });
-  const path = await credsFile(JSON.stringify({ tokens: { access_token: access, account_id: "acct" } }));
+  const path = await credsFile(t, JSON.stringify({ tokens: { access_token: access, account_id: "acct" } }));
   assert.deepEqual(await readCodexCredential(path, FIXED), { access, accountId: "acct" });
 });
 
-test("readCodexCredential refuses a token whose expiry has arrived", async () => {
+test("readCodexCredential refuses a token whose expiry has arrived", async (t) => {
   // `<=`, not `<`: a token whose expiry *is* this instant has no life left in
   // it, the rule `parseAntigravityToken` holds to.
   for (const exp of [FIXED / 1000 - 1, FIXED / 1000]) {
-    const path = await credsFile(JSON.stringify({
+    const path = await credsFile(t, JSON.stringify({
       "openai-codex": { access: token({ exp }), accountId: "acct" },
     }));
     assert.deepEqual(await readCodexCredential(path, FIXED), { error: "codex token expired" });
@@ -725,9 +725,9 @@ test("readCodexCredential refuses a token whose expiry has arrived", async () =>
 
 // A claim this cannot read is not evidence of expiry, so the token is sent and
 // the endpoint gets to answer — the position taken on an absent `expires`.
-test("readCodexCredential sends a token that states no readable expiry", async () => {
+test("readCodexCredential sends a token that states no readable expiry", async (t) => {
   for (const access of [token({}), token({ exp: "soon" }), "opaque-token", "a.b"]) {
-    const path = await credsFile(JSON.stringify({ "openai-codex": { access, accountId: "acct" } }));
+    const path = await credsFile(t, JSON.stringify({ "openai-codex": { access, accountId: "acct" } }));
     assert.deepEqual(await readCodexCredential(path, FIXED), { access, accountId: "acct" });
   }
 });

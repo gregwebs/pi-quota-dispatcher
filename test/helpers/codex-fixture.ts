@@ -1,30 +1,15 @@
 import assert from "node:assert/strict";
 import { constants } from "node:fs";
-import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { CodexHost } from "../../src/codex-refresh.ts";
+import { tempRoot } from "./temp-dir.ts";
 
 // One fixture per test: a `bin` holding a `codex` that can be executed, a Codex
 // CLI home holding a managed login, and a `HOME` of its own. Nothing here reads
 // the developer's own `~/.codex`, and nothing runs a real Codex CLI.
-
-/**
- * Every directory this helper made, so a test file can remove them all.
- *
- * Registered rather than returned per fixture because a fixture is made inside a
- * test body and the removal belongs to the file's `after` hook, where the trap's
- * zero-invocation assertion can run first.
- */
-const created: string[] = [];
-
-/** Removes every fixture and trap directory this module created. */
-export async function removeCodexFixtures(): Promise<void> {
-  const roots = created.splice(0);
-  await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
-}
 
 /**
  * The installed CLI's stand-in, run through an absolute `process.execPath`.
@@ -79,10 +64,13 @@ export interface CodexFixture {
  * a `PATH` holding nothing but `bin` is enough to run it — which is what makes
  * "the child PATH keeps only absolute entries" testable — and so no shell
  * process outlives the run.
+ *
+ * The directory goes into the module registry rather than onto a test's `after`
+ * hook: a fixture is made inside a test body, but the removal has to wait for
+ * the file's own hook, where the trap's zero-invocation assertion reads last.
  */
 export async function codexFixture(): Promise<CodexFixture> {
-  const root = await mkdtemp(join(tmpdir(), "pqd-codex-fx-"));
-  created.push(root);
+  const root = await tempRoot("codex-fx");
   const bin = join(root, "bin");
   const control = join(root, "control");
   const codexHome = join(root, "codex-home");
@@ -128,8 +116,7 @@ export interface CodexTrap {
  * credential exchange against the developer's own account.
  */
 export async function installCodexTrap(): Promise<CodexTrap> {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-codex-trap-"));
-  created.push(dir);
+  const dir = await tempRoot("codex-trap");
   const log = join(dir, "invocations.log");
   const trap = join(dir, "codex");
   await writeFile(trap, `#!/bin/sh\necho "$@" >> '${log}'\nexit 99\n`, "utf8");

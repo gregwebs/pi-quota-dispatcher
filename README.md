@@ -1554,6 +1554,11 @@ npm ci && npm test    # install the dev dependency, then run the suite
 npm run typecheck
 ```
 
+A test that needs a temp directory takes it from `test/helpers/temp-dir.ts`,
+which removes what it made before the process exits; `test/temp-dir.test.ts`
+fails when a file under `test/` names `mkdtemp` itself, so the suite's own
+directories do not pile up in `$TMPDIR` between runs (issue #101).
+
 Validated configuration identifiers — agent names, model ids and skill names —
 are opaque newtypes produced only by checked parsers, so a wrong-role value does
 not compile. The pattern, what a brand does and does not prove, and the reasons

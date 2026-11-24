@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
@@ -37,6 +37,7 @@ import {
 } from "../src/rail-reading.ts";
 
 import { agentName, routeOf } from "./helpers/identifiers.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 // ---------------------------------------------------------------- helpers
 
@@ -519,8 +520,8 @@ interface Sandbox {
   target: string;
 }
 
-async function sandbox(contents: string, project = "global"): Promise<Sandbox> {
-  const root = await mkdtemp(join(tmpdir(), "pqd-generate-"));
+async function sandbox(t: TestContext, contents: string, project = "global"): Promise<Sandbox> {
+  const root = await tempDir(t, "generate");
   const agentDir = join(root, "agent");
   const projectDir = join(root, "project");
   await mkdir(agentDir, { recursive: true });
@@ -592,8 +593,8 @@ async function generate(
   return { result, calls: canned.calls };
 }
 
-test("a successful run writes the ordinary output and preserves the declaration", async () => {
-  const box = await sandbox(declarationText("true", 2500));
+test("a successful run writes the ordinary output and preserves the declaration", async (t) => {
+  const box = await sandbox(t, declarationText("true", 2500));
   const generated = JSON.stringify({ agents: { planner: VALID_ROUTE }, margin: 12 }, null, 2);
   const { result, calls } = await generate(box, generated);
   assert.equal(result.kind, "generated");
@@ -611,14 +612,14 @@ test("a successful run writes the ordinary output and preserves the declaration"
   assert.equal(result.prepared.tag, "prepared");
 });
 
-test("the default timeout is used when the declaration states none", async () => {
-  const box = await sandbox(declarationText("true"));
+test("the default timeout is used when the declaration states none", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   const { calls } = await generate(box, JSON.stringify({}));
   assert.equal(calls[0].timeoutMs, DEFAULT_GENERATOR_TIMEOUT_MS);
 });
 
-test("the stdout generator is ignored even when invalid, and the original is kept", async () => {
-  const box = await sandbox(declarationText("true", 1234));
+test("the stdout generator is ignored even when invalid, and the original is kept", async (t) => {
+  const box = await sandbox(t, declarationText("true", 1234));
   const generated = JSON.stringify({ generator: "not a declaration at all", margin: 7 });
   const { result } = await generate(box, generated);
   assert.equal(result.kind, "generated");
@@ -627,8 +628,8 @@ test("the stdout generator is ignored even when invalid, and the original is kep
   assert.equal(written.margin, 7);
 });
 
-test("a failed run preserves the file, reports stderr, and never prepares", async () => {
-  const box = await sandbox(declarationText("false"));
+test("a failed run preserves the file, reports stderr, and never prepares", async (t) => {
+  const box = await sandbox(t, declarationText("false"));
   let prepared = false;
   const { result } = await generate(box, "", {
     stderr: "the script exploded\n",
@@ -649,8 +650,8 @@ test("a failed run preserves the file, reports stderr, and never prepares", asyn
   assert.equal(await readFile(box.target, "utf8"), declarationText("false"));
 });
 
-test("invalid output preserves the file and still shows the run's stderr", async () => {
-  const box = await sandbox(declarationText("true"));
+test("invalid output preserves the file and still shows the run's stderr", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   const before = await readFile(box.target, "utf8");
   for (const [label, stdout] of [
     ["not json", "hello"],
@@ -658,7 +659,7 @@ test("invalid output preserves the file and still shows the run's stderr", async
     ["a BOM", "\uFEFF{}"],
     ["a number that re-serializes to null", '{"pollMs": 1e400}'],
   ] as Array<[string, string]>) {
-    const fresh = await sandbox(declarationText("true"));
+    const fresh = await sandbox(t, declarationText("true"));
     const { result } = await generate(fresh, stdout, { stderr: "warning: noisy\n" });
     assert.equal(result.kind, "failed", label);
     if (result.kind === "failed") {
@@ -668,8 +669,8 @@ test("invalid output preserves the file and still shows the run's stderr", async
   }
 });
 
-test("invalid UTF-8 on stdout is a failure", async () => {
-  const box = await sandbox(declarationText("true"));
+test("invalid UTF-8 on stdout is a failure", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   const canned = cannedRunner("");
   const result = await generateConfig({
     source: "global",
@@ -687,8 +688,8 @@ test("invalid UTF-8 on stdout is a failure", async () => {
   if (result.kind === "failed") assert.ok(result.lines.join("\n").includes("UTF-8"), result.lines.join("\n"));
 });
 
-test("a configuration that cannot be prepared fails before the file is touched", async () => {
-  const box = await sandbox(declarationText("true"));
+test("a configuration that cannot be prepared fails before the file is touched", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   const before = await readFile(box.target, "utf8");
   const { result } = await generate(box, JSON.stringify({ margin: 9 }), {
     stderr: "context\n",
@@ -705,8 +706,8 @@ test("a configuration that cannot be prepared fails before the file is touched",
   assert.equal(await readFile(box.target, "utf8"), before);
 });
 
-test("a target edited while the generator ran is not clobbered", async () => {
-  const box = await sandbox(declarationText("true"));
+test("a target edited while the generator ran is not clobbered", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   const external = declarationText("true").replace("}", ', "margin": 3}');
   const canned = cannedRunner(JSON.stringify({ margin: 42 }));
   const result = await generateConfig({
@@ -728,8 +729,8 @@ test("a target edited while the generator ran is not clobbered", async () => {
   assert.equal(await readFile(box.target, "utf8"), external);
 });
 
-test("a held lock is a failure, not permission to write", async () => {
-  const box = await sandbox(declarationText("true"));
+test("a held lock is a failure, not permission to write", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   const before = await readFile(box.target, "utf8");
   const lockPath = join(dirname(box.target), `.${"quota-dispatch.json"}.lock`);
   const lockRecord = JSON.stringify({ pid: process.pid, host: hostname(), at: Date.now() });
@@ -766,8 +767,8 @@ test("a held lock is a failure, not permission to write", async () => {
   }
 });
 
-test("a committed change whose lock release failed is reported as a note, not as unchanged", async () => {
-  const box = await sandbox(declarationText("true"));
+test("a committed change whose lock release failed is reported as a note, not as unchanged", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   const lockPath = join(dirname(box.target), `.${basename(box.target)}.lock`);
   // The path the lock resolves to; the compare-and-swap re-read names it, and it
   // is the last hook before the rename.
@@ -807,8 +808,8 @@ test("a committed change whose lock release failed is reported as a note, not as
   }
 });
 
-test("a symlinked target keeps its link and writes through to the file", async () => {
-  const box = await sandbox(declarationText("true"));
+test("a symlinked target keeps its link and writes through to the file", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   const real = join(box.root, "real.json");
   await writeFile(real, await readFile(box.target, "utf8"), "utf8");
   await rm(box.target);
@@ -819,8 +820,8 @@ test("a symlinked target keeps its link and writes through to the file", async (
   assert.equal(JSON.parse(await readFile(real, "utf8")).margin, 8);
 });
 
-test("only the target layer is written; the other file is untouched", async () => {
-  const box = await sandbox(declarationText("true"));
+test("only the target layer is written; the other file is untouched", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   const other = join(box.projectDir, CONFIG_DIR_NAME, "quota-dispatch.json");
   await writeFile(other, JSON.stringify({ margin: 1 }), "utf8");
   const { result } = await generate(box, JSON.stringify({ margin: 2 }));
@@ -884,8 +885,8 @@ const REFUSAL = [
   "Run /quota-dispatch refresh once the rail can be read, then generate again.",
 ];
 
-test("the generator's stdin is exactly the gathered document, newline-terminated", async () => {
-  const box = await sandbox(declarationText("true"));
+test("the generator's stdin is exactly the gathered document, newline-terminated", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   const { result, calls } = await generate(box, JSON.stringify({}), {
     input: async () => ({ kind: "ready", input: RICH_INPUT }),
   });
@@ -899,9 +900,9 @@ test("the generator's stdin is exactly the gathered document, newline-terminated
   assert.ok(calls[0].stdin.endsWith("}\n"), JSON.stringify(calls[0].stdin.slice(-5)));
 });
 
-test("a refused input fails the run before the command, preparation or file are touched", async () => {
+test("a refused input fails the run before the command, preparation or file are touched", async (t) => {
   const text = declarationText("true");
-  const box = await sandbox(text);
+  const box = await sandbox(t, text);
   let prepared = false;
   const { result, calls } = await generate(box, JSON.stringify({ margin: 3 }), {
     input: async () => ({ kind: "refused", reason: REFUSAL }),
@@ -919,9 +920,9 @@ test("a refused input fails the run before the command, preparation or file are 
   assert.equal(await readFile(box.target, "utf8"), text);
 });
 
-test("an input that throws is a generation failure, and the command is not run", async () => {
+test("an input that throws is a generation failure, and the command is not run", async (t) => {
   const text = declarationText("true");
-  const box = await sandbox(text);
+  const box = await sandbox(t, text);
   const { result, calls } = await generate(box, JSON.stringify({ margin: 3 }), {
     input: async () => {
       throw new Error("the boot fell over");
@@ -937,15 +938,15 @@ test("an input that throws is a generation failure, and the command is not run",
   assert.equal(await readFile(box.target, "utf8"), text);
 });
 
-test("a target that cannot run a generator costs no input", async () => {
+test("a target that cannot run a generator costs no input", async (t) => {
   // The input is a quota read: a typo in the file, or a file that declares no
   // generator at all, must be answered before anything asks a vendor.
   const cases: Array<[string, Sandbox]> = [
-    ["no generator declared", await sandbox(JSON.stringify({ margin: 3 }))],
-    ["an invalid declaration", await sandbox(JSON.stringify({ generator: { command: "  ", timeoutMs: 0 } }))],
-    ["not JSON", await sandbox("{ not json")],
+    ["no generator declared", await sandbox(t, JSON.stringify({ margin: 3 }))],
+    ["an invalid declaration", await sandbox(t, JSON.stringify({ generator: { command: "  ", timeoutMs: 0 } }))],
+    ["not JSON", await sandbox(t, "{ not json")],
   ];
-  const missing = await sandbox(declarationText("true"));
+  const missing = await sandbox(t, declarationText("true"));
   await rm(missing.target);
   cases.push(["an unreadable file", missing]);
 
@@ -963,8 +964,8 @@ test("a target that cannot run a generator costs no input", async () => {
   }
 });
 
-test("the input is gathered once and settled before the command is spawned", async () => {
-  const box = await sandbox(declarationText("true"));
+test("the input is gathered once and settled before the command is spawned", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   const order: string[] = [];
   const result = await generateConfig({
     source: "global",
@@ -989,11 +990,11 @@ test("the input is gathered once and settled before the command is spawned", asy
   assert.deepEqual(order, ["input:start", "input:end", "run"]);
 });
 
-test("timeoutMs starts at the spawn: a slow input does not eat the command's time", async () => {
+test("timeoutMs starts at the spawn: a slow input does not eat the command's time", async (t) => {
   // The real runner, so the timer under test is the real one. The input takes
   // longer than the whole timeout, and the command itself needs a part of it: a
   // timer armed before the input was awaited would already have fired.
-  const box = await sandbox(declarationText("sleep 0.05; printf '{}'", 300));
+  const box = await sandbox(t, declarationText("sleep 0.05; printf '{}'", 300));
   const result = await generateConfig({
     source: "global",
     path: box.target,
@@ -1008,9 +1009,9 @@ test("timeoutMs starts at the spawn: a slow input does not eat the command's tim
   assert.equal(result.kind, "generated", result.kind === "failed" ? result.lines.join("\n") : "");
 });
 
-test("timeoutMs still bounds the command after a slow input", async () => {
+test("timeoutMs still bounds the command after a slow input", async (t) => {
   // The other side of the scope: moving the timer to the spawn must not lose it.
-  const box = await sandbox(declarationText("sleep 30", 200));
+  const box = await sandbox(t, declarationText("sleep 30", 200));
   const started = Date.now();
   const result = await generateConfig({
     source: "global",
@@ -1036,8 +1037,8 @@ function runOrFail(input: Omit<BashRunInput, "stdin"> & { stdin?: string }): Pro
   return runBash({ ...rest, stdin });
 }
 
-test("real Bash: exact stdout, cwd and EOF stdin", async () => {
-  const box = await sandbox(declarationText("true"));
+test("real Bash: exact stdout, cwd and EOF stdin", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   const cwd = await realpath(dirname(box.target));
   const ran = await runOrFail({
     command: "cat >/dev/null; pwd; printf '{\"ok\":true}'",
@@ -1159,8 +1160,8 @@ test("real Bash: stderr is bounded to its tail", async () => {
   assert.ok(ran.stderr.length <= GENERATOR_STDERR_CAP_BYTES, String(ran.stderr.length));
 });
 
-test("a rejected layer is never prepared and never written", async () => {
-  const box = await sandbox(declarationText("true"));
+test("a rejected layer is never prepared and never written", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   const before = await readFile(box.target, "utf8");
   let prepared = false;
   const { result } = await generate(box, JSON.stringify({ agents: { planner: { primary: {} } } }), {
@@ -1176,8 +1177,8 @@ test("a rejected layer is never prepared and never written", async () => {
   assert.equal(await readFile(box.target, "utf8"), before);
 });
 
-test("the replaced file keeps its mode", async () => {
-  const box = await sandbox(declarationText("true"));
+test("the replaced file keeps its mode", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   await chmod(box.target, 0o600);
   const { result } = await generate(box, JSON.stringify({ margin: 6 }));
   assert.equal(result.kind, "generated");
@@ -1189,8 +1190,8 @@ test("real Bash: a missing working directory is a spawn failure", async () => {
   assert.ok(ran.failure?.includes("could not be started"), ran.failure);
 });
 
-test("real Bash: a grandchild is killed with the group on timeout", async () => {
-  const box = await sandbox(declarationText("true"));
+test("real Bash: a grandchild is killed with the group on timeout", async (t) => {
+  const box = await sandbox(t, declarationText("true"));
   const marker = join(box.root, "orphan-alive");
   // The child backgrounds a writer, then sleeps past the timeout. If the group
   // is killed, the writer never fires; the direct child alone would leave it.

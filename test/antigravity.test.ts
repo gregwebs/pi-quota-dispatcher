@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 
@@ -26,6 +25,7 @@ import {
 import { assertCleanExit, waitUntil } from "./fixtures/agent-write-child.ts";
 import { spawnAntigravityChild } from "./fixtures/antigravity-child.ts";
 import { agentTable } from "./helpers/identifiers.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 const NOW = 1_730_123_456_789;
 
@@ -172,8 +172,7 @@ const STORED_AUTH = JSON.stringify({
 
 /** `auth` is the file's bytes, or `null` for no file at all. */
 async function fixture(t: TestContext, auth: string | null = STORED_AUTH): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "pqd-antigravity-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir(t, "antigravity");
   await mkdir(root, { recursive: true });
   const piAuthPath = join(root, "pi-auth.json");
   if (auth !== null) await writeFile(piAuthPath, auth, "utf8");
@@ -385,8 +384,7 @@ test("the resolver adapter calls pi's registry through the registry, for one pro
 });
 
 test("on the default auth path, an expired token is refreshed by delegating to pi", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "pqd-antigravity-default-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir(t, "antigravity-default");
   const agentDir = join(root, "agent");
   const marker = join(root, "refresh-started");
   const child = spawnAntigravityChild({
@@ -424,8 +422,7 @@ test("on the default auth path, an expired token is refreshed by delegating to p
 });
 
 test("a resolver that throws reports an expiry without echoing its message", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "pqd-antigravity-throw-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir(t, "antigravity-throw");
   const child = spawnAntigravityChild({
     agentDir: join(root, "agent"),
     auth: JSON.stringify({ antigravity: { access: "expired-access", expires: Date.now() - 1_000 } }),
@@ -459,8 +456,7 @@ test("a resolver that throws reports an expiry without echoing its message", asy
  * to see, and it is a different failure from the refresh itself failing.
  */
 test("a refresh that persists nothing usable says so instead of repeating the expiry", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "pqd-antigravity-still-expired-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir(t, "antigravity-still-expired");
   const expired = JSON.stringify({ antigravity: { access: "expired-access", expires: Date.now() - 1_000 } });
   const child = spawnAntigravityChild({
     agentDir: join(root, "agent"),
@@ -497,8 +493,7 @@ test("a refresh that persists nothing usable says so instead of repeating the ex
  * them looking for the wrong problem.
  */
 test("a re-read that fails for a new reason reports that reason, not the first read's", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "pqd-antigravity-reread-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir(t, "antigravity-reread");
   const child = spawnAntigravityChild({
     agentDir: join(root, "agent"),
     auth: JSON.stringify({ antigravity: { access: "expired-access", expires: Date.now() - 1_000 } }),
@@ -528,8 +523,7 @@ test("a re-read that fails for a new reason reports that reason, not the first r
 });
 
 test("a refresh that times out is waited for once, and the next read recovers without a second", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "pqd-antigravity-timeout-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir(t, "antigravity-timeout");
   const agentDir = join(root, "agent");
   const started = join(root, "resolver-started");
   const release = join(root, "resolver-release");

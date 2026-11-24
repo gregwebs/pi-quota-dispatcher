@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, symlink, unlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, mkdir, readFile, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -25,6 +24,7 @@ import {
 import {
   type ModelMiss,
 } from "../src/models.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
 // documented literal directly.
@@ -47,8 +47,8 @@ function named(file: AgentFile): NamedAgentFile {
 
 // ---------------------------------------------------------------- readAgentFiles
 
-test("readAgentFiles lists only *.md files, sorted, with the active model unquoted", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-read-"));
+test("readAgentFiles lists only *.md files, sorted, with the active model unquoted", async (t) => {
+  const dir = await tempDir(t, "read");
   await writeFile(join(dir, "zulu.md"), TEMPLATE("zulu", "deepseek/deepseek-flash"), "utf8");
   await writeFile(join(dir, "alpha.md"), TEMPLATE("alpha", "claude-bridge/claude-opus-5-5"), "utf8");
   // Neither is a `*.md` regular file, so neither is an agent.
@@ -66,8 +66,8 @@ test("readAgentFiles lists only *.md files, sorted, with the active model unquot
   assert.equal(named(files[0]).model, "claude-bridge/claude-opus-5-5", "the value is unquoted");
 });
 
-test("readAgentFiles leaves model absent when the file declares none", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-read-"));
+test("readAgentFiles leaves model absent when the file declares none", async (t) => {
+  const dir = await tempDir(t, "read");
   await writeFile(join(dir, "nomodel.md"), `---\nname: nomodel\nthinking: high\n---\n\nBody.\n`, "utf8");
   // Only a commented model: the active line is what counts.
   await writeFile(join(dir, "commented.md"), `---\nname: commented\n# model: "a/b"\n---\n`, "utf8");
@@ -82,8 +82,8 @@ test("readAgentFiles leaves model absent when the file declares none", async () 
 
 // Discovery decodes the same way `upsertModel` compares, so a snippet proposes
 // the model id itself — never the comment someone glued to it.
-test("readAgentFiles decodes a commented or escaped model to the bare id", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-read-"));
+test("readAgentFiles decodes a commented or escaped model to the bare id", async (t) => {
+  const dir = await tempDir(t, "read");
   await writeFile(
     join(dir, "comment.md"),
     `---\nname: comment\nmodel: claude-bridge/claude-opus-5-5 # pinned\n---\n`,
@@ -105,13 +105,13 @@ test("readAgentFiles decodes a commented or escaped model to the bare id", async
   assert.equal(agents.escape.primary.model, "openai-codex/gpt-6-sol");
 });
 
-test("readAgentFiles reads a missing directory as no files", async () => {
-  const dir = join(await mkdtemp(join(tmpdir(), "pqd-read-")), "does-not-exist");
+test("readAgentFiles reads a missing directory as no files", async (t) => {
+  const dir = join(await tempDir(t, "read"), "does-not-exist");
   assert.deepEqual(await readAgentFiles(dir), []);
 });
 
-test("readAgentFiles skips a file it cannot read rather than throwing", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-read-"));
+test("readAgentFiles skips a file it cannot read rather than throwing", async (t) => {
+  const dir = await tempDir(t, "read");
   await writeFile(join(dir, "ok.md"), TEMPLATE("ok", "deepseek/deepseek-flash"), "utf8");
   // A dangling symlink is a `*.md` name whose read rejects.
   await symlink(join(dir, "missing.md"), join(dir, "broken.md"));
@@ -128,7 +128,7 @@ test("readAgentFiles skips a file it cannot read rather than throwing", async ()
 // rest without opening a FIFO, which is why it is used instead of `readdir`'s
 // file type.
 test("readAgentFiles skips non-regular files and follows a symlink to one", async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-read-"));
+  const dir = await tempDir(t, "read");
   await writeFile(join(dir, "ok.md"), TEMPLATE("ok", "deepseek/deepseek-flash"), "utf8");
   await writeFile(join(dir, "target.md"), TEMPLATE("target", "deepseek/deepseek-flash"), "utf8");
   await symlink(join(dir, "target.md"), join(dir, "link.md")); // symlink to a regular file: an agent
@@ -158,7 +158,7 @@ test("readAgentFiles lists a present-but-unreadable file and says so", async (t)
     t.skip("root can read a mode-000 file");
     return;
   }
-  const dir = await mkdtemp(join(tmpdir(), "pqd-read-"));
+  const dir = await tempDir(t, "read");
   const secret = join(dir, "secret.md");
   await writeFile(secret, TEMPLATE("secret", "deepseek/deepseek-flash"), "utf8");
   await chmod(secret, 0o000);
@@ -408,8 +408,8 @@ interface FreshFixture {
  * `agents` table under the caller's control. The default is the shipped empty
  * table.
  */
-async function freshFixture(agents: Record<string, unknown> = {}): Promise<FreshFixture> {
-  const root = await mkdtemp(join(tmpdir(), "pqd-startup-"));
+async function freshFixture(t: TestContext, agents: Record<string, unknown> = {}): Promise<FreshFixture> {
+  const root = await tempDir(t, "startup");
   const agentDir = join(root, "agent");
   const projectDir = join(root, "project");
   const agentsDir = join(agentDir, "agents");
@@ -558,8 +558,8 @@ async function withExtension(
   }
 }
 
-test("a fresh install makes no HTTP call, writes nothing, and schedules no poll", async () => {
-  const fx = await freshFixture();
+test("a fresh install makes no HTTP call, writes nothing, and schedules no poll", async (t) => {
+  const fx = await freshFixture(t);
   const before = await readFile(join(fx.agentsDir, "planner.md"), "utf8");
 
   await withExtension(fx, async (h) => {
@@ -578,8 +578,8 @@ test("a fresh install makes no HTTP call, writes nothing, and schedules no poll"
 // The common fresh install has no config file yet — that is why it is being
 // asked to make one. The path named must come from the fallback, not from a
 // loaded file the install does not have.
-test("a fresh install with no config file still names the file to create", async () => {
-  const fx = await freshFixture();
+test("a fresh install with no config file still names the file to create", async (t) => {
+  const fx = await freshFixture(t);
   await unlink(fx.configPath);
 
   await withExtension(fx, async (h) => {
@@ -595,8 +595,8 @@ test("a fresh install with no config file still names the file to create", async
 });
 
 for (const reason of ["startup", "new", "reload"]) {
-  test(`an empty table notifies once, at warning level, on ${reason}`, async () => {
-    const fx = await freshFixture();
+  test(`an empty table notifies once, at warning level, on ${reason}`, async (t) => {
+    const fx = await freshFixture(t);
 
     await withExtension(fx, async (h) => {
       await h.start(reason);
@@ -621,8 +621,8 @@ for (const reason of ["startup", "new", "reload"]) {
 }
 
 for (const reason of ["resume", "fork"]) {
-  test(`an empty table stays silent on ${reason}`, async () => {
-    const fx = await freshFixture();
+  test(`an empty table stays silent on ${reason}`, async (t) => {
+    const fx = await freshFixture(t);
 
     await withExtension(fx, async (h) => {
       await h.start(reason);
@@ -643,8 +643,8 @@ for (const reason of ["resume", "fork"]) {
 // already wrote, and the table being empty is the only symptom they would
 // otherwise see — the parse error goes to a console line that scrolls past at
 // session start.
-test("an unparseable config file is reported instead of the unconfigured ask", async () => {
-  const fx = await freshFixture();
+test("an unparseable config file is reported instead of the unconfigured ask", async (t) => {
+  const fx = await freshFixture(t);
   await writeFile(fx.configPath, '{ "agents": {\n  "planner": {,}\n}', "utf8");
 
   await withExtension(fx, async (h) => {
@@ -673,8 +673,8 @@ test("an unparseable config file is reported instead of the unconfigured ask", a
 // agents, so the only symptom is a route that is quietly not the one the reader
 // wrote. That is the state ADR 0009 raised for a model this pi cannot spawn, and
 // it gets the same notification rather than a console line that scrolls past.
-test("a skipped project layer is reported even though the global one still manages agents", async () => {
-  const fx = await freshFixture({
+test("a skipped project layer is reported even though the global one still manages agents", async (t) => {
+  const fx = await freshFixture(t, {
     planner: { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } },
   });
   await writeFile(join(fx.projectDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), "[1,2]", "utf8");
@@ -696,8 +696,8 @@ test("a skipped project layer is reported even though the global one still manag
 // session resuming work does not want to be interrupted about a file it read
 // yesterday, and there is a report for asking.
 for (const reason of ["resume", "fork"]) {
-  test(`a skipped config file stays silent on ${reason}`, async () => {
-    const fx = await freshFixture();
+  test(`a skipped config file stays silent on ${reason}`, async (t) => {
+    const fx = await freshFixture(t);
     await writeFile(fx.configPath, "{ broken", "utf8");
 
     await withExtension(fx, async (h) => {
@@ -710,8 +710,8 @@ for (const reason of ["resume", "fork"]) {
 // The notification is a rendering, so it obeys `hasUI` exactly as the ask does.
 // A parse error is the case where it would be easiest to forget: the fault is
 // reported from a helper of its own, not from the branch that guards the ask.
-test("no notify for a skipped config file when ctx.hasUI is false", async () => {
-  const fx = await freshFixture();
+test("no notify for a skipped config file when ctx.hasUI is false", async (t) => {
+  const fx = await freshFixture(t);
   await writeFile(fx.configPath, "{ broken", "utf8");
 
   await withExtension(
@@ -725,8 +725,8 @@ test("no notify for a skipped config file when ctx.hasUI is false", async () => 
   );
 });
 
-test("the footer status is set while the table is empty", async () => {
-  const fx = await freshFixture();
+test("the footer status is set while the table is empty", async (t) => {
+  const fx = await freshFixture(t);
 
   await withExtension(fx, async (h) => {
     await h.start("startup");
@@ -743,8 +743,8 @@ test("the footer status is set while the table is empty", async () => {
   });
 });
 
-test("once the table is non-empty the footer is cleared, not left showing unconfigured", async () => {
-  const fx = await freshFixture({
+test("once the table is non-empty the footer is cleared, not left showing unconfigured", async (t) => {
+  const fx = await freshFixture(t, {
     planner: {
       primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
       alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
@@ -771,17 +771,17 @@ test("once the table is non-empty the footer is cleared, not left showing unconf
 
 // The clear must target the status the ask set, so it is observed across two
 // installs writing to one recorded list rather than assumed from an empty one.
-test("a configured install clears the footer an unconfigured one set", async () => {
+test("a configured install clears the footer an unconfigured one set", async (t) => {
   const shared: Array<{ key: string; text: string | undefined }> = [];
 
-  const empty = await freshFixture();
+  const empty = await freshFixture(t);
   await withExtension(empty, async (h) => {
     await h.start("startup");
   }, { statuses: shared });
   const set = shared.find((s) => s.text !== undefined && s.text.length > 0);
   assert.ok(set, `the empty install must set the footer: ${JSON.stringify(shared)}`);
 
-  const configured = await freshFixture({
+  const configured = await freshFixture(t, {
     planner: {
       primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
       alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
@@ -801,8 +801,8 @@ test("a configured install clears the footer an unconfigured one set", async () 
   }, { statuses: shared });
 });
 
-test("nothing is rendered at all when ctx.hasUI is false", async () => {
-  const fx = await freshFixture();
+test("nothing is rendered at all when ctx.hasUI is false", async (t) => {
+  const fx = await freshFixture(t);
 
   await withExtension(
     fx,

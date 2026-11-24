@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 
@@ -28,6 +27,7 @@ import {
 
 import { agentTable, routeOf } from "./helpers/identifiers.ts";
 import { failureOf, fakeReads, poolFailure, poolGroup, readingOf, type Used } from "./helpers/rails.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 const NOW = 1_730_123_456_789;
 const TTL = 10_000;
@@ -50,8 +50,7 @@ const meteredWithLastGood: RailReadings = { latest: meteredReading, lastGood: de
 const meteredClaude: MeteredReading = { rail: "claude", ok: true, windows: [], metered: true };
 
 async function fixture(t: TestContext, opts: { antigravity?: boolean } = {}) {
-  const root = await mkdtemp(join(tmpdir(), "pqd-readings-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir(t, "readings");
   const agentDir = join(root, "agents");
   await mkdir(agentDir);
   const agentFile = join(agentDir, "planner.md");

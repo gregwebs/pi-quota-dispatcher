@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 
 import {
   type AgentDefinition,
@@ -27,6 +26,7 @@ import type { RailReading, RailWindow } from "../src/rail-reading.ts";
 import type { ModelId } from "../src/identifiers.ts";
 import { agentName, agentTable, modelId, modelTable } from "./helpers/identifiers.ts";
 import { fakeReads, readingOf } from "./helpers/rails.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 const definitionOf = (agent: string, cfg: DispatcherConfig): AgentDefinition => ({ agent: agentName(agent), file: join(cfg.agentDir, `${agent}.md`) });
 
@@ -537,8 +537,8 @@ interface Fixture {
  * or missing stub cannot fall through to the developer's real
  * `~/.claude/.credentials.json` or `~/.pi/agent/auth.json`.
  */
-async function fixture(models: Record<string, string>): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "pqd-models-"));
+async function fixture(t: TestContext, models: Record<string, string>): Promise<Fixture> {
+  const root = await tempDir(t, "models");
   const agentDir = join(root, "agents");
   await mkdir(agentDir, { recursive: true });
   for (const [name, model] of Object.entries(models)) {
@@ -562,8 +562,8 @@ async function fixture(models: Record<string, string>): Promise<Fixture> {
   return { agentDir, claudeCredsPath, piAuthPath, codexCredsPath: piAuthPath, readingsPath: join(root, "quota-dispatch-readings.json") };
 }
 
-test("a held unknown primary leaves the agent's file byte-for-byte alone even when a switch is due", async () => {
-  const fx = await fixture({ planner: "claude-bridge/claude-opus-5-5" });
+test("a held unknown primary leaves the agent's file byte-for-byte alone even when a switch is due", async (t) => {
+  const fx = await fixture(t, { planner: "claude-bridge/claude-opus-5-5" });
   const cfg: DispatcherConfig = {
     ...DEFAULT_CONFIG,
     ...fx,

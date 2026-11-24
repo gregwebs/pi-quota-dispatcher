@@ -9,8 +9,7 @@
  * two failures, not a tour of the fields.
  */
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -21,6 +20,7 @@ import {
   type StampFacts,
   type StampStat,
 } from "../src/config-stamp.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 function facts(mtimeMs: number, size = 100, ino = 1, ctimeMs = mtimeMs): StampFacts {
   return { mtimeMs, ctimeMs, size, ino };
@@ -143,46 +143,38 @@ test("every moved path is named, and only the moved ones", async () => {
  * file the extension could not read becomes readable again with the same size,
  * mtime and inode, and a stamp without `ctimeMs` would never notice.
  */
-test("a real file's save and permission change both move the stamp", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-stamp-"));
+test("a real file's save and permission change both move the stamp", async (t) => {
+  const dir = await tempDir(t, "stamp");
   const file = join(dir, "quota-dispatch.json");
-  try {
-    await writeFile(file, JSON.stringify({ margin: 20 }), "utf8");
-    const held = await readConfigStamp([file]);
+  await writeFile(file, JSON.stringify({ margin: 20 }), "utf8");
+  const held = await readConfigStamp([file]);
 
-    // An in-place save of the same length: only the timestamps move.
-    await writeFile(file, JSON.stringify({ margin: 21 }), "utf8");
-    const rewritten = await readConfigStamp([file]);
-    assert.deepEqual(changedConfigPaths(held, rewritten), [file], "a same-length rewrite is a change");
+  // An in-place save of the same length: only the timestamps move.
+  await writeFile(file, JSON.stringify({ margin: 21 }), "utf8");
+  const rewritten = await readConfigStamp([file]);
+  assert.deepEqual(changedConfigPaths(held, rewritten), [file], "a same-length rewrite is a change");
 
-    // `stat` sees a mode-000 file; only `read` fails, which is why the stamp has
-    // to carry ctime rather than a "could not read it" outcome.
-    await chmod(file, 0o000);
-    const unreadable = await readConfigStamp([file]);
-    assert.deepEqual(changedConfigPaths(rewritten, unreadable), [file], "chmod 000 is a change");
+  // `stat` sees a mode-000 file; only `read` fails, which is why the stamp has
+  // to carry ctime rather than a "could not read it" outcome.
+  await chmod(file, 0o000);
+  const unreadable = await readConfigStamp([file]);
+  assert.deepEqual(changedConfigPaths(rewritten, unreadable), [file], "chmod 000 is a change");
 
-    await chmod(file, 0o644);
-    const restored = await readConfigStamp([file]);
-    assert.deepEqual(changedConfigPaths(unreadable, restored), [file], "chmod 644 is a change");
+  await chmod(file, 0o644);
+  const restored = await readConfigStamp([file]);
+  assert.deepEqual(changedConfigPaths(unreadable, restored), [file], "chmod 644 is a change");
 
-    // And an unchanged file settles: the next read of the same stamp is quiet.
-    assert.deepEqual(changedConfigPaths(restored, await readConfigStamp([file])), []);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+  // And an unchanged file settles: the next read of the same stamp is quiet.
+  assert.deepEqual(changedConfigPaths(restored, await readConfigStamp([file])), []);
 });
 
 /** A file that appears between two stamps is a change, from the production `stat`. */
-test("a file created after the first stamp is a change", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-stamp-"));
+test("a file created after the first stamp is a change", async (t) => {
+  const dir = await tempDir(t, "stamp");
   const file = join(dir, "quota-dispatch.json");
-  try {
-    const missing = await readConfigStamp([file]);
-    assert.deepEqual(missing, [{ path: file, kind: "absent" }]);
+  const missing = await readConfigStamp([file]);
+  assert.deepEqual(missing, [{ path: file, kind: "absent" }]);
 
-    await writeFile(file, "{}", "utf8");
-    assert.deepEqual(changedConfigPaths(missing, await readConfigStamp([file])), [file]);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+  await writeFile(file, "{}", "utf8");
+  assert.deepEqual(changedConfigPaths(missing, await readConfigStamp([file])), [file]);
 });

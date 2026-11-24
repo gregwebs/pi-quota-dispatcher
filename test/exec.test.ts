@@ -1,24 +1,17 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { stat } from "node:fs/promises";
 import { join } from "node:path";
-import { test, type TestContext } from "node:test";
+import { test } from "node:test";
 
 import { createSpawnProcess, spawnProcess, type ProcessSpec } from "../src/exec.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 
 // The contract this file pins is the one `/quota-dispatch refresh-codex` leans
 // on: a child that owns nothing, a monotonic deadline that no exit observed at
 // or after it can turn into success, and a runner that says "no exit was
 // observed" rather than pretending a signal is proof.
-
-/** A private directory per test, removed when it ends. */
-async function workdir(t: TestContext): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "pqd-exec-"));
-  t.after(() => rm(dir, { recursive: true, force: true }));
-  return dir;
-}
 
 function spec(cwd: string, over: Partial<ProcessSpec> = {}): ProcessSpec {
   return {
@@ -55,13 +48,13 @@ async function waitFor(path: string, timeoutMs = 5_000): Promise<void> {
 }
 
 test("spawnProcess resolves a natural exit with its code", async (t) => {
-  const cwd = await workdir(t);
+  const cwd = await tempDir(t, "exec");
   const end = await spawnProcess(spec(cwd, { args: ["-e", "process.exit(7)"] }));
   assert.deepEqual(end, { kind: "exited", code: 7, signal: null });
 });
 
 test("spawnProcess reports a missing file as not started, by Node's string errno", async (t) => {
-  const cwd = await workdir(t);
+  const cwd = await tempDir(t, "exec");
   const end = await spawnProcess(spec(cwd, { file: join(cwd, "no-such-binary") }));
   // The string, not the numeric `errno`: a redacted line is the only place this
   // ends up, and `ENOENT` is the token a reader knows.
@@ -69,7 +62,7 @@ test("spawnProcess reports a missing file as not started, by Node's string errno
 });
 
 test("spawnProcess gives the child no stdin and no captured output", async (t) => {
-  const cwd = await workdir(t);
+  const cwd = await tempDir(t, "exec");
   // Reads stdin to its end and exits 3 if anything was there, while printing to
   // both streams: with `stdio: "ignore"` the read sees EOF at once and nothing
   // printed can come back through the runner.
@@ -88,7 +81,7 @@ test("spawnProcess gives the child no stdin and no captured output", async (t) =
 });
 
 test("spawnProcess sends no signal before the deadline, and a natural exit does not wait for it", async (t) => {
-  const cwd = await workdir(t);
+  const cwd = await tempDir(t, "exec");
   const signalled = join(cwd, "signalled");
   const script = [
     `process.on('SIGTERM', () => require('node:fs').writeFileSync(${JSON.stringify(signalled)}, 'term'));`,
@@ -109,7 +102,7 @@ test("spawnProcess sends no signal before the deadline, and a natural exit does 
 });
 
 test("deadline hit: SIGTERM ends a waiting child and settles timed-out", async (t) => {
-  const cwd = await workdir(t);
+  const cwd = await tempDir(t, "exec");
   const ready = join(cwd, "ready");
   const script = [
     `require('node:fs').writeFileSync(${JSON.stringify(ready)}, '1');`,
@@ -125,7 +118,7 @@ test("deadline hit: SIGTERM ends a waiting child and settles timed-out", async (
 });
 
 test("late exit: an exit observed at the deadline is timed-out, never exited", async (t) => {
-  const cwd = await workdir(t);
+  const cwd = await tempDir(t, "exec");
   const deadlineMs = 100_000;
   let clock = 0;
   const run = createSpawnProcess({ now: () => clock });
@@ -140,7 +133,7 @@ test("late exit: an exit observed at the deadline is timed-out, never exited", a
 });
 
 test("child ignoring TERM: SIGTERM is delivered and ignored, then SIGKILL ends the direct child", async (t) => {
-  const cwd = await workdir(t);
+  const cwd = await tempDir(t, "exec");
   const ready = join(cwd, "ready");
   const termSeen = join(cwd, "term-seen");
   // The handler is installed *before* the ready marker is written, so a SIGTERM
@@ -166,7 +159,7 @@ test("child ignoring TERM: SIGTERM is delivered and ignored, then SIGKILL ends t
 });
 
 test("the escalation sends SIGTERM first, then SIGKILL one grace period later", async (t) => {
-  const cwd = await workdir(t);
+  const cwd = await tempDir(t, "exec");
   const emitter = new EventEmitter();
   const signals: Array<{ signal: NodeJS.Signals; at: number }> = [];
   const child = Object.assign(emitter, {
@@ -190,7 +183,7 @@ test("the escalation sends SIGTERM first, then SIGKILL one grace period later", 
 });
 
 test("no exit observed: ignored signals and a post-spawn error settle timed-out with the pid", async (t) => {
-  const cwd = await workdir(t);
+  const cwd = await tempDir(t, "exec");
   const emitter = new EventEmitter();
   const child = Object.assign(emitter, {
     pid: 4242,

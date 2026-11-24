@@ -13,7 +13,6 @@ import { existsSync } from "node:fs";
 import {
   chmod,
   lstat,
-  mkdtemp,
   open,
   readdir,
   readFile,
@@ -24,7 +23,7 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
-import { hostname, tmpdir } from "node:os";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -41,6 +40,7 @@ import {
   withFileLock,
 } from "../src/agent-file.ts";
 import { modelId } from "./helpers/identifiers.ts";
+import { tempDir } from "./helpers/temp-dir.ts";
 import {
   FAST,
   assertCleanExit,
@@ -84,10 +84,6 @@ async function modelIn(file: string): Promise<string> {
   return found[1];
 }
 
-async function agentDir(prefix: string): Promise<string> {
-  return mkdtemp(join(tmpdir(), `pqd-${prefix}-`));
-}
-
 /**
  * Runs `jobs` as real child processes, all gated on one release file, and lets
  * them go only once every one of them is loaded and waiting.
@@ -118,8 +114,8 @@ async function runTogether<T>(dir: string, jobs: Array<Record<string, unknown>>)
 
 // ---------------------------------------------------------------- the write
 
-test("a coordinated write lands the model and its level and leaves the rest of the file alone", async () => {
-  const dir = await agentDir("write");
+test("a coordinated write lands the model and its level and leaves the rest of the file alone", async (t) => {
+  const dir = await tempDir(t, "write");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
 
@@ -140,8 +136,8 @@ test("a coordinated write lands the model and its level and leaves the rest of t
 // The fault: the pass decided from one file and the file moved under it. The
 // rewrite is applied to the bytes on disk now, so a body edit made in between is
 // kept — only the two lines the dispatcher owns move.
-test("an unrelated edit made after the pass read the file survives the write", async () => {
-  const dir = await agentDir("preserve");
+test("an unrelated edit made after the pass read the file survives the write", async (t) => {
+  const dir = await tempDir(t, "preserve");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
   // The pass has read the file: `base` is what it saw.
@@ -160,8 +156,8 @@ test("an unrelated edit made after the pass read the file survives the write", a
 // process. The child's gate is before its own pre-check, so this proves an edit
 // made before the pass's read survives — not one made between its read and its
 // write, which the read-under-lock test below is for.
-test("an edit another process makes while a pass waits survives that pass's write", async () => {
-  const dir = await agentDir("cross-process-edit");
+test("an edit another process makes while a pass waits survives that pass's write", async (t) => {
+  const dir = await tempDir(t, "cross-process-edit");
   const file = join(dir, "agent.md");
   const ready = join(dir, ".ready");
   const release = join(dir, ".start");
@@ -197,8 +193,8 @@ test("an edit another process makes while a pass waits survives that pass's writ
 // lock is held by another process and the edit lands while this pass waits for
 // it, so an edit missing from the result can only have been dropped by the
 // read.
-test("the write reads the file after the lock, so an edit made while it waits survives", async () => {
-  const dir = await agentDir("read-under-lock");
+test("the write reads the file after the lock, so an edit made while it waits survives", async (t) => {
+  const dir = await tempDir(t, "read-under-lock");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
 
@@ -235,8 +231,8 @@ test("the write reads the file after the lock, so an edit made while it waits su
 
 // Two passes reaching the same answer is the normal case, and it must not write:
 // a write here would be one process undoing and redoing another's work.
-test("a file another pass already brought to the target is unchanged", async () => {
-  const dir = await agentDir("converge");
+test("a file another pass already brought to the target is unchanged", async (t) => {
+  const dir = await tempDir(t, "converge");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("c/d"), "utf8");
 
@@ -250,8 +246,8 @@ test("a file another pass already brought to the target is unchanged", async () 
 // The lock is for writes. A pass that has nothing to write should not need one,
 // which is what keeps a poll from creating and deleting a lock file per agent,
 // and what keeps an agent dir this process cannot write to reportable.
-test("a pass with nothing to write takes no lock", async () => {
-  const dir = await agentDir("no-write");
+test("a pass with nothing to write takes no lock", async (t) => {
+  const dir = await tempDir(t, "no-write");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("c/d"), "utf8");
 
@@ -275,8 +271,8 @@ test("a pass with nothing to write takes no lock", async () => {
 // lock file is not an install where every agent reads as held. The lock is a
 // file, and a directory that refuses new files refuses it; a pass with no write
 // to make never asks.
-test("an agent dir that cannot hold a lock file still reports an unchanged agent", async () => {
-  const dir = await agentDir("read-only");
+test("an agent dir that cannot hold a lock file still reports an unchanged agent", async (t) => {
+  const dir = await tempDir(t, "read-only");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("c/d"), "utf8");
   await chmod(dir, 0o555);
@@ -290,8 +286,8 @@ test("an agent dir that cannot hold a lock file still reports an unchanged agent
   }
 });
 
-test("a conflicting assignment is held, and the reason names both models", async () => {
-  const dir = await agentDir("conflict");
+test("a conflicting assignment is held, and the reason names both models", async (t) => {
+  const dir = await tempDir(t, "conflict");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
   // The pass read `a/b`; another process assigned `x/y` before this write.
@@ -308,8 +304,8 @@ test("a conflicting assignment is held, and the reason names both models", async
 // The model a conflicting file carries is evidence, not a validated value, so a
 // malformed spelling survives the refusal and is named as it stands rather than
 // being rejected on the way into the reason.
-test("a malformed raw model on disk survives conflict detection and is named verbatim", async () => {
-  const dir = await agentDir("raw-conflict");
+test("a malformed raw model on disk survives conflict detection and is named verbatim", async (t) => {
+  const dir = await tempDir(t, "raw-conflict");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
   await writeFile(file, agentFileText("nomodel"), "utf8");
@@ -322,8 +318,8 @@ test("a malformed raw model on disk survives conflict detection and is named ver
 
 // `undefined` is not a model, and a reason that named it would send the reader
 // looking for a model id that does not exist. The refusal is the same one.
-test("a file whose model line vanished mid-pass is held in words that name no model", async () => {
-  const dir = await agentDir("removed");
+test("a file whose model line vanished mid-pass is held in words that name no model", async (t) => {
+  const dir = await tempDir(t, "removed");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
   const after = `---\nname: agent\ntools: read\n---\n\nBody.\n`;
@@ -337,8 +333,8 @@ test("a file whose model line vanished mid-pass is held in words that name no mo
   assert.equal(await readFile(file, "utf8"), after);
 });
 
-test("a missing file, and a file with no usable frontmatter, are skipped rather than held", async () => {
-  const dir = await agentDir("skip");
+test("a missing file, and a file with no usable frontmatter, are skipped rather than held", async (t) => {
+  const dir = await tempDir(t, "skip");
   const absent = join(dir, "absent.md");
   assert.deepEqual(
     await applyDecision({ file: absent, model: modelId("c/d"), base: undefined, dry: false }, { pacing: FAST }),
@@ -354,8 +350,8 @@ test("a missing file, and a file with no usable frontmatter, are skipped rather 
   assert.equal(await readFile(bare, "utf8"), "no frontmatter here\n");
 });
 
-test("a dry pass reports what a write would do and touches nothing", async () => {
-  const dir = await agentDir("dry");
+test("a dry pass reports what a write would do and touches nothing", async (t) => {
+  const dir = await tempDir(t, "dry");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
 
@@ -372,8 +368,8 @@ test("a dry pass reports what a write would do and touches nothing", async () =>
 // dry pass must still answer at once. Taking the lock would make it wait, and
 // failing to take it would make the report describe a hold the real pass would
 // only reach after its own wait.
-test("a dry pass answers even while another process holds the lock", async () => {
-  const dir = await agentDir("dry-held");
+test("a dry pass answers even while another process holds the lock", async (t) => {
+  const dir = await tempDir(t, "dry-held");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
 
@@ -396,8 +392,8 @@ test("a dry pass answers even while another process holds the lock", async () =>
 
 // The check is the same one the real write makes, made without the lock: a
 // report that could not see a conflict would describe a write that then refuses.
-test("a dry pass reports a conflicting assignment it can see", async () => {
-  const dir = await agentDir("dry-conflict");
+test("a dry pass reports a conflicting assignment it can see", async (t) => {
+  const dir = await tempDir(t, "dry-conflict");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("x/y"), "utf8");
 
@@ -414,8 +410,8 @@ test("a dry pass reports a conflicting assignment it can see", async () => {
  * because the new text went to a different inode and was renamed over the old
  * one. An implementation that truncated and rewrote in place fails this.
  */
-test("a replacement is one step: a reader that already opened the file keeps the old one", async () => {
-  const dir = await agentDir("atomic");
+test("a replacement is one step: a reader that already opened the file keeps the old one", async (t) => {
+  const dir = await tempDir(t, "atomic");
   const file = join(dir, "agent.md");
   const before = agentFileText("a/b");
   await writeFile(file, before, "utf8");
@@ -443,8 +439,8 @@ test("a replacement is one step: a reader that already opened the file keeps the
  * writers share, and the second can then publish the first's half-written bytes
  * — or truncate the file the first has already renamed into place.
  */
-test("two replacements with no lock between them each publish a whole file", async () => {
-  const dir = await agentDir("racing");
+test("two replacements with no lock between them each publish a whole file", async (t) => {
+  const dir = await tempDir(t, "racing");
   const file = join(dir, "agent.md");
   const texts = [agentFileText("c/1"), agentFileText("c/2")];
   await writeFile(file, texts[0], "utf8");
@@ -459,8 +455,8 @@ test("two replacements with no lock between them each publish a whole file", asy
   assert.deepEqual(await stagingFiles(dir), [], "a replacement left its staging file behind");
 });
 
-test("the file's permission bits survive the replacement", async () => {
-  const dir = await agentDir("mode");
+test("the file's permission bits survive the replacement", async (t) => {
+  const dir = await tempDir(t, "mode");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), { mode: 0o600 });
 
@@ -478,8 +474,8 @@ test("the file's permission bits survive the replacement", async () => {
  * because there is no instant at which the target is anything but one complete
  * version or the other. The writer alternates so that every round really writes.
  */
-test("a reader never sees a partial file while it is being rewritten", async () => {
-  const dir = await agentDir("reader");
+test("a reader never sees a partial file while it is being rewritten", async (t) => {
+  const dir = await tempDir(t, "reader");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
 
@@ -514,8 +510,8 @@ test("a reader never sees a partial file while it is being rewritten", async () 
  * exactly that. Renaming onto the path the user named would replace their link
  * with a regular file and quietly detach the copy they edit.
  */
-test("a symlinked agent file is written through, not replaced by a regular file", async () => {
-  const dir = await agentDir("symlink");
+test("a symlinked agent file is written through, not replaced by a regular file", async (t) => {
+  const dir = await tempDir(t, "symlink");
   const target = join(dir, "dotfiles.md");
   const link = join(dir, "agent.md");
   await writeFile(target, agentFileText("a/b"), "utf8");
@@ -535,8 +531,8 @@ test("a symlinked agent file is written through, not replaced by a regular file"
  * the name the caller used, an alias would be a second way into a file another
  * process is rewriting.
  */
-test("a write through a symlink waits behind the target's own lock", async () => {
-  const dir = await agentDir("alias");
+test("a write through a symlink waits behind the target's own lock", async (t) => {
+  const dir = await tempDir(t, "alias");
   const target = join(dir, "dotfiles.md");
   const link = join(dir, "agent.md");
   await writeFile(target, agentFileText("a/b"), "utf8");
@@ -567,8 +563,8 @@ test("a write through a symlink waits behind the target's own lock", async () =>
  * The lock pins one string, and the write must land on exactly that string, so
  * the retargeted link is replaced and the file it points at is left untouched.
  */
-test("a retarget must not redirect a publication into another locked file", async () => {
-  const dir = await agentDir("retarget");
+test("a retarget must not redirect a publication into another locked file", async (t) => {
+  const dir = await tempDir(t, "retarget");
   const a = join(dir, "a.md");
   const b = join(dir, "b.md");
   // Both files state the model the pass decided against, so only the landing
@@ -609,8 +605,8 @@ test("a retarget must not redirect a publication into another locked file", asyn
 // a skip, not a hold, and nothing invents `<name>.lock` for a file that may
 // never be occupied — locking that would coordinate a name while another process
 // coordinates the file it points at.
-test("a lock is refused, without running its body, when the target has vanished", async () => {
-  const dir = await agentDir("gone");
+test("a lock is refused, without running its body, when the target has vanished", async (t) => {
+  const dir = await tempDir(t, "gone");
   const target = join(dir, "dotfiles.md");
   const link = join(dir, "agent.md");
   await writeFile(target, agentFileText("a/b"), "utf8");
@@ -629,8 +625,8 @@ test("a lock is refused, without running its body, when the target has vanished"
 
 // ------------------------------------------------ the lock
 
-test("a second attempt at a held lock waits, and reports the holder when it gives up", async () => {
-  const dir = await agentDir("exclusion");
+test("a second attempt at a held lock waits, and reports the holder when it gives up", async (t) => {
+  const dir = await tempDir(t, "exclusion");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
 
@@ -661,8 +657,8 @@ test("a second attempt at a held lock waits, and reports the holder when it give
   assert.equal(existsSync(await lockFor(file)), false, "the lock outlived its holder");
 });
 
-test("the lock is released on the way out, including when the body throws", async () => {
-  const dir = await agentDir("release");
+test("the lock is released on the way out, including when the body throws", async (t) => {
+  const dir = await tempDir(t, "release");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
 
@@ -689,8 +685,8 @@ test("the lock is released on the way out, including when the body throws", asyn
  * `ABANDONED_LOCK_MS` — the bound no millisecond critical section can reach —
  * is allowed past this.
  */
-test("a lock whose holder is alive is not taken over by the staleness bound", async () => {
-  const dir = await agentDir("alive");
+test("a lock whose holder is alive is not taken over by the staleness bound", async (t) => {
+  const dir = await tempDir(t, "alive");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
 
@@ -736,8 +732,8 @@ test("a lock whose holder is alive is not taken over by the staleness bound", as
  * milliseconds, so a lock ten minutes old is an abandoned release rather than
  * active work.
  */
-test("a lock whose live holder is older than the abandoned bound is taken over", async () => {
-  const dir = await agentDir("abandoned");
+test("a lock whose live holder is older than the abandoned bound is taken over", async (t) => {
+  const dir = await tempDir(t, "abandoned");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
 
@@ -779,8 +775,8 @@ test("a lock whose live holder is older than the abandoned bound is taken over",
  * happens to carry our pid and clock reading. These two tests drive each defense
  * on its own, as the old combined one did not.
  */
-test("a late release does not unlink a lock rewritten in place with another record", async () => {
-  const dir = await agentDir("late-record");
+test("a late release does not unlink a lock rewritten in place with another record", async (t) => {
+  const dir = await tempDir(t, "late-record");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
   const lock = await lockFor(file);
@@ -808,8 +804,8 @@ test("a late release does not unlink a lock rewritten in place with another reco
   assert.deepEqual(JSON.parse(await readFile(lock, "utf8")), other);
 });
 
-test("a late release does not unlink a different inode that holds our record", async () => {
-  const dir = await agentDir("late-inode");
+test("a late release does not unlink a different inode that holds our record", async (t) => {
+  const dir = await tempDir(t, "late-inode");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
   const lock = await lockFor(file);
@@ -840,8 +836,8 @@ test("a late release does not unlink a different inode that holds our record", a
   assert.equal(existsSync(lock), true, "the late release deleted a lock in a different inode");
 });
 
-test("the lock file is not an agent file", async () => {
-  const dir = await agentDir("not-an-agent");
+test("the lock file is not an agent file", async (t) => {
+  const dir = await tempDir(t, "not-an-agent");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
 
@@ -863,8 +859,8 @@ test("the lock file is not an agent file", async () => {
  * parses to `Infinity`, and an age comparison against it is false forever, which
  * would wedge the file behind a lock no pass could ever clear.
  */
-test("a lock record with an unusable timestamp ages out on the lock's mtime", async () => {
-  const dir = await agentDir("record");
+test("a lock record with an unusable timestamp ages out on the lock's mtime", async (t) => {
+  const dir = await tempDir(t, "record");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
   const lock = await lockFor(file);
@@ -894,8 +890,8 @@ test("a lock record with an unusable timestamp ages out on the lock's mtime", as
 // just as unmeasurable: `now - at` is negative, so the lock would never reach
 // `staleMs` however long it sat. The record's `at` is therefore used only when it
 // is not in the future, and a future one falls back to the lock's own mtime.
-test("a record whose timestamp is in the future ages out on the lock's mtime", async () => {
-  const dir = await agentDir("future-record");
+test("a record whose timestamp is in the future ages out on the lock's mtime", async (t) => {
+  const dir = await tempDir(t, "future-record");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
   const lock = await lockFor(file);
@@ -925,8 +921,8 @@ test("a record whose timestamp is in the future ages out on the lock's mtime", a
 // locks already on disk, and an absent host treated as another machine would age
 // a live holder out at `staleMs`. This asserts the compatibility assumption, not
 // that the pid is proven to belong here.
-test("a record with no host is read as this host, so its live pid is not aged out early", async () => {
-  const dir = await agentDir("hostless-record");
+test("a record with no host is read as this host, so its live pid is not aged out early", async (t) => {
+  const dir = await tempDir(t, "hostless-record");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
   const lock = await lockFor(file);
@@ -943,8 +939,8 @@ test("a record with no host is read as this host, so its live pid is not aged ou
 
 // ------------------------------------------------ across processes
 
-test("a write refuses while another process holds the lock, and lands once it lets go", async () => {
-  const dir = await agentDir("busy");
+test("a write refuses while another process holds the lock, and lands once it lets go", async (t) => {
+  const dir = await tempDir(t, "busy");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
 
@@ -971,8 +967,8 @@ test("a write refuses while another process holds the lock, and lands once it le
 // The recovery half of the crash story, from the outside: an hour of staleness
 // means the age rule cannot possibly explain the recovery, so only the dead
 // holder's pid can — and the write must not wait out an hour to find that out.
-test("a lock left by a killed process is taken over at once", async () => {
-  const dir = await agentDir("crash");
+test("a lock left by a killed process is taken over at once", async (t) => {
+  const dir = await tempDir(t, "crash");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
   const marker = join(dir, "crashed.marker");
@@ -1006,8 +1002,8 @@ test("a lock left by a killed process is taken over at once", async () => {
  * complete and correct, and exactly one process does the writing: the lock is
  * what makes the others see the work already done rather than redo it.
  */
-test("children assigning the same model converge on one complete file", async () => {
-  const dir = await agentDir("same");
+test("children assigning the same model converge on one complete file", async (t) => {
+  const dir = await tempDir(t, "same");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
 
@@ -1034,8 +1030,8 @@ test("children assigning the same model converge on one complete file", async ()
  * have written: the rest found an assignment that is not theirs and held rather
  * than overwriting it, and the file is left as one complete answer.
  */
-test("children assigning different models: one wins, the rest hold, and no answer is mixed in", async () => {
-  const dir = await agentDir("different");
+test("children assigning different models: one wins, the rest hold, and no answer is mixed in", async (t) => {
+  const dir = await tempDir(t, "different");
   const file = join(dir, "agent.md");
   await writeFile(file, agentFileText("a/b"), "utf8");
   const models = ["c/1", "c/2", "c/3", "c/4"];
