@@ -19,22 +19,23 @@
  */
 
 /**
- * The three quota pools Antigravity gives one account, each independently capped.
+ * The two quota pools Antigravity gives one account, each independently capped.
  *
  * They are separate rails rather than one account rail because the vendor caps
  * them separately: spending the Claude-and-GPT pool says nothing about the
  * Gemini one. They share a credential and a single vendor read, which is why the
  * dispatcher fetches them as a group — see
- * `docs/adr/0019-antigravity-pool-rails.md`.
+ * `docs/adr/0019-antigravity-pool-rails.md` and
+ * `docs/adr/0026-the-argon-pool-is-retired.md`.
  */
-export const ANTIGRAVITY_RAILS = ["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const;
+export const ANTIGRAVITY_RAILS = ["antigravity-gemini", "antigravity-3p"] as const;
 
 export type AntigravityRail = (typeof ANTIGRAVITY_RAILS)[number];
 
 /**
  * Every rail, in the order the report prints them: the two long-standing vendor
- * rails, then the three Antigravity pools as one account's group, then the
- * metered rail.
+ * rails, then the two Antigravity pools as one account's group, then the metered
+ * rail.
  *
  * One ordered list rather than a literal repeated at each reader, so the report
  * and the generator cannot disagree about which rails exist or how they read —
@@ -67,12 +68,12 @@ export type Budget = "session" | "weekly";
  * The budgets each rail actually carries, which is the difference between "no
  * cap here" and "this read did not say".
  *
- * A pool need not impose both caps: Antigravity's Argon pool has one weekly
- * bucket and no 5-hour window at all, and the metered rail has no cap of either
- * kind. Only a carried budget can be *missing* — an uncarried one is a budget the
- * rail cannot exceed, so its effective usage is zero and no threshold, not even
- * one configured as `0`, can make it tight. Reading the two cases alike is what
- * would hold every Argon primary for a session window the vendor never promised.
+ * A pool need not impose both caps: the metered rail has no cap of either kind.
+ * Only a carried budget can be *missing* — an uncarried one is a budget the rail
+ * cannot exceed, so its effective usage is zero and no threshold, not even one
+ * configured as `0`, can make it tight. Reading the two cases alike would hold a
+ * rail whose pool never imposed the budget, and would let a configured `0`
+ * refuse it as a destination for a cap it does not have.
  *
  * Declared as one exhaustive record so a new rail cannot be added without
  * answering this question.
@@ -80,7 +81,6 @@ export type Budget = "session" | "weekly";
 export const RAIL_BUDGETS: Record<Rail, readonly Budget[]> = {
   claude: ["session", "weekly"],
   codex: ["session", "weekly"],
-  "antigravity-argon": ["weekly"],
   "antigravity-gemini": ["session", "weekly"],
   "antigravity-3p": ["session", "weekly"],
   deepseek: [],
@@ -98,9 +98,9 @@ export function isRail(value: unknown): value is Rail {
 }
 
 /**
- * Whether `value` is one of the three Antigravity pool rails.
+ * Whether `value` is one of the Antigravity pool rails.
  *
- * Exported because the readings store groups those three behind one fetch, and
+ * Exported because the readings store groups those two behind one fetch, and
  * the grouping is stated once here rather than re-derived from a prefix.
  */
 export function isAntigravityRail(value: unknown): value is AntigravityRail {
@@ -119,11 +119,9 @@ export function railFromModel(model: string): Rail | undefined {
   if (model.startsWith("claude-bridge/") || model.startsWith("anthropic/")) return "claude";
   if (model.startsWith("openai-codex/")) return "codex";
   if (model.startsWith("deepseek/")) return "deepseek";
-  // Argon is checked before the general Gemini prefix: both pools serve Gemini
-  // models, and only the Argon one has its own weekly bucket. A suffix such as
-  // `gemini-4-argon-extra` is still Argon, because the vendor's own bucket ids
-  // for the pool all share that stem.
-  if (model.startsWith("antigravity/gemini-4-argon")) return "antigravity-argon";
+  // The retired Argon pool's models keep the general Gemini prefix: `gemini-4-argon`
+  // is a Gemini model whose own pool no longer exists, so if it is still routed
+  // anywhere it is the Gemini pool it draws on.
   if (model.startsWith("antigravity/gemini-")) return "antigravity-gemini";
   if (model.startsWith("antigravity/claude-") || model.startsWith("antigravity/gpt-")) {
     return "antigravity-3p";

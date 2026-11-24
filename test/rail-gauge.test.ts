@@ -46,9 +46,6 @@ const CLAUDE_ROUTE = routeOf({
   primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
 });
 const CODEX_ROUTE = routeOf({ primary: { model: "openai-codex/gpt-6-sol", rail: "codex" } });
-const ARGON_ROUTE = routeOf({
-  primary: { model: "antigravity-claude/argon", rail: "antigravity-argon" },
-});
 const GEMINI_ROUTE = routeOf({
   primary: { model: "antigravity-gemini/gemini-4", rail: "antigravity-gemini" },
 });
@@ -64,12 +61,11 @@ function cfgNaming(rails: readonly Rail[]): DispatcherConfig {
   const routes: Record<string, AgentRoute> = {
     claude: CLAUDE_ROUTE,
     codex: CODEX_ROUTE,
-    "antigravity-argon": ARGON_ROUTE,
     "antigravity-gemini": GEMINI_ROUTE,
     "antigravity-3p": THIRD_PARTY_ROUTE,
     deepseek: DEEPSEEK_ROUTE,
   };
-  const gated = ["claude", "codex", "antigravity-argon", "antigravity-gemini", "antigravity-3p"];
+  const gated = ["claude", "codex", "antigravity-gemini", "antigravity-3p"];
   const entries: Record<string, AgentRoute> = {};
   for (const rail of gated) if (rails.includes(rail as Rail)) entries[`agent-${rail}`] = routes[rail];
   if (rails.includes("deepseek")) entries["agent-deepseek"] = DEEPSEEK_ROUTE;
@@ -103,7 +99,7 @@ function weekly(used: number, resetsAt?: number): RailWindow {
   return { label: "7d", used, budget: "weekly", ...(resetsAt === undefined ? {} : { resetsAt }) };
 }
 
-const EXAMPLE_CFG: DispatcherConfig = { ...cfgNaming(["claude", "codex", "antigravity-argon", "deepseek"]), sessionSwitchAt: 70, weeklySwitchAt: 90 };
+const EXAMPLE_CFG: DispatcherConfig = { ...cfgNaming(["claude", "codex", "antigravity-gemini", "deepseek"]), sessionSwitchAt: 70, weeklySwitchAt: 90 };
 
 function gauge(
   map: Map<Rail, RailReadings>,
@@ -119,24 +115,21 @@ test("renders the spec's example line", () => {
   const map = readings(
     ["claude", ok(good("claude", [session(13), weekly(91, NOW + 4 * DAY)]))],
     ["codex", ok(good("codex", [session(74, NOW + 2 * HOUR), weekly(41)]))],
-    ["antigravity-argon", ok(good("antigravity-argon", [weekly(62)]))],
+    ["antigravity-gemini", ok(good("antigravity-gemini", [session(62), weekly(62)]))],
     ["deepseek", { latest: { rail: "deepseek", ok: true, metered: true, windows: [], note: "metered" } }],
   );
-  assert.equal(gauge(map), "claude 13/<91,4d> │ codex <74,2h>/41 │ ag-argon –/62");
+  assert.equal(gauge(map), "claude 13/<91,4d> │ codex <74,2h>/41 │ ag-gemini 62/62");
 });
 
 test("a maxed rail goes last however high its figure", () => {
-  const cfg = cfgNaming(["claude", "codex", "antigravity-3p", "antigravity-argon"]);
+  const cfg = cfgNaming(["claude", "antigravity-3p"]);
   const map = readings(
     ["claude", ok(good("claude", [session(20), weekly(10)]))],
-    ["codex", ok(good("codex", [session(74), weekly(41)]))],
     ["antigravity-3p", ok(good("antigravity-3p", [session(0), weekly(100)]))],
-    ["antigravity-argon", ok(good("antigravity-argon", [weekly(100)]))],
   );
-  // Both pools are at 100%, which is the most-used key and would put them first. They
-  // are the least useful instead: nothing can be sent to either for days. The tie
-  // between them still follows the fixed order.
-  assert.equal(gauge(map, cfg), "codex 74/41 │ claude 20/10 │ ag-3p x/<100> │ ag-argon –/<100>");
+  // The pool is at 100%, which is the most-used key and would put it first. It
+  // is the least useful instead: nothing can be sent there for days.
+  assert.equal(gauge(map, cfg), "claude 20/10 │ ag-3p x/<100>");
 });
 
 test("a spent rail sorts after a rail with no number at all", () => {
@@ -183,19 +176,16 @@ test("ties keep the fixed order whatever order the entries arrive in", () => {
     "codex",
     "antigravity-3p",
     "antigravity-gemini",
-    "antigravity-argon",
   ]);
   const entries: Array<[Rail, RailReadings]> = [
     ["claude", ok(good("claude", [session(50)]))],
     ["codex", ok(good("codex", [session(50)]))],
     ["antigravity-3p", ok(good("antigravity-3p", [session(50)]))],
     ["antigravity-gemini", ok(good("antigravity-gemini", [session(50)]))],
-    // Argon has no session budget, so its peak is the week's 50.
-    ["antigravity-argon", ok(good("antigravity-argon", [weekly(50)]))],
   ];
   // Every one of them carries a week it did not report, so the slot is `?`; the
-  // peak is what ties, and Argon's is the only week it has.
-  const expected = "claude 50/? │ codex 50/? │ ag-3p 50/? │ ag-gemini 50/? │ ag-argon –/50";
+  // session figure is what ties.
+  const expected = "claude 50/? │ codex 50/? │ ag-3p 50/? │ ag-gemini 50/?";
   assert.equal(gauge(readings(...entries), cfg), expected);
   assert.equal(gauge(readings(...[...entries].reverse()), cfg), expected);
 });
@@ -309,29 +299,22 @@ test("one tight window with no reset makes the whole budget's reset unknown", ()
   assert.equal(gauge(map, cfg), "claude 0/<95>");
 });
 
-test("a budget the rail does not carry reads as absent, one it did not report as unknown", () => {
-  const cfg = cfgNaming(["codex", "antigravity-argon"]);
-  const map = readings(
-    ["codex", ok(good("codex", [weekly(41)]))],
-    ["antigravity-argon", ok(good("antigravity-argon", [weekly(62)]))],
-  );
-  assert.equal(gauge(map, cfg), "ag-argon –/62 │ codex ?/41");
+test("a budget the rail did not report reads as unknown", () => {
+  const cfg = cfgNaming(["codex"]);
+  const map = readings(["codex", ok(good("codex", [weekly(41)]))]);
+  assert.equal(gauge(map, cfg), "codex ?/41");
 });
 
-test("a spent week switches the session slot off and leaves every other slot alone", () => {
-  const cfg = cfgNaming(["antigravity-3p", "antigravity-argon"]);
-  const map = readings(
-    [
-      "antigravity-3p",
-      ok(good("antigravity-3p", [session(0, NOW + 5 * HOUR), weekly(100, NOW + 5 * DAY)])),
-    ],
-    // Argon's week is spent too, and a spent week is all it ever has.
-    ["antigravity-argon", ok(good("antigravity-argon", [weekly(100, NOW + 5 * DAY)]))],
-  );
+test("a spent week switches the session slot off", () => {
+  const cfg = cfgNaming(["antigravity-3p"]);
+  const map = readings([
+    "antigravity-3p",
+    ok(good("antigravity-3p", [session(0, NOW + 5 * HOUR), weekly(100, NOW + 5 * DAY)])),
+  ]);
   // The vendor turns the 5-hour limit off once a weekly pool is spent and keeps
   // reporting the 5-hour window at 0%, which would read as the roomiest figure
-  // on the account. Argon has no session budget to turn off, so it keeps `–`.
-  assert.equal(gauge(map, cfg), "ag-3p x/<100,5d> │ ag-argon –/<100,5d>");
+  // on the account.
+  assert.equal(gauge(map, cfg), "ag-3p x/<100,5d>");
 });
 
 test("the session slot is drawn until a pool reaches the vendor's own cap", () => {
@@ -400,30 +383,27 @@ test("a tie between a stale rail and a fresh one keeps the fixed order", () => {
   assert.equal(gauge(map, cfg), "codex 95/97? │ ag-3p <97>/51");
 });
 
-test("a stale rail's absent budget stays absent, and one it never reported stays unknown", () => {
-  const cfg = cfgNaming(["codex", "antigravity-argon"]);
-  const map = readings(
-    ["codex", { latest: failed("codex"), lastGood: good("codex", [weekly(41)]) }],
-    [
-      "antigravity-argon",
-      { latest: failed("antigravity-argon"), lastGood: good("antigravity-argon", [weekly(62)]) },
-    ],
-  );
-  // Argon has no session budget, so `–`; codex carries one and did not report
-  // it, so `?`. Both rails still end in the stale marker.
-  assert.equal(gauge(map, cfg), "ag-argon –/62? │ codex ?/41?");
+test("a stale rail's unreported budget stays unknown", () => {
+  const cfg = cfgNaming(["codex"]);
+  const map = readings([
+    "codex",
+    { latest: failed("codex"), lastGood: good("codex", [weekly(41)]) },
+  ]);
+  // Codex carries a session budget and did not report it, so `?`. The rail still
+  // ends in the stale marker.
+  assert.equal(gauge(map, cfg), "codex ?/41?");
 });
 
 test("a rail with no reading at all shows a bare label and sorts last", () => {
   // The unread rail is *first* in the fixed order, so a peak that treated "no
   // number" as zero would tie here and put `claude` first: only reading it as a
   // missing number sorts it after a rail that really is at 0%.
-  const cfg = cfgNaming(["claude", "antigravity-argon"]);
+  const cfg = cfgNaming(["claude", "antigravity-gemini"]);
   const map = readings(
     ["claude", { latest: failed("claude") }],
-    ["antigravity-argon", ok(good("antigravity-argon", [weekly(0)]))],
+    ["antigravity-gemini", ok(good("antigravity-gemini", [session(0), weekly(0)]))],
   );
-  assert.equal(gauge(map, cfg), "ag-argon –/0 │ claude ?");
+  assert.equal(gauge(map, cfg), "ag-gemini 0/0 │ claude ?");
 });
 
 test("a rail whose every budget is unreported also sorts last", () => {
@@ -457,11 +437,11 @@ test("the tie order does not depend on the order the entries arrive in", () => {
     session: { kind: "used", used: 50, resetInMs: undefined },
     weekly: { kind: "unreported" },
   });
-  const fixed: VendorRail[] = ["claude", "codex", "antigravity-3p", "antigravity-gemini", "antigravity-argon"];
-  const expected = "claude 50/? │ codex 50/? │ ag-3p 50/? │ ag-gemini 50/? │ ag-argon 50/?";
+  const fixed: VendorRail[] = ["claude", "codex", "antigravity-3p", "antigravity-gemini"];
+  const expected = "claude 50/? │ codex 50/? │ ag-3p 50/? │ ag-gemini 50/?";
   assert.equal(renderRailGauge(fixed.map(entry), WARN), expected);
   assert.equal(renderRailGauge([...fixed].reverse().map(entry), WARN), expected);
-  const shuffled: VendorRail[] = ["antigravity-gemini", "claude", "antigravity-argon", "codex", "antigravity-3p"];
+  const shuffled: VendorRail[] = ["antigravity-gemini", "claude", "codex", "antigravity-3p"];
   assert.equal(renderRailGauge(shuffled.map(entry), WARN), expected);
 });
 
@@ -551,11 +531,11 @@ test("every character outside a tight slot is dim, merged into one run per tone 
   const map = readings(
     ["claude", ok(good("claude", [session(13), weekly(91, NOW + 4 * DAY)]))],
     ["codex", ok(good("codex", [session(74, NOW + 2 * HOUR), weekly(41)]))],
-    ["antigravity-argon", ok(good("antigravity-argon", [weekly(62)]))],
+    ["antigravity-gemini", ok(good("antigravity-gemini", [session(62), weekly(62)]))],
   );
   assert.equal(
     gauge(map, EXAMPLE_CFG, TAGGED),
-    "(claude 13/)<91,4d>( │ codex )<74,2h>(/41 │ ag-argon –/62)",
+    "(claude 13/)<91,4d>( │ codex )<74,2h>(/41 │ ag-gemini 62/62)",
   );
 });
 

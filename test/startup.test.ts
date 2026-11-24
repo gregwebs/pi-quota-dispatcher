@@ -182,8 +182,9 @@ const SNIPPET_FILES: AgentFile[] = [
   { kind: "agent", name: "reviewer", file: "/a/reviewer.md", model: "openai-codex/gpt-6-astra" },
   { kind: "agent", name: "writer", file: "/a/writer.md", model: "anthropic/claude-sonnet" },
   { kind: "agent", name: "rest", file: "/a/rest.md", model: "deepseek/deepseek-flash" },
-  // One account, three pools: the snippet has to name a rail that is not the
-  // model's provider, and has to tell the two Gemini pools apart.
+  // One account, two pools: the snippet has to name a rail that is not the
+  // model's provider, and the retired Argon model now registers on the Gemini
+  // pool it draws from.
   { kind: "agent", name: "argon", file: "/a/argon.md", model: "antigravity/gemini-4-argon" },
   { kind: "agent", name: "flash", file: "/a/flash.md", model: "antigravity/gemini-4-7-flash" },
   { kind: "agent", name: "proxy", file: "/a/proxy.md", model: "antigravity/claude-opus-5-5" },
@@ -206,7 +207,7 @@ test("agentTableSnippet registers each rail once and names only models in the ro
     // Two names for the same rail; both must derive it.
     "anthropic/claude-sonnet": { rail: "claude" },
     "deepseek/deepseek-flash": { rail: "deepseek" },
-    "antigravity/gemini-4-argon": { rail: "antigravity-argon" },
+    "antigravity/gemini-4-argon": { rail: "antigravity-gemini" },
     "antigravity/gemini-4-7-flash": { rail: "antigravity-gemini" },
     // Two routes on one pool register it once, by model.
     "antigravity/claude-opus-5-5": { rail: "antigravity-3p" },
@@ -223,23 +224,25 @@ test("agentTableSnippet registers each rail once and names only models in the ro
   });
 });
 
-test("the snippet tells the two Gemini pools apart and reuses one registration per model", () => {
-  // Argon's models start with `gemini-`, so a snippet that only knew the general
-  // prefix would register the Argon pool as the Gemini one — a wrong rail that
-  // the paste-ready fragment would then carry into the config.
+test("the snippet registers each Antigravity pool and reuses one registration per model", () => {
+  // The retired Argon model's id still starts with `gemini-`, so it registers on
+  // the Gemini pool beside the other Gemini models, while the proxied Claude and
+  // GPT models register on the third-party pool.
   const files: AgentFile[] = [
     { kind: "agent", name: "one", file: "/a/one.md", model: "antigravity/gemini-4-argon" },
     { kind: "agent", name: "two", file: "/a/two.md", model: "antigravity/gemini-4-argon" },
     { kind: "agent", name: "three", file: "/a/three.md", model: "antigravity/gemini-4-7-pro" },
     { kind: "agent", name: "four", file: "/a/four.md", model: "antigravity/gpt-6-codex" },
+    { kind: "agent", name: "five", file: "/a/five.md", model: "antigravity/claude-opus-5-5" },
   ];
   const { models, agents } = JSON.parse(agentTableSnippet(files).join("\n"));
   assert.deepEqual(models, {
-    "antigravity/gemini-4-argon": { rail: "antigravity-argon" },
+    "antigravity/gemini-4-argon": { rail: "antigravity-gemini" },
     "antigravity/gemini-4-7-pro": { rail: "antigravity-gemini" },
     "antigravity/gpt-6-codex": { rail: "antigravity-3p" },
+    "antigravity/claude-opus-5-5": { rail: "antigravity-3p" },
   });
-  assert.deepEqual(Object.keys(agents), ["one", "two", "three", "four"]);
+  assert.deepEqual(Object.keys(agents), ["one", "two", "three", "four", "five"]);
 });
 
 test("agentTableSnippet drops a file with no model, an unknown prefix, or an unusable name", () => {

@@ -31,7 +31,7 @@ const NOW = 1_730_123_456_789;
 
 /** One `retrieveUserQuotaSummary` body, in the vendor's own shape. */
 function quotaBody(options: {
-  argon?: boolean;
+  gemini?: boolean;
   geminiWeekly?: number;
   geminiSession?: number;
   threePartyWeekly?: number;
@@ -47,13 +47,17 @@ function quotaBody(options: {
   });
   return {
     groups: [
-      {
-        displayName: "Gemini Models",
-        buckets: [
-          bucket("gemini-weekly", "weekly", options.geminiWeekly ?? 0.88, weekly),
-          bucket("gemini-5h", "5h", options.geminiSession ?? 0.58, session),
-        ],
-      },
+      ...(options.gemini === false
+        ? []
+        : [
+            {
+              displayName: "Gemini Models",
+              buckets: [
+                bucket("gemini-weekly", "weekly", options.geminiWeekly ?? 0.88, weekly),
+                bucket("gemini-5h", "5h", options.geminiSession ?? 0.58, session),
+              ],
+            },
+          ]),
       {
         displayName: "Claude and GPT models",
         buckets: [
@@ -61,14 +65,6 @@ function quotaBody(options: {
           bucket("3p-5h", "5h", options.threePartySession ?? 1, session),
         ],
       },
-      ...(options.argon === false
-        ? []
-        : [
-            {
-              displayName: "Gemini 4 Argon",
-              buckets: [bucket("gemini-argon-wtu-weekly", "weekly", 1, weekly)],
-            },
-          ]),
     ],
   };
 }
@@ -252,7 +248,7 @@ function pool(readings: RailReadings) {
 
 test("a missing or unreadable auth file is unavailable without a request", async (t) => {
   const missing = await fixture(t, null);
-  const missingReading = pool(await missing.dispatcher().railReadings("antigravity-argon", true));
+  const missingReading = pool(await missing.dispatcher().railReadings("antigravity-gemini", true));
   assert.equal(missingReading.ok === false ? missingReading.note : "", "no pi auth file");
   assert.equal(quotaCalls(missing.probe).length, 0);
 
@@ -276,7 +272,7 @@ test("an expired token on another profile's auth file is unavailable and is not 
         return "{}";
       },
     })
-    .railReadings("antigravity-argon", true);
+    .railReadings("antigravity-gemini", true);
   const latest = pool(readings);
   assert.equal(latest.ok, false);
   const note = latest.ok === false ? latest.note : "";
@@ -307,7 +303,7 @@ test("a usable token never invokes the resolver, even where one is wired", async
         return "{}";
       },
     })
-    .railReadings("antigravity-argon", true);
+    .railReadings("antigravity-gemini", true);
   assert.equal(resolverCalls, 0);
   assert.equal(quotaCalls(fx.probe).length, 1);
 });
@@ -326,7 +322,7 @@ test("a usable token never invokes the resolver, even where one is wired", async
 test("reading a credential leaves auth.json byte-for-byte unchanged", async (t) => {
   const unexpired = await fixture(t);
   const before = await readFile(unexpired.piAuthPath, "utf8");
-  assert.equal(pool(await unexpired.dispatcher().railReadings("antigravity-argon", true)).ok, true);
+  assert.equal(pool(await unexpired.dispatcher().railReadings("antigravity-3p", true)).ok, true);
   assert.equal(await readFile(unexpired.piAuthPath, "utf8"), before, "a usable token is read, not rewritten");
 
   // An expired token on another profile's file: the refresh this dispatcher may
@@ -349,18 +345,20 @@ test("reading a credential leaves auth.json byte-for-byte unchanged", async (t) 
 
 test("a pool the vendor omitted keeps its own last good reading", async (t) => {
   const fx = await fixture(t);
-  const first = await fx.dispatcher().railReadings("antigravity-argon", true);
+  const first = await fx.dispatcher().railReadings("antigravity-gemini", true);
   assert.equal(pool(first).ok, true);
-  // A second, forced read whose body carries only the other two pools: Argon's
-  // failure must not borrow a neighbour's numbers, and the neighbours must not
-  // lose theirs.
-  const second = await fx.dispatcher({ body: quotaBody({ argon: false }) }).railReadings("antigravity-argon", true);
+  // A second, forced read whose body carries only the other pool: Gemini's
+  // failure must not borrow its neighbour's numbers, and the neighbour must not
+  // lose its own.
+  const second = await fx.dispatcher({ body: quotaBody({ gemini: false }) }).railReadings("antigravity-gemini", true);
   assert.equal(pool(second).ok, false);
   assert.equal(second.lastGood?.ok, true);
   assert.deepEqual(second.lastGood?.raw, quotaBody());
-  const gemini = await fx.dispatcher({ body: quotaBody({ argon: false }) }).railReadings("antigravity-gemini", true);
-  assert.equal(pool(gemini).ok, true);
-  assert.equal(gemini.lastGood?.rail, "antigravity-gemini");
+  const threeParty = await fx
+    .dispatcher({ body: quotaBody({ gemini: false }) })
+    .railReadings("antigravity-3p", true);
+  assert.equal(pool(threeParty).ok, true);
+  assert.equal(threeParty.lastGood?.rail, "antigravity-3p");
 });
 
 // ---------------------------------------------------------------- default path

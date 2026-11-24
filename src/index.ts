@@ -415,7 +415,6 @@ function freshBudget(
   budget: Budget,
   context: { cfg: DispatcherConfig; now: number },
 ): BudgetGauge {
-  if (!carries(reading.rail, budget)) return { kind: "uncarried" };
   if (budget === "session" && weekSpent(reading)) return { kind: "disabled" };
   const used = budgetUsed(reading, budget);
   if (used === undefined) return { kind: "unreported" };
@@ -456,7 +455,6 @@ function latestResetIn(windows: readonly RailWindow[], now: number): number | un
  * argue with it.
  */
 function staleBudget(reading: GoodReading, budget: Budget): StaleBudgetGauge {
-  if (!carries(reading.rail, budget)) return { kind: "uncarried" };
   // The week the last good reading saw was spent, and the vendor's switch-off
   // came with it: a stale 0% session is as misleading as a fresh one.
   if (budget === "session" && weekSpent(reading)) return { kind: "disabled" };
@@ -715,11 +713,11 @@ export function decide(
       // than relieving anything. This is what stops an agent being moved onto
       // the very rail another agent was moved off in the same pass.
       //
-      // Only a budget the destination carries can be tight: a pool with no cap
-      // on `spare` (Argon has no session cap; a metered rail has neither) cannot
-      // be blocked there, so its effective usage of 0 is never compared against
-      // `spareThreshold` — otherwise a configured `sessionSwitchAt: 0` would
-      // reject every such destination for a cap it does not have.
+      // Only a budget the destination carries can be tight: a metered rail
+      // carries neither and so cannot be blocked there, so its effective usage
+      // of 0 is never compared against `spareThreshold` — otherwise a configured
+      // `sessionSwitchAt: 0` would reject every such destination for a cap it
+      // does not have.
       if (carries(state.rail, spare)) {
         const altSpare = budgetUsed(state, spare)!;
         if (isTight(state, spare, spareThreshold)) {
@@ -2350,10 +2348,10 @@ export function createDispatcher(
   }
 
   /**
-   * The one vendor request that answers for all three Antigravity pools. The
+   * The one vendor request that answers for both Antigravity pools. The
    * credential is acquired first — including pi's delegated refresh, which is
    * why it is not the read's job — and the read is handed the result so a
-   * credential failure is one group-wide failure rather than three.
+   * credential failure is one group-wide failure rather than two.
    */
   async function fetchAntigravity(): Promise<AntigravityReadings> {
     return railRead.antigravity(await antigravity.read());
@@ -2376,7 +2374,7 @@ export function createDispatcher(
    * file — get different keys and therefore never see each other's readings,
    * which is the one thing a shared cache must not do.
    *
-   * The three Antigravity pools resolve to one key, which is the credential the
+   * The two Antigravity pools resolve to one key, which is the credential the
    * group is fetched under — not a per-pool key, because they are not per-pool
    * credentials.
    *
@@ -2415,7 +2413,7 @@ export function createDispatcher(
   /**
    * The grouped Antigravity read, as the store asks for it.
    *
-   * A throw becomes one failure for all three pools rather than propagating: the
+   * A throw becomes one failure for both pools rather than propagating: the
    * store re-raises a body that threw, and a caller asking for a quota reading
    * should get a reading that failed, not an exception. The note is fixed because
    * whatever was thrown may quote the response.
@@ -2449,7 +2447,7 @@ export function createDispatcher(
 
   async function allReadings(force = false): Promise<Map<Rail, RailReadings>> {
     // Every rail is asked for, in canonical order, and the grouped store is what
-    // turns the three Antigravity asks into one request. DeepSeek is unpersisted
+    // turns the two Antigravity asks into one request. DeepSeek is unpersisted
     // and unfetched, so it costs nothing to include.
     const entries = await Promise.all(RAILS.map((rail) => railReadings(rail, force)));
     return new Map(entries.map((r) => [r.latest.rail, r]));
@@ -2468,30 +2466,29 @@ export function createDispatcher(
   }
 
   /**
-   * The three Antigravity pools as one consistent picture.
+   * The Antigravity pools as one consistent picture.
    *
    * Asking the store for each pool on its own is not that picture: a pool with no
-   * entry makes the store fetch the group — and that fetch answers for all three
-   * — so a sibling whose `known` call resolved first would report the state
-   * before it. Warming the group once and then reading all three back is what
-   * keeps one generation's three pool readings from disagreeing about which read
-   * they came from.
+   * entry makes the store fetch the group — and that fetch answers for both — so
+   * a sibling whose `known` call resolved first would report the state before
+   * it. Warming the group once and then reading both back is what keeps one
+   * generation's two pool readings from disagreeing about which read they came
+   * from.
    */
   async function knownAntigravityReadings(): Promise<Record<AntigravityRail, VendorRailReadings>> {
     const held = await Promise.all(
       ANTIGRAVITY_RAILS.map((rail) => readings.known(rail, credentialFor(rail))),
     );
-    const [argon, gemini, threeParty] = held;
-    if (argon !== undefined && gemini !== undefined && threeParty !== undefined) {
-      return { "antigravity-argon": argon, "antigravity-gemini": gemini, "antigravity-3p": threeParty };
+    const [gemini, threeParty] = held;
+    if (gemini !== undefined && threeParty !== undefined) {
+      return { "antigravity-gemini": gemini, "antigravity-3p": threeParty };
     }
-    // Any pool reaches the same grouped read, so one is enough to warm all three.
-    await vendorRailReadings("antigravity-argon", false);
-    const [warmArgon, warmGemini, warmThreeParty] = await Promise.all(
+    // Either pool reaches the same grouped read, so one is enough to warm both.
+    await vendorRailReadings("antigravity-gemini", false);
+    const [warmGemini, warmThreeParty] = await Promise.all(
       ANTIGRAVITY_RAILS.map((rail) => knownVendorRailReadings(rail)),
     );
     return {
-      "antigravity-argon": warmArgon,
       "antigravity-gemini": warmGemini,
       "antigravity-3p": warmThreeParty,
     };
@@ -2500,7 +2497,7 @@ export function createDispatcher(
   async function knownReadings(): Promise<KnownReadings> {
     // Every capped rail in flight together: a sequential walk would make
     // generation wait out one vendor latency per rail, and the store's grouped
-    // read is what turns the three pool asks into one request.
+    // read is what turns the two pool asks into one request.
     const [claude, codex, antigravity] = await Promise.all([
       knownVendorRailReadings("claude"),
       knownVendorRailReadings("codex"),

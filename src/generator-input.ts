@@ -34,7 +34,6 @@ import {
 export interface KnownReadings {
   readonly claude: VendorRailReadings;
   readonly codex: VendorRailReadings;
-  readonly "antigravity-argon": VendorRailReadings;
   readonly "antigravity-gemini": VendorRailReadings;
   readonly "antigravity-3p": VendorRailReadings;
   readonly deepseek: MeteredRailReadings;
@@ -131,23 +130,20 @@ function projectVendorRail(readings: VendorRailReadings): VendorRailProjection {
 export function generatorInput(known: KnownReadings): GeneratorInputOutcome {
   const claude = projectVendorRail(known.claude);
   const codex = projectVendorRail(known.codex);
-  const argon = projectVendorRail(known["antigravity-argon"]);
   const gemini = projectVendorRail(known["antigravity-gemini"]);
   const threeParty = projectVendorRail(known["antigravity-3p"]);
   // Canonical order, and the order the refusal names a failing rail in: a
-  // generator reads one document, so the five capped rails are one list rather
-  // than five independent chances to be the one that is missing.
+  // generator reads one document, so the four capped rails are one list rather
+  // than four independent chances to be the one that is missing.
   const capped: ReadonlyArray<readonly [VendorRail, VendorRailProjection]> = [
     ["claude", claude],
     ["codex", codex],
-    ["antigravity-argon", argon],
     ["antigravity-gemini", gemini],
     ["antigravity-3p", threeParty],
   ];
   if (
     claude.kind === "no-reading" ||
     codex.kind === "no-reading" ||
-    argon.kind === "no-reading" ||
     gemini.kind === "no-reading" ||
     threeParty.kind === "no-reading"
   ) {
@@ -172,7 +168,6 @@ export function generatorInput(known: KnownReadings): GeneratorInputOutcome {
       rails: {
         claude: claude.reading,
         codex: codex.reading,
-        "antigravity-argon": argon.reading,
         "antigravity-gemini": gemini.reading,
         "antigravity-3p": threeParty.reading,
         deepseek: { metered: true, windows: [], raw: null },

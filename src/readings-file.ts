@@ -49,6 +49,7 @@ import { open, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { errnoIs, lockPathFor, withLockPath, type FileWritePacing, type LockAttempt } from "./agent-file.ts";
 import { READINGS_FILE_NAME } from "./config.ts";
+import { jsonObject } from "./json.ts";
 import { ANTIGRAVITY_RAILS, isAntigravityRail, isRail, type AntigravityRail } from "./rail.ts";
 import {
   decodeReading,
@@ -63,17 +64,21 @@ import {
  * The version this module writes.
  *
  * 2 added the refresh gates and the sticky halt beside the entries. 3 widened
- * the accepted rail vocabulary to the three Antigravity pools, which is a change
- * to what an entry's `rail` may be — the one field whose acceptance the version
+ * the accepted rail vocabulary to the Antigravity pools, which is a change to
+ * what an entry's `rail` may be — the one field whose acceptance the version
  * answers for.
  *
  * A version-2 document is still *read*, and that is deliberate: it can only hold
  * Claude and Codex entries, whose shape did not change, so accepting it costs
  * nothing and keeping its readings — and, far more importantly, its refresh
  * gates and sticky halt — through the upgrade is what stops an upgrade from
- * forgetting that a ping already spent money. Writes are always version 3. Any
- * other version is an unknown shape this writer cannot promise to preserve, so
- * it faults the whole file and the next write repairs it.
+ * forgetting that a ping already spent money. Writes are always version 3. A
+ * version-3 document may also hold an entry for the retired Argon pool, whose
+ * writer legitimately recorded it; that entry is dropped on read rather than
+ * faulting the file, because a file that elsewhere still holds a cooldown is not
+ * a document nobody wrote. Any other version is an unknown shape this writer
+ * cannot promise to preserve, so it faults the whole file and the next write
+ * repairs it. See `docs/adr/0026-the-argon-pool-is-retired.md`.
  */
 export const READINGS_FILE_VERSION = 3;
 
@@ -193,7 +198,7 @@ export interface GatePatch {
  * A rail whose readings come from a request of its own.
  *
  * The Antigravity pools are deliberately not in this set: one
- * `retrieveUserQuotaSummary` answers for all three, so a per-pool fetch can be
+ * `retrieveUserQuotaSummary` answers for both, so a per-pool fetch can be
  * neither locked nor published on its own — see `readAntigravity`.
  */
 export type SingleFetchRail = Exclude<VendorRail, AntigravityRail>;
@@ -203,7 +208,7 @@ export type SingleFetchRail = Exclude<VendorRail, AntigravityRail>;
  *
  * `read` is the policy's path — a reading fresh within its TTL, a fetch when it
  * has lapsed — and `known` is the generator path, which is deliberately
- * age-blind (see ADR 0015). `readAntigravity` is `read` for the three pools one
+ * age-blind (see ADR 0015). `readAntigravity` is `read` for the two pools one
  * vendor call answers, so the group is fetched, locked and published once.
  * `warnings` is a rendering, not state: the report is where a corrupt file
  * becomes visible, and nowhere else is allowed to refuse work over one.
@@ -216,13 +221,13 @@ export interface SharedReadings {
     opts: { ttlMs: number; force?: boolean; fetch: () => Promise<VendorReading> },
   ): Promise<VendorRailReadings>;
   /**
-   * One Antigravity pool's readings, from a fetch that answers for all three.
+   * One Antigravity pool's readings, from a fetch that answers for both.
    *
    * The selected rail is what the caller asked about; the store fetches, locks
    * and publishes the whole group, and every other caller wanting a pool of the
-   * same credential joins that same work. A group whose earlier three entries are
-   * all present and fresh is a cache hit for all three, so a caller wanting a
-   * pool the group already holds costs no request at all.
+   * same credential joins that same work. A group whose earlier entries are both
+   * present and fresh is a cache hit for both, so a caller wanting a pool the
+   * group already holds costs no request at all.
    */
   readAntigravity(
     rail: AntigravityRail,
@@ -258,9 +263,9 @@ export interface SharedReadingsDeps {
  * One fetch's answer for every pool it reports on, correlated with the rail each
  * reading is filed under.
  *
- * The single-rail source has one member; Antigravity has three. Every member is
- * present or the source failed as a whole — a fetch that answered for only some
- * of the pools it was asked for is not a source, and no member is ever
+ * The single-rail source has one member; Antigravity has both pools. Every
+ * member is present or the source failed as a whole — a fetch that answered for
+ * only some of the pools it was asked for is not a source, and no member is ever
  * fabricated from a neighbour's numbers.
  */
 type SourceReadings =
@@ -271,9 +276,9 @@ type SourceReadings =
  * One Antigravity pool's cached entry, correlated with the rail it is filed
  * under.
  *
- * The correlation is what keeps a group's three results from being handed out
- * as one indistinguishable bag: a caller asking about `antigravity-gemini` gets
- * a reading the store knows is Gemini's.
+ * The correlation is what keeps a group's results from being handed out as one
+ * indistinguishable bag: a caller asking about `antigravity-gemini` gets a
+ * reading the store knows is Gemini's.
  */
 type AntigravityCachedReadings = {
   readonly [R in AntigravityRail]: CachedReadings & {
@@ -281,7 +286,7 @@ type AntigravityCachedReadings = {
   };
 };
 
-/** What one operation asks the vendor: one reading, or all three pools at once. */
+/** What one operation asks the vendor: one reading, or the pool group at once. */
 type ReadSource =
   | { readonly kind: "single"; readonly rail: SingleFetchRail; readonly fetch: () => Promise<VendorReading> }
   | { readonly kind: "antigravity"; readonly fetch: () => Promise<AntigravityReadings> };
@@ -370,12 +375,28 @@ function entryFault(rail: unknown, index: number): string {
 }
 
 /**
+ * The rail a version-3 document may hold an entry for although this reader no
+ * longer knows it: the retired Argon pool.
+ *
+ * Its writer was entitled to file that entry, so it is dropped rather than
+ * faulting the whole document. Compare the rule that a version-2 document may not
+ * name a pool at all: there the entry is a hand edit, because that version's
+ * writer could not have produced one. Nothing is inferred from the retired
+ * entry: the quota it describes is one no route can spend.
+ */
+function retiredRail(rail: unknown, version: ReadableVersion): boolean {
+  return version === 3 && rail === "antigravity-argon";
+}
+
+/**
  * The rails one version of the document may hold an entry for.
  *
  * A version-2 document was written before Antigravity existed, so a Claude or
  * Codex entry is all it can legitimately carry and anything else in it is a
  * hand edit rather than an older writer's work. Version 3 added the pools, and
  * still refuses the metered rail: it is never read and so has nothing to cache.
+ * The retired Argon pool is accepted by version 3 and filtered out by `decode`
+ * before this is consulted.
  */
 function readableRail(rail: unknown, version: ReadableVersion): rail is VendorRail {
   if (!isRail(rail) || rail === "deepseek") return false;
@@ -562,6 +583,7 @@ function decode(text: string): Decoded {
   if (!Array.isArray(doc.entries)) return { fault: "its entries are not a list" };
   const entries: FileEntry[] = [];
   for (const [index, raw] of doc.entries.entries()) {
+    if (retiredRail(jsonObject(raw)?.rail, version)) continue;
     const result = fileEntry(raw, index, version);
     if ("fault" in result) return result;
     entries.push(result.entry);
@@ -728,9 +750,9 @@ function sameEntry(a: CachedReadings | undefined, b: CachedReadings | undefined)
 /**
  * The key one fetch is locked and joined under.
  *
- * A single-rail read keeps its per-rail key. Antigravity's three pools share one
- * key, which is what makes two processes — and two rails of one process — agree
- * to make one request. The group key lives in its own domain rather than reusing
+ * A single-rail read keeps its per-rail key. Antigravity's pools share one key,
+ * which is what makes two processes — and two rails of one process — agree to
+ * make one request. The group key lives in its own domain rather than reusing
  * any member's: `antigravity` is not a rail name, so no `storeKey` can collide
  * with it, and Codex — which is configured from the same `auth.json` — is not
  * swept into the group merely by sharing a credential path.
@@ -772,12 +794,11 @@ function correlated<R extends AntigravityRail>(
   return entry as CachedReadings & { readonly latest: VendorReading & { readonly rail: R } };
 }
 
-/** A group of three entries, in the rails' canonical order. */
+/** The group's entries, in the rails' canonical order. */
 function antigravityGroup(
   entries: Readonly<Record<AntigravityRail, CachedReadings>>,
 ): AntigravityCachedReadings {
   return {
-    "antigravity-argon": correlated("antigravity-argon", entries["antigravity-argon"]),
     "antigravity-gemini": correlated("antigravity-gemini", entries["antigravity-gemini"]),
     "antigravity-3p": correlated("antigravity-3p", entries["antigravity-3p"]),
   };
@@ -787,8 +808,8 @@ function antigravityGroup(
  * The source's answer, from the entry each of its members settled on.
  *
  * Every member must be present: a single fetch answers for its one rail, and an
- * Antigravity fetch answers for all three pools whatever the vendor omitted —
- * the omitted pool's `latest` is its failure. An absent member is therefore a bug
+ * Antigravity fetch answers for both pools whatever the vendor omitted — the
+ * omitted pool's `latest` is its failure. An absent member is therefore a bug
  * here, never a reading this module invents.
  */
 function sourceReadings(
@@ -800,14 +821,13 @@ function sourceReadings(
     if (entry === undefined) throw new Error(`no reading settled for ${source.rail}`);
     return { kind: "single", rail: source.rail, entry };
   }
-  const [argon, gemini, threeParty] = settled;
-  if (argon === undefined || gemini === undefined || threeParty === undefined) {
-    throw new Error("the antigravity group settled without all three pools");
+  const [gemini, threeParty] = settled;
+  if (gemini === undefined || threeParty === undefined) {
+    throw new Error("the antigravity group settled without both pools");
   }
   return {
     kind: "antigravity",
     entries: antigravityGroup({
-      "antigravity-argon": argon,
       "antigravity-gemini": gemini,
       "antigravity-3p": threeParty,
     }),
@@ -979,8 +999,8 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
    * a concurrent read has moved it.
    *
    * One `at` stamps the whole answer, because it is one vendor answer: the TTL
-   * counts from when the group was stored, and a group whose members carried
-   * three different stamps would be three half-groups pretending to be one read.
+   * counts from when the group was stored, and a group whose members carried two
+   * different stamps would be half-groups pretending to be one read.
    * Each member's `lastGood` is still its own, computed from that member's own
    * prior entry — never a neighbour's.
    */
@@ -1036,8 +1056,8 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
    * `fetchAndStore` publish the same readings in its overlay.
    *
    * A group is written in **one** replace, so a reader — or a crash — never sees
-   * two of three pools published. Everything unrelated in the document, the
-   * gates and the sticky halt included, is carried forward untouched.
+   * one pool published without its sibling. Everything unrelated in the document,
+   * the gates and the sticky halt included, is carried forward untouched.
    *
    * A lock that cannot be taken in time skips the write and nothing else — the
    * readings are already in the overlay, which is the copy this process answers
@@ -1232,7 +1252,7 @@ export function createSharedReadings(deps: SharedReadingsDeps): SharedReadings {
    *
    * The record is keyed by the *source*, not by the rail that asked: every caller
    * wanting any pool of one Antigravity credential joins one operation, and each
-   * projects its own rail out of the answer afterwards. That is what makes three
+   * projects its own rail out of the answer afterwards. That is what makes two
    * concurrent pool reads one request, both within this process and — through the
    * fetch lock the operation itself takes — across processes.
    */

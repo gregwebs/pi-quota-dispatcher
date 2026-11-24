@@ -119,8 +119,8 @@ async function fixture(
     join(agentDir, "auth.json"),
     JSON.stringify({
       "openai-codex": { access: "test-token", accountId: "acct-test" },
-      // The one credential all three Antigravity pools are read under, so a
-      // complete read of them is one request, not three.
+      // The one credential both Antigravity pools are read under, so a complete
+      // read of them is one request, not two.
       antigravity: { access: "test-token", expires: Date.now() + 3_600_000, projectId: "test-project" },
     }),
     "utf8",
@@ -149,8 +149,6 @@ interface RailReadings {
   claudeWeekly: number;
   codexSession: number;
   codexWeekly: number;
-  /** Antigravity's Argon pool: a week, and no session cap at all. */
-  argonWeekly: number;
   geminiSession: number;
   geminiWeekly: number;
   threePartySession: number;
@@ -162,15 +160,14 @@ interface RailReadings {
  * session at 90% is tight, codex session at 10% is more than `margin`
  * healthier and not tight on its week, so the claude-primary planner moves to
  * its codex alternate. Three requests only: claude, codex, and the one
- * Antigravity summary that answers for all three of its pools; deepseek is
- * metered and never fetched.
+ * Antigravity summary that answers for both of its pools; deepseek is metered
+ * and never fetched.
  */
 const DEFAULT_READINGS: RailReadings = {
   claudeSession: 90,
   claudeWeekly: 0,
   codexSession: 10,
   codexWeekly: 0,
-  argonWeekly: 0,
   geminiSession: 20,
   geminiWeekly: 0,
   threePartySession: 30,
@@ -201,9 +198,9 @@ const ANTIGRAVITY_WEEKLY_RESET = new Date(Date.now() + 6 * 24 * 60 * 60 * 1000).
 const ANTIGRAVITY_SESSION_RESET = new Date(Date.now() - 60 * 60 * 1000).toISOString();
 
 /**
- * One `retrieveUserQuotaSummary` body for those readings: three pools, told
- * apart by bucket id. The display names and the group order are deliberately not
- * the partition — the parser must not depend on either.
+ * One `retrieveUserQuotaSummary` body for those readings: two pools, told apart
+ * by bucket id. The display names and the group order are deliberately not the
+ * partition — the parser must not depend on either.
  */
 function antigravityBody(r: RailReadings): unknown {
   // The vendor reports what is left of a window, so a used percentage is a fraction.
@@ -229,11 +226,6 @@ function antigravityBody(r: RailReadings): unknown {
           bucket("3p-weekly", "weekly", r.threePartyWeekly, ANTIGRAVITY_WEEKLY_RESET),
           bucket("3p-5h", "5h", r.threePartySession, ANTIGRAVITY_SESSION_RESET),
         ],
-      },
-      {
-        // Last in the body: an ordering the partition must ignore.
-        displayName: "Gemini 4 Argon",
-        buckets: [bucket("gemini-argon-wtu-weekly", "weekly", r.argonWeekly, ANTIGRAVITY_WEEKLY_RESET)],
       },
     ],
   };
@@ -824,9 +816,9 @@ test("bootFrom wires pi's provider-token resolver into every dispatcher, and cal
       assert.equal(calls.length, 0, "a config form that boots must not refresh a credential");
       assert.ok(config.includes("config: built-in < global"), config);
 
-      // A usable token: all three pools read, and nothing consults the resolver.
+      // A usable token: both pools read, and nothing consults the resolver.
       const healthy = await run("refresh");
-      assert.ok(healthy.includes("antigravity-argon: gemini-argon-wtu-weekly 0%"), healthy);
+      assert.ok(healthy.includes("antigravity-gemini: gemini-weekly 0%, gemini-5h 20%"), healthy);
       assert.equal(calls.length, 0, "a usable token never refreshes anything");
 
       // Expired, so a read has something to consult a resolver about; the note it
@@ -838,7 +830,7 @@ test("bootFrom wires pi's provider-token resolver into every dispatcher, and cal
       assert.equal(calls.length, 0, "a config form reads no quota, so it refreshes nothing");
       const report = await run("refresh");
       assert.equal(calls.length, 0, "this profile's auth file is not pi's to refresh");
-      assert.ok(report.includes(`antigravity-argon: unavailable — antigravity token expired; ${WIRED}`), report);
+      assert.ok(report.includes(`antigravity-gemini: unavailable — antigravity token expired; ${WIRED}`), report);
       assert.ok(!report.includes(UNWIRED), `boot must have passed the resolver on: ${report}`);
 
       // Generation is the second place a dispatcher is built: it carries the
@@ -1217,7 +1209,7 @@ async function generateFixture(
     JSON.stringify({
       "openai-codex": { access: "test-token", accountId: "acct-test" },
       // Generation needs a successful reading for every quota-capped rail, and
-      // the three Antigravity pools are one credential and one request.
+      // the two Antigravity pools are one credential and one request.
       antigravity: { access: "test-token", expires: Date.now() + 3_600_000, projectId: "test-project" },
     }),
     "utf8",
@@ -1689,7 +1681,6 @@ test("a generator reading stdin receives every rail's reading in the documented 
   assert.equal(input.version, 1);
   assert.deepEqual(Object.keys(input.rails).sort(), [
     "antigravity-3p",
-    "antigravity-argon",
     "antigravity-gemini",
     "claude",
     "codex",
@@ -1723,19 +1714,12 @@ test("a generator reading stdin receives every rail's reading in the documented 
   assert.equal(codex.raw.rate_limit.primary_window.used_percent, 10);
   assert.ok(!("latestFailure" in codex));
 
-  // The three pools are one response partitioned by bucket id, so they share
-  // `readAt` and `raw` and differ only in the windows each owns. Argon carries
-  // a week and no session: the document must not invent a window for a cap that
-  // pool does not have.
-  const argon = input.rails["antigravity-argon"];
+  // The two pools are one response partitioned by bucket id, so they share
+  // `readAt` and `raw` and differ only in the windows each owns.
   const gemini = input.rails["antigravity-gemini"];
   const threeParty = input.rails["antigravity-3p"];
-  assert.equal(argon.ok, true);
   assert.equal(gemini.ok, true);
   assert.equal(threeParty.ok, true);
-  assert.deepEqual(argon.windows.map((w: any) => [w.label, w.used, w.budget]), [
-    ["gemini-argon-wtu-weekly", 0, "weekly"],
-  ]);
   assert.deepEqual(gemini.windows.map((w: any) => [w.label, w.used, w.budget]), [
     ["gemini-weekly", 0, "weekly"],
     ["gemini-5h", 20, "session"],
@@ -1744,19 +1728,17 @@ test("a generator reading stdin receives every rail's reading in the documented 
     ["3p-weekly", 0, "weekly"],
     ["3p-5h", 30, "session"],
   ]);
-  const poolReadAt = Date.parse(argon.readAt);
+  const poolReadAt = Date.parse(gemini.readAt);
   const poolAfter = Date.now();
-  assert.ok(before <= poolReadAt && poolReadAt <= poolAfter, `pool readAt ${argon.readAt} is not this run's`);
-  // One vendor answer, one instant: three stamps would be three answers.
-  assert.equal(gemini.readAt, argon.readAt);
-  assert.equal(threeParty.readAt, argon.readAt);
-  // Each pool carries the whole document — the same account-wide body three
-  // times over — not a per-pool excerpt.
-  assert.deepEqual(gemini.raw, argon.raw);
-  assert.deepEqual(threeParty.raw, argon.raw);
-  assert.deepEqual(Object.keys(argon.raw), ["groups"]);
+  assert.ok(before <= poolReadAt && poolReadAt <= poolAfter, `pool readAt ${gemini.readAt} is not this run's`);
+  // One vendor answer, one instant: two stamps would be two answers.
+  assert.equal(threeParty.readAt, gemini.readAt);
+  // Each pool carries the whole document — the same account-wide body twice
+  // over — not a per-pool excerpt.
+  assert.deepEqual(threeParty.raw, gemini.raw);
+  assert.deepEqual(Object.keys(gemini.raw), ["groups"]);
   // Every window keeps the vendor's own reset instant.
-  assert.equal(argon.windows[0].resetsAt, new Date(Date.parse(ANTIGRAVITY_WEEKLY_RESET)).toISOString());
+  assert.equal(gemini.windows[0].resetsAt, new Date(Date.parse(ANTIGRAVITY_WEEKLY_RESET)).toISOString());
   assert.equal(gemini.windows[1].resetsAt, new Date(Date.parse(ANTIGRAVITY_SESSION_RESET)).toISOString());
 });
 
@@ -2404,8 +2386,8 @@ test("refresh forces a re-fetch while the plain form reuses the cache", async ()
         }),
       };
     }
-    // The three pools are one request, so a complete read is three requests and
-    // a refresh is three more.
+    // The pools are one request, so a complete read is three requests and a
+    // refresh is three more.
     return { ok: true, status: 200, json: async () => antigravityBody(DEFAULT_READINGS) };
   }) as unknown as typeof fetch;
 
@@ -4334,7 +4316,6 @@ const ALL_RAILS_AGENTS = {
   },
   gemini: { primary: { model: "antigravity-gemini/gemini-4-pro", rail: "antigravity-gemini" } },
   third: { primary: { model: "antigravity-3p/claude-and-gpt", rail: "antigravity-3p" } },
-  argon: { primary: { model: "antigravity-claude/argon", rail: "antigravity-argon" } },
   coder: { primary: { model: "openai-codex/gpt-6-sol", rail: "codex" } },
 };
 
@@ -4345,7 +4326,7 @@ const ALL_RAILS_AGENTS = {
  * of this expected text rather than a separate assertion about the constant.
  */
 const ALL_RAILS_GAUGE =
-  "claude <90>/0 │ ag-3p 30,now/0,6d │ ag-gemini 20,now/0,6d │ codex 10,1h/0,5d │ ag-argon –/0,6d";
+  "claude <90>/0 │ ag-3p 30,now/0,6d │ ag-gemini 20,now/0,6d │ codex 10,1h/0,5d";
 
 test("the rail gauge is drawn at session start, most-used first", async () => {
   const fx = await fixture(MAX_POLL_MS, ALL_RAILS_AGENTS);

@@ -196,16 +196,15 @@ test("the README's stdin document example is the documented shape", async () => 
   assert.equal(doc.version, GENERATOR_INPUT_VERSION);
   assert.deepEqual(Object.keys(doc.rails).sort(), [
     "antigravity-3p",
-    "antigravity-argon",
     "antigravity-gemini",
     "claude",
     "codex",
     "deepseek",
   ]);
   assert.deepEqual(doc.rails.deepseek, { metered: true, windows: [], raw: null });
-  // Five capped rails, not two: the document a generator reads names every rail
+  // Four capped rails, not two: the document a generator reads names every rail
   // the policy can route on.
-  const capped = ["claude", "codex", "antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const;
+  const capped = ["claude", "codex", "antigravity-gemini", "antigravity-3p"] as const;
   for (const rail of capped) {
     assert.equal(doc.rails[rail].ok, true, rail);
     assert.ok(!Number.isNaN(Date.parse(doc.rails[rail].readAt)), `${rail}.readAt must be an ISO instant`);
@@ -246,27 +245,25 @@ test("the README's stdin document example is the documented shape", async () => 
     note: "HTTP 500 after 2 attempts",
   };
   const metered: MeteredReading = { rail: "deepseek", ok: true, windows: [], metered: true, note: "metered" };
-  // The three pools are one vendor body partitioned by bucket id, so the example
+  // The two pools are one vendor body partitioned by bucket id, so the example
   // must be readable as exactly that: parse each pool's own `raw` with the real
   // parser and keep only that pool's windows.
-  const poolGood = (rail: "antigravity-argon" | "antigravity-gemini" | "antigravity-3p"): GoodReading => ({
+  const poolGood = (rail: "antigravity-gemini" | "antigravity-3p"): GoodReading => ({
     rail,
     ok: true,
     readAt: Date.parse(doc.rails[rail].readAt),
     windows: parseAntigravityUsage(doc.rails[rail].raw)[rail],
     raw: doc.rails[rail].raw,
   });
-  const argonGood = poolGood("antigravity-argon");
   const geminiGood = poolGood("antigravity-gemini");
   const threePartyGood = poolGood("antigravity-3p");
-  // One response, three pools: the same document is carried on each, and the
+  // One response, two pools: the same document is carried on each, and the
   // example is wrong if they disagree.
-  assert.deepEqual(doc.rails["antigravity-argon"].raw, doc.rails["antigravity-3p"].raw);
-  assert.equal(doc.rails["antigravity-argon"].readAt, doc.rails["antigravity-gemini"].readAt);
+  assert.deepEqual(doc.rails["antigravity-gemini"].raw, doc.rails["antigravity-3p"].raw);
+  assert.equal(doc.rails["antigravity-gemini"].readAt, doc.rails["antigravity-3p"].readAt);
   const readings: KnownReadings = {
     claude: { latest: claudeFailure, lastGood: claudeGood },
     codex: { latest: codexGood, lastGood: codexGood },
-    "antigravity-argon": { latest: argonGood, lastGood: argonGood },
     "antigravity-gemini": { latest: geminiGood, lastGood: geminiGood },
     "antigravity-3p": { latest: threePartyGood, lastGood: threePartyGood },
     deepseek: { latest: metered },
@@ -286,7 +283,7 @@ test("the README's stdin document example is the documented shape", async () => 
   // window the parser never emits cannot survive. Claude's per-model weeks and
   // Codex's `limit_reached` reads are the two places `used` is the vendor's own
   // number rather than a fraction, and the prose above says so.
-  for (const rail of ["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const) {
+  for (const rail of ["antigravity-gemini", "antigravity-3p"] as const) {
     assert.deepEqual(doc.rails[rail].windows, outcome.input.rails[rail].windows, `${rail} windows`);
   }
   // Per rail, over every window: the same shapes the code emits, whatever their
@@ -299,12 +296,14 @@ test("the README's stdin document example is the documented shape", async () => 
       `${rail} window key sets`,
     );
   }
-  // Argon carries a week and no session, and the example says so rather than
-  // inventing a session window the pool has none of.
-  assert.deepEqual(
-    doc.rails["antigravity-argon"].windows.map((w: { budget?: string }) => w.budget),
-    ["weekly"],
-  );
+  // Every capped rail reports both of its budgets, and the example says so.
+  for (const rail of ["antigravity-gemini", "antigravity-3p"] as const) {
+    assert.deepEqual(
+      doc.rails[rail].windows.map((w: { budget?: string }) => w.budget).sort(),
+      ["session", "weekly"],
+      rail,
+    );
+  }
 });
 
 test("a plain valid replacement is accepted with no warnings", async () => {
@@ -472,14 +471,13 @@ test("the strict replacement accepts a generated layer that registers and routes
   // boot.
   const result = await replaceGlobal({
     models: {
-      "antigravity/gemini-4-argon": { rail: "antigravity-argon", thinking: "high" },
       "antigravity/gemini-3-pro": { rail: "antigravity-gemini" },
       "antigravity/claude-sonnet-5": { rail: "antigravity-3p", thinking: "low" },
     },
     agents: {
       planner: {
         primary: { model: "antigravity/gemini-3-pro" },
-        alternates: [{ model: "antigravity/gemini-4-argon" }, { model: "antigravity/claude-sonnet-5" }],
+        alternates: [{ model: "antigravity/claude-sonnet-5" }],
       },
     },
   });
@@ -488,7 +486,6 @@ test("the strict replacement accepts a generated layer that registers and routes
   const planner = result.loaded.config.agents[agentName("planner")];
   assert.equal(planner.primary.rail, "antigravity-gemini");
   assert.deepEqual(planner.alternates.map((c) => [c.model, c.rail]), [
-    ["antigravity/gemini-4-argon", "antigravity-argon"],
     ["antigravity/claude-sonnet-5", "antigravity-3p"],
   ]);
   // The rail is what the models table supplied, and its source says so; each
@@ -560,7 +557,6 @@ const READY_INPUT = {
   rails: {
     claude: { ok: true, readAt: "2024-01-01T00:00:00.000Z", windows: [], raw: {} },
     codex: { ok: true, readAt: "2024-01-01T00:00:00.000Z", windows: [], raw: {} },
-    "antigravity-argon": { ok: true, readAt: "2024-01-01T00:00:00.000Z", windows: [], raw: {} },
     "antigravity-gemini": { ok: true, readAt: "2024-01-01T00:00:00.000Z", windows: [], raw: {} },
     "antigravity-3p": { ok: true, readAt: "2024-01-01T00:00:00.000Z", windows: [], raw: {} },
     deepseek: { metered: true, windows: [], raw: null },
@@ -857,12 +853,6 @@ const RICH_INPUT = {
     },
     // Distinct instants, budgets and raw bodies per pool, so a document that
     // dropped a key or copied a neighbour's reading would not round-trip.
-    "antigravity-argon": {
-      ok: true,
-      readAt: "2025-02-03T09:21:11.006Z",
-      windows: [{ label: "gemini-argon-wtu-weekly", used: 6, budget: "weekly" }],
-      raw: { groups: [{ buckets: [{ bucketId: "gemini-argon-wtu-weekly" }] }] },
-    },
     "antigravity-gemini": {
       ok: true,
       readAt: "2025-02-03T09:21:11.007Z",

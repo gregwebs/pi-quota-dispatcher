@@ -30,7 +30,7 @@ export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
  * The quota-summary endpoint Antigravity's own CLI calls.
  *
  * Undocumented, like the two vendor endpoints beside it, and the only place the
- * three pools' bucket ids appear. See `docs/adr/0019-antigravity-pool-rails.md`.
+ * pools' bucket ids appear. See `docs/adr/0019-antigravity-pool-rails.md`.
  *
  * The host is the `daily-` one on purpose, and it is the part of this URL that
  * matters most: a release channel keeps its own ledger, and the answer on one
@@ -38,11 +38,10 @@ export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
  * `pi-antigravity` sends every model request to, so it is the ledger pi's own
  * work is billed against — the only one whose numbers describe what the next
  * spawn will cost. The unchannelled `cloudcode-pa.googleapis.com` is a different
- * ledger that lags: there the Argon pool reports `remainingFraction: 1` with a
- * `resetTime` that slides to `now + 7d` on every read, so an Argon week that is
- * nine tenths spent printed as untouched and never moved. Reading the channel
- * the traffic uses is what keeps a rail's number and its own spending the same
- * fact.
+ * ledger that lags: its `remainingFraction` figures stay at 1 with a `resetTime`
+ * that slides to `now + 7d` on every read, so a pool that is nine tenths spent
+ * prints as untouched and never moves. Reading the channel the traffic uses is
+ * what keeps a rail's number and its own spending the same fact.
  */
 export const ANTIGRAVITY_QUOTA_URL =
   "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
@@ -52,7 +51,7 @@ export const ANTIGRAVITY_QUOTA_URL =
  *
  * `rails` is a list because one request can answer for several pools — the
  * Antigravity summary does — and a reader allow-listing by rail needs to know
- * that the three pools share one host rather than three.
+ * that the pools share one host rather than one request each.
  */
 export interface OutboundRequest {
   readonly rails: readonly Rail[];
@@ -64,7 +63,7 @@ export interface OutboundRequest {
 
 /**
  * The requests, in the order the report prints their rails: Claude, Codex, then
- * Antigravity's three pools. Order is part of the list because this is also what
+ * Antigravity's two pools. Order is part of the list because this is also what
  * the command prints, and a stable order lets a reader compare two runs.
  */
 export const OUTBOUND_REQUESTS: readonly OutboundRequest[] = [
@@ -81,10 +80,10 @@ export const OUTBOUND_REQUESTS: readonly OutboundRequest[] = [
     purpose: "session and weekly budgets",
   },
   {
-    rails: ["antigravity-argon", "antigravity-gemini", "antigravity-3p"],
+    rails: ["antigravity-gemini", "antigravity-3p"],
     method: "POST",
     url: ANTIGRAVITY_QUOTA_URL,
-    purpose: "one request answers all three pools",
+    purpose: "one request answers both pools",
   },
 ];
 

@@ -740,9 +740,8 @@ test("a metered primary is never tight, so it is left where it is", () => {
 // ------------------------------------------------- alternates in priority order
 
 // The third pool carries both budgets, so a candidate on it can be rejected on
-// one of them. A pool with no session cap — the metered rail, or Antigravity's
-// Argon pool — reads 0% there and is always a session destination; those have
-// their own tests below.
+// one of them. The metered rail carries neither — it reads 0% on both and is
+// always a session destination; that has its own tests below.
 const MULTI: AgentRoute = routeOf({
   primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
   alternates: [
@@ -824,10 +823,9 @@ test("an alternate tight on its other budget is passed over for a later usable o
 });
 
 test("when every readable alternate is rejected and none is unreadable, the primary is assigned", () => {
-  // Both alternates carry the compared budget and are within it. A pool that
-  // carries no session cap at all (the metered rail, or Antigravity's Argon
-  // pool) reads 0% there and would always be eligible, so the two pools here are
-  // ones that really do have a session cap.
+  // Both alternates carry the compared budget and are within it. The metered
+  // rail carries no session cap at all — it reads 0% there and would always be
+  // eligible — so the two pools here are ones that really do have a session cap.
   const twoPools: AgentRoute = routeOf({
     primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
     alternates: [
@@ -1221,64 +1219,6 @@ test("a metered rail reports no budgets rather than unreported ones", () => {
 
 // ------------------------------------- budgets a rail does not carry
 
-// A pool need not impose both caps. Argon has one weekly bucket and no 5-hour
-// window at all, so "no session cap" (usage 0, never tight) has to be a
-// different fact from "this read did not say" (undefined, a hold).
-test("budgetUsed separates a budget a rail does not carry from one it did not report", () => {
-  const argon = railState("antigravity-argon", { weekly: 20 });
-  assert.equal(budgetUsed(argon, "weekly"), 20);
-  assert.equal(budgetUsed(argon, "session"), 0, "Argon has no session cap, so it is never tight there");
-
-  const gemini = railState("antigravity-gemini", { session: 20 });
-  assert.equal(budgetUsed(gemini, "weekly"), undefined, "Gemini does have a weekly cap and did not report it");
-
-  // An uncarried budget reads 0 even if a vendor anomaly put a window on it.
-  const anomalous: RailReading = {
-    rail: "antigravity-argon",
-    ok: true,
-    windows: [
-      { label: "gemini-argon-wtu-weekly", used: 20, budget: "weekly" },
-      { label: "unexpected-5h", used: 100, budget: "session" },
-    ],
-    readAt: 0,
-    raw: {},
-  };
-  assert.equal(budgetUsed(anomalous, "session"), 0);
-  assert.equal(budgetUsed(anomalous, "weekly"), 20);
-});
-
-const ARGON_PRIMARY: AgentRoute = routeOf({
-  primary: { model: "antigravity/gemini-4-argon", rail: "antigravity-argon" },
-  alternates: [{ model: "openai-codex/gpt-6-sol", rail: "codex" }],
-});
-
-test("an Argon primary reporting only its week is not missing a session budget", () => {
-  const d = decide(
-    definitionOf("planner", cfg),
-    ARGON_PRIMARY,
-    railMap(railState("antigravity-argon", { weekly: 20 }), railState("codex", { session: 0, weekly: 0 })),
-    cfg,
-  );
-  assert.equal(d.kind, "assign");
-  assert.equal(assignedModel(d), "antigravity/gemini-4-argon");
-  // The line names the one budget the pool carries, rather than inventing a
-  // reported session figure or reporting a session fault that cannot exist.
-  assert.ok(d.why.includes("weekly 20%"), d.why);
-  assert.ok(!d.why.includes("session"), d.why);
-});
-
-test("an Argon primary that fails to report its week holds", () => {
-  const d = decide(
-    definitionOf("planner", cfg),
-    ARGON_PRIMARY,
-    railMap(railState("antigravity-argon", {}), railState("codex", { session: 0, weekly: 0 })),
-    cfg,
-  );
-  assert.equal(d.kind, "hold");
-  assert.ok(d.why.includes("weekly"), d.why);
-  assert.ok(!d.why.includes("session"), d.why);
-});
-
 for (const [rail, model] of [
   ["antigravity-gemini", "antigravity/gemini-5-pro"],
   ["antigravity-3p", "antigravity/claude-sonnet-4-5"],
@@ -1329,100 +1269,6 @@ test("display-only windows do not satisfy a carried budget", () => {
   assert.ok(d.why.includes("session and weekly"), d.why);
 });
 
-test("an Argon alternate takes work off a session-tight primary", () => {
-  // Argon has no session cap, so its effective session usage is 0 — the same
-  // reading a metered rail gets — and that is what lets it relieve an acute
-  // session squeeze. Only its week has to be safe.
-  const d = decide(
-    definitionOf("planner", cfg),
-    routeOf({
-      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
-      alternates: [{ model: "antigravity/gemini-4-argon", rail: "antigravity-argon" }],
-    }),
-    railMap(
-      railState("claude", { session: 95, weekly: 20 }),
-      railState("antigravity-argon", { weekly: 30 }),
-    ),
-    cfg,
-  );
-  assert.equal(assignedModel(d), "antigravity/gemini-4-argon");
-  assert.ok(d.why.includes("session 0%"), d.why);
-});
-
-test("an Argon alternate whose own week is tight is not a destination", () => {
-  const d = decide(
-    definitionOf("planner", cfg),
-    routeOf({
-      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
-      alternates: [{ model: "antigravity/gemini-4-argon", rail: "antigravity-argon" }],
-    }),
-    railMap(
-      railState("claude", { session: 95, weekly: 20 }),
-      railState("antigravity-argon", { weekly: 90 }),
-    ),
-    cfg,
-  );
-  assert.equal(assignedModel(d), "claude-bridge/claude-opus-5-5");
-  assert.ok(d.why.includes("weekly 90% is itself tight"), d.why);
-});
-
-test("a week-tight Argon primary is not relieved by an alternate whose own session is tight", () => {
-  const d = decide(
-    definitionOf("planner", cfg),
-    routeOf({
-      primary: { model: "antigravity/gemini-4-argon", rail: "antigravity-argon" },
-      alternates: [{ model: "antigravity/gemini-5-pro", rail: "antigravity-gemini" }],
-    }),
-    railMap(
-      railState("antigravity-argon", { weekly: 95 }),
-      railState("antigravity-gemini", { session: 75, weekly: 20 }),
-    ),
-    cfg,
-  );
-  assert.equal(assignedModel(d), "antigravity/gemini-4-argon");
-  assert.ok(d.why.includes("session 75% is itself tight"), d.why);
-});
-
-test("an uncarried spare budget is never rejected, even at a zero threshold", () => {
-  // `sessionSwitchAt: 0` makes every rail that really carries a session cap
-  // tight there, which is why the destination has to be one that does not: the
-  // week is the only budget this primary is tight on, so the pass that fires
-  // weighs `session` on the destination, and the destination has none.
-  const zeroSession: DispatcherConfig = { ...cfg, sessionSwitchAt: 0 };
-  const d = decide(
-    definitionOf("planner", cfg),
-    routeOf({
-      primary: { model: "antigravity/gemini-4-argon", rail: "antigravity-argon" },
-      alternates: [{ model: "deepseek/deepseek-flash", rail: "deepseek" }],
-    }),
-    railMap(
-      railState("antigravity-argon", { weekly: 95 }),
-      railState("deepseek", { metered: true }),
-    ),
-    zeroSession,
-  );
-  assert.equal(assignedModel(d), "deepseek/deepseek-flash");
-  assert.ok(!d.why.includes("is itself tight"), d.why);
-});
-
-test("a weekly-tight primary still reaches a session-free destination at a zero threshold", () => {
-  const zeroSession: DispatcherConfig = { ...cfg, sessionSwitchAt: 0 };
-  const d = decide(
-    definitionOf("planner", cfg),
-    routeOf({
-      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
-      alternates: [{ model: "antigravity/gemini-4-argon", rail: "antigravity-argon" }],
-    }),
-    railMap(
-      railState("claude", { session: 20, weekly: 95 }),
-      railState("antigravity-argon", { weekly: 30 }),
-    ),
-    zeroSession,
-  );
-  assert.equal(assignedModel(d), "antigravity/gemini-4-argon");
-  assert.ok(!d.why.includes("is itself tight"), d.why);
-});
-
 test("a metered alternate is never rejected for a budget it does not carry", () => {
   const zeroBoth: DispatcherConfig = { ...cfg, sessionSwitchAt: 0, weeklySwitchAt: 0 };
   const d = decide(
@@ -1438,19 +1284,6 @@ test("a metered alternate is never rejected for a budget it does not carry", () 
     zeroBoth,
   );
   assert.equal(assignedModel(d), "deepseek/deepseek-flash");
-});
-
-test("an Argon primary is never tight on a session the pool does not have", () => {
-  // Argon carries one budget, so a zero session threshold has nothing to fire on.
-  const zeroSession: DispatcherConfig = { ...cfg, sessionSwitchAt: 0 };
-  const d = decide(
-    definitionOf("planner", cfg),
-    ARGON_PRIMARY,
-    railMap(railState("antigravity-argon", { weekly: 20 }), railState("codex", { session: 0, weekly: 0 })),
-    zeroSession,
-  );
-  assert.equal(assignedModel(d), "antigravity/gemini-4-argon");
-  assert.ok(!d.why.includes("tight on session"), d.why);
 });
 
 // A hold is not "assign the primary". These decisions carry no model at all,
