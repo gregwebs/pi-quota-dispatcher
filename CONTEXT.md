@@ -88,23 +88,23 @@ _Avoid_: provider, plan, account, budget
 
 **Rail read**:
 The one vendor request that produces a **rail reading**, and the rails it answers
-for: one rail where the vendor reports per account, or the three Antigravity
-pools together. Its unit is a source, not a rail, so a pool group's read is one
-read and never three. A read that failed still produced a reading — a failed one
-— and a read never judges what it reports.
+for: one rail where the vendor reports per account, or the two Antigravity pools
+together. Its unit is a source, not a rail, so a pool group's read is one read
+and never two. A read that failed still produced a reading — a failed one — and
+a read never judges what it reports.
 _Avoid_: quota read, fetch, poll, vendor call. See
 [docs/adr/0021](docs/adr/0021-a-rail-read-is-its-own-module.md).
 
 **Rail reading**:
 What one **rail read** reports for one rail: each window the vendor reported, how
 much of it is used, which budget it counts toward and when it resets — or why
-the read failed. A rail does not have to carry both budgets: one whose pool has
-no **session budget** or no **weekly budget** simply reports no window for it,
-and only a budget the rail carries can be missing. A reading states facts only;
-whether a budget is **tight** is a judgment the policy makes about it, not part
-of it. That judgment has one implementation, `isTight`, which the policy and the
-**rail gauge** both call: it takes the threshold as an argument, so a reading
-never learns a configuration value and no reading carries a judgment.
+the read failed. A rail need not impose a budget at all — the **metered** rail
+imposes none — and only a budget the rail carries can be missing. A reading
+states facts only; whether a budget is **tight** is a judgment the policy makes
+about it, not part of it. That judgment has one implementation, `isTight`, which
+the policy and the **rail gauge** both call: it takes the threshold as an
+argument, so a reading never learns a configuration value and no reading carries
+a judgment.
 _Avoid_: usage data, quota data, rail state, usage snapshot
 
 **Last good reading**:

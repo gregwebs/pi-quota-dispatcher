@@ -190,13 +190,13 @@ export type VendorRail = Exclude<Rail, "deepseek">;
 export type VendorReading = GoodReading | FailedReading;
 
 /**
- * What one Antigravity read answers: all three pool rails, each carrying its own
+ * What one Antigravity read answers: both pool rails, each carrying its own
  * rail.
  *
- * One type for three results because one vendor request produces them — the
+ * One type for two results because one vendor request produces them — the
  * buckets of a single `retrieveUserQuotaSummary` body are partitioned across the
  * pools. It is one answer, so a pool the vendor omitted is that pool's own
- * failure while its neighbours are read normally.
+ * failure while its neighbour is read normally.
  */
 export type AntigravityReadings = {
   readonly [R in AntigravityRail]: VendorReading & { readonly rail: R };
@@ -322,12 +322,14 @@ export function parseCodexUsage(
  * Which pool owns a bucket, by the bucket id's own prefix.
  *
  * The vendor groups its buckets under display names, but the names and the group
- * order are presentation: what a bucket *is* comes from its id. Argon is matched
- * before the general `gemini-` prefix because the Argon pool's buckets are Gemini
- * buckets too (`gemini-argon-wtu-weekly`), and only the id distinguishes them.
+ * order are presentation: what a bucket *is* comes from its id. A bucket no
+ * prefix claims is dropped rather than guessed into a pool. The retired Argon
+ * pool's `gemini-argon-*` buckets are refused before the general `gemini-`
+ * prefix can claim them, because a number about a pool this dispatcher no longer
+ * routes on would weigh a quota nothing spends.
  */
 function antigravityPoolFor(bucketId: string): AntigravityRail | undefined {
-  if (bucketId.startsWith("gemini-argon-")) return "antigravity-argon";
+  if (bucketId.startsWith("gemini-argon-")) return undefined;
   if (bucketId.startsWith("gemini-")) return "antigravity-gemini";
   if (bucketId.startsWith("3p-")) return "antigravity-3p";
   return undefined;
@@ -347,10 +349,10 @@ function antigravityBudget(window: unknown): Budget | undefined {
 }
 
 /**
- * One `retrieveUserQuotaSummary` document partitioned across the three pools.
+ * One `retrieveUserQuotaSummary` document partitioned across the pools.
  *
  * A pool with no bucket of its own is an empty list, not an absent key: the
- * caller states the same three rails whatever the vendor said, and an empty list
+ * caller states the same two rails whatever the vendor said, and an empty list
  * is how "this response said nothing about that pool" is spelled. Everything the
  * parser cannot use — a bucket with no id, a fraction that is missing or not a
  * number, a bucket belonging to no pool — is dropped rather than repaired.
@@ -361,7 +363,6 @@ function antigravityBudget(window: unknown): Budget | undefined {
  */
 export function parseAntigravityUsage(data: unknown): Record<AntigravityRail, RailWindow[]> {
   const windows: Record<AntigravityRail, RailWindow[]> = {
-    "antigravity-argon": [],
     "antigravity-gemini": [],
     "antigravity-3p": [],
   };
@@ -407,9 +408,9 @@ export function parseAntigravityUsage(data: unknown): Record<AntigravityRail, Ra
  * worst of them.
  *
  * `0` is the answer for a budget the rail does not carry: a metered rail is
- * billed per token rather than capped, and Argon's pool has no session window, so
- * neither can ever be tight there. That is a different fact from "the read did
- * not say", and the two must not be spelled alike — see `RAIL_BUDGETS`.
+ * billed per token rather than capped, so it can never be tight there. That is a
+ * different fact from "the read did not say", and the two must not be spelled
+ * alike — see `RAIL_BUDGETS`.
  */
 export function budgetUsed(reading: RailReading, budget: Budget): number | undefined {
   if (reading.metered || !carries(reading.rail, budget)) return 0;
@@ -441,10 +442,9 @@ export function absentBudgets(reading: RailReading): Budget[] {
  *
  * Two cases are never tight, and neither is a guess at room. A budget the rail
  * does not carry cannot be exceeded there, so no threshold — not even one
- * configured as `0` — may make it tight; that is what keeps Argon, with no
- * session window at all, from being refused on one. A carried budget the read
- * did not report is not evidence of pressure either: the policy holds on it
- * instead, because a missing number is not a small one.
+ * configured as `0` — may make it tight. A carried budget the read did not
+ * report is not evidence of pressure either: the policy holds on it instead,
+ * because a missing number is not a small one.
  */
 export function isTight(reading: RailReading, budget: Budget, threshold: number): boolean {
   if (!carries(reading.rail, budget)) return false;
@@ -469,10 +469,8 @@ const EXHAUSTED = 100;
  * 0%, so the figure must be read against the week rather than taken at face
  * value. The week is the rail's worst pool, which is what `budgetUsed` returns:
  * one pool at its cap is enough, and the vendor turns the limit off for the
- * whole account. A rail with no session budget still answers here, because a
- * spent week leaves it with nothing to spend either — only the `disabled` slot
- * is out of its reach (`freshBudget` and `staleBudget` answer `uncarried` first,
- * so Argon keeps its `–`).
+ * whole account. Every capped rail carries a week, so this is never the
+ * absent-budget case.
  */
 export function weekSpent(reading: RailReading): boolean {
   const week = budgetUsed(reading, "weekly");

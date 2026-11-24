@@ -46,15 +46,9 @@ test("a carried budget is tight at a zero threshold, so a pool with no room at a
   assert.equal(isTight(claude(0), "session", 0), true);
 });
 
-test("a budget the rail does not carry is never tight, even at a zero threshold", () => {
-  // Argon has one weekly pool and no session window: the vendor never promised a
-  // session cap there, so `sessionSwitchAt: 0` must not refuse it on one.
-  const argon = reading("antigravity-argon", [{ label: "gemini-argon-wtu-weekly", used: 0, budget: "weekly" }]);
-  assert.equal(isTight(argon, "session", 0), false);
-  assert.equal(isTight(argon, "weekly", 0), true, "the cap it does carry is still weighed");
-});
-
-test("a metered rail is never tight on either budget", () => {
+test("a metered rail is never tight on either budget, even at a zero threshold", () => {
+  // It carries no budget at all, so no threshold can make it tight — the case
+  // `carries` separates from a carried budget that went unreported.
   const metered: MeteredReading = { rail: "deepseek", ok: true, metered: true, windows: [] };
   assert.equal(isTight(metered, "session", 0), false);
   assert.equal(isTight(metered, "weekly", 0), false);

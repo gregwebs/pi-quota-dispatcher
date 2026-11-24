@@ -29,7 +29,6 @@ export const GAUGE_ORDER: readonly VendorRail[] = [
   "codex",
   "antigravity-3p",
   "antigravity-gemini",
-  "antigravity-argon",
 ];
 
 /** Exhaustive so a new capped rail cannot ship without a footer label. */
@@ -38,16 +37,13 @@ export const GAUGE_LABELS: Record<VendorRail, string> = {
   codex: "codex",
   "antigravity-3p": "ag-3p",
   "antigravity-gemini": "ag-gemini",
-  "antigravity-argon": "ag-argon",
 };
 
 /**
  * A budget slot as a fresh reading supports it.
  *
- * `uncarried` and `unreported` are different facts and are spelled differently:
- * Argon has no session budget, while a rail that carries one and did not report
- * it told us nothing. Collapsing them would print a missing reading as a free
- * budget — the error `budgetUsed` exists to prevent.
+ * `unreported` is a budget the rail carries and the read did not report: a
+ * missing number, not a free budget — the error `budgetUsed` exists to prevent.
  *
  * `resetInMs` is required even when unknown, so a producer has to decide about
  * the countdown rather than forget it: `undefined` means the vendor reported no
@@ -59,7 +55,6 @@ export const GAUGE_LABELS: Record<VendorRail, string> = {
  * claim a freedom the vendor has withdrawn.
  */
 export type BudgetGauge =
-  | { readonly kind: "uncarried" }
   | { readonly kind: "unreported" }
   | { readonly kind: "disabled" }
   | { readonly kind: "used"; readonly used: number; readonly resetInMs: number | undefined }
@@ -79,7 +74,6 @@ export type BudgetGauge =
  * rather than a rule the renderer has to remember.
  */
 export type StaleBudgetGauge =
-  | { readonly kind: "uncarried" }
   | { readonly kind: "unreported" }
   | { readonly kind: "disabled" }
   | { readonly kind: "used"; readonly used: number };
@@ -120,8 +114,6 @@ export interface GaugeStyle {
 
 /** U+2502, the box-drawing bar: a thinner separator than `|` at footer size. */
 const GAUGE_SEPARATOR = " │ ";
-/** U+2013, a budget the rail does not have. */
-const ABSENT = "–";
 /**
  * A budget the vendor has switched off, which is why it is not a figure: the
  * reading may still carry one, and printing it would show 0% on a cap that is
@@ -218,8 +210,6 @@ function ordered(entries: readonly GaugeEntry[]): GaugeEntry[] {
 
 function budgetTokens(budget: StaleBudgetGauge): Token[] {
   switch (budget.kind) {
-    case "uncarried":
-      return [{ text: ABSENT, tone: "dim" }];
     case "unreported":
       return [{ text: "?", tone: "dim" }];
     case "disabled":

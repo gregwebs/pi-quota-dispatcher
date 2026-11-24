@@ -78,7 +78,7 @@ async function fixture(t: TestContext, opts: { antigravity?: boolean } = {}) {
     calls: { claude: 0, codex: 0 },
     /** Antigravity reads, counted apart so the two-vendor assertions stay exact. */
     antigravityCalls: 0,
-    /** The three pools' one answer, stamped when it is read. */
+    /** The two pools' one answer, stamped when it is read. */
     poolUsed: {} as Partial<Record<AntigravityRail, Used>>,
     /** Overrides a rail's answer for one test; the counters above still run. */
     answer: {} as Partial<Record<LiveRail | "antigravity", (call: number) => VendorReading | AntigravityReadings>>,
@@ -120,10 +120,9 @@ async function fixture(t: TestContext, opts: { antigravity?: boolean } = {}) {
     },
   });
   const readingsPath = join(root, "quota-dispatch-readings.json");
-  // One answer for the three pools: the percentages the old document fixture
+  // One answer for both pools: the percentages the old document fixture
   // reported, so a stored reading can never be mistaken for a fresh one.
   probe.poolUsed = {
-    "antigravity-argon": { weekly: 0 },
     "antigravity-gemini": { session: 42, weekly: 12 },
     "antigravity-3p": { session: 0, weekly: 2 },
   };
@@ -307,11 +306,10 @@ test("allReadings exposes deepseek as metered with no raw, readAt, lastGood or f
   assert.deepEqual(probe.calls, { claude: 0, codex: 0 });
   const all = await dispatcher.allReadings(true);
   // Canonical order, not sorted: the report prints the two long-standing vendor
-  // rails, then one account's three Antigravity pools, then the metered rail.
+  // rails, then one account's two Antigravity pools, then the metered rail.
   assert.deepEqual([...all.keys()], [
     "claude",
     "codex",
-    "antigravity-argon",
     "antigravity-gemini",
     "antigravity-3p",
     "deepseek",
@@ -501,7 +499,6 @@ test("knownReadings gives deepseek the metered arm and never fetches it", async 
   assert.ok(!("lastGood" in known.deepseek));
   assert.deepEqual(Object.keys(known).sort(), [
     "antigravity-3p",
-    "antigravity-argon",
     "antigravity-gemini",
     "claude",
     "codex",
@@ -510,11 +507,11 @@ test("knownReadings gives deepseek the metered arm and never fetches it", async 
   // The fetch stub rejects any URL but the vendors', so a deepseek request would
   // already have failed; the count pins that each vendor was asked once. The
   // Antigravity pools never reach the network here: this fixture's auth file has
-  // no `antigravity` entry, so all three fail as unavailable without a request —
+  // no `antigravity` entry, so both fail as unavailable without a request —
   // which is exactly what an install without that provider gets.
   assert.deepEqual(probe.calls, { claude: 1, codex: 1 });
   assert.equal(probe.antigravityCalls, 0);
-  for (const rail of ["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const) {
+  for (const rail of ["antigravity-gemini", "antigravity-3p"] as const) {
     assert.equal(known[rail].latest.ok, false);
   }
 });
@@ -522,27 +519,30 @@ test("knownReadings gives deepseek the metered arm and never fetches it", async 
 /**
  * One generation, one picture of the Antigravity group.
  *
- * A store holding one pool but not its siblings is what a partially publishable
+ * A store holding one pool but not its sibling is what a partially publishable
  * file leaves behind. Reading each pool independently would let a sibling answer
- * from before the fetch the missing pool triggers — three readings of one vendor
+ * from before the fetch the missing pool triggers — two readings of one vendor
  * answer that disagree about when, and about what, was read. The group is warmed
- * once and read back together, so the three always describe the same request.
+ * once and read back together, so both always describe the same request.
  */
 test("knownReadings warms a partial Antigravity group once, so its siblings cannot disagree", async (t) => {
   const { dispatcher, probe, piAuthPath, readingsPath } = await fixture(t, { antigravity: true });
   await writeFile(readingsPath, JSON.stringify({
     version: READINGS_FILE_VERSION,
     entries: [{
-      rail: "antigravity-argon",
+      rail: "antigravity-gemini",
       credential: resolve(piAuthPath),
       at: NOW - 1,
-      // A percentage no pool in the stub's body reports, so a returned Argon
+      // Percentages no pool in the stub's body reports, so a returned Gemini
       // reading of 55% could only be this stored one.
       latest: {
-        rail: "antigravity-argon",
+        rail: "antigravity-gemini",
         ok: true,
         readAt: NOW - 1,
-        windows: [{ label: "gemini-argon-wtu-weekly", used: 55, budget: "weekly" }],
+        windows: [
+          { label: "gemini-5h", used: 55, budget: "session" },
+          { label: "gemini-weekly", used: 55, budget: "weekly" },
+        ],
         raw: { groups: [] },
       },
     }],
@@ -550,12 +550,9 @@ test("knownReadings warms a partial Antigravity group once, so its siblings cann
 
   const known = await dispatcher.knownReadings();
   assert.equal(probe.antigravityCalls, 1, "a missing pool warms the group once, not once per pool");
-  const latest = (["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const).map((rail) =>
-    good(known[rail].latest),
-  );
+  const latest = (["antigravity-gemini", "antigravity-3p"] as const).map((rail) => good(known[rail].latest));
   assert.deepEqual(new Set(latest.map((r) => r.readAt)), new Set([NOW]), "one vendor answer, one instant");
   assert.deepEqual(latest.map((r) => r.windows.map((w) => [w.label, w.used])), [
-    [["7d", 0]],
     [["5h", 42], ["7d", 12]],
     [["5h", 0], ["7d", 2]],
   ]);

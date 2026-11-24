@@ -67,13 +67,9 @@ const CODEX_GOOD: GoodReading = {
   raw: CODEX_RAW,
 };
 
-const ARGON_AT = Date.UTC(2025, 1, 3, 9, 25, 13, 517);
 const GEMINI_AT = Date.UTC(2025, 1, 3, 9, 26, 44, 61);
 const THIRD_PARTY_AT = Date.UTC(2025, 1, 3, 9, 27, 58, 733);
 
-const ARGON_RAW = {
-  groups: [{ displayName: "Gemini 4 Argon", buckets: [{ bucketId: "gemini-argon-wtu-weekly", window: "weekly", remainingFraction: 0.94 }] }],
-};
 const GEMINI_RAW = {
   groups: [{ displayName: "Gemini Models", buckets: [
     { bucketId: "gemini-weekly", window: "weekly", remainingFraction: 0.91 },
@@ -85,14 +81,6 @@ const THIRD_PARTY_RAW = {
     { bucketId: "3p-weekly", window: "weekly", remainingFraction: 0.99 },
     { bucketId: "3p-5h", window: "5h", remainingFraction: 0.97 },
   ] }],
-};
-
-const ARGON_GOOD: GoodReading = {
-  rail: "antigravity-argon",
-  ok: true,
-  readAt: ARGON_AT,
-  windows: [{ label: "gemini-argon-wtu-weekly", used: 6, budget: "weekly" }],
-  raw: ARGON_RAW,
 };
 
 const GEMINI_GOOD: GoodReading = {
@@ -130,16 +118,15 @@ function healthy(reading: GoodReading): VendorRailReadings {
 
 /**
  * A readings record with every rail present, the two vendor rails the caller is
- * exercising and the three Antigravity pools at their healthy defaults.
+ * exercising and the two Antigravity pools at their healthy defaults.
  *
  * The pools are separate arguments rather than one bag so a test can make one
- * pool fail and say what the other two were.
+ * pool fail and say what the other was.
  */
 function known(
   claude: VendorRailReadings,
   codex: VendorRailReadings,
   pools: {
-    argon?: VendorRailReadings;
     gemini?: VendorRailReadings;
     threeParty?: VendorRailReadings;
   } = {},
@@ -147,15 +134,14 @@ function known(
   return {
     claude,
     codex,
-    "antigravity-argon": pools.argon ?? healthy(ARGON_GOOD),
     "antigravity-gemini": pools.gemini ?? healthy(GEMINI_GOOD),
     "antigravity-3p": pools.threeParty ?? healthy(THIRD_PARTY_GOOD),
     deepseek: { latest: DEEPSEEK },
   };
 }
 
-/** The five rails the generator may send, in the order the document states them. */
-const CAPPED = ["claude", "codex", "antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const;
+/** The four capped rails the generator may send, in the order the document states them. */
+const CAPPED = ["claude", "codex", "antigravity-gemini", "antigravity-3p"] as const;
 
 function ready(outcome: GeneratorInputOutcome): GeneratorInput {
   assert.equal(outcome.kind, "ready", outcome.kind === "refused" ? outcome.reason.join("\n") : "");
@@ -201,31 +187,28 @@ const claudeAsMetered: KnownReadings = {
   // @ts-expect-error a vendor rail cannot hold the metered arm
   claude: { latest: DEEPSEEK },
   codex: healthy(CODEX_GOOD),
-  "antigravity-argon": healthy(ARGON_GOOD),
   "antigravity-gemini": healthy(GEMINI_GOOD),
   "antigravity-3p": healthy(THIRD_PARTY_GOOD),
   deepseek: { latest: DEEPSEEK },
 };
-const argonAsMetered: KnownReadings = {
+const poolAsMetered: KnownReadings = {
   claude: healthy(CLAUDE_GOOD),
   codex: healthy(CODEX_GOOD),
   // @ts-expect-error a pool is quota-capped, so it cannot hold the metered arm
-  "antigravity-argon": { latest: DEEPSEEK },
-  "antigravity-gemini": healthy(GEMINI_GOOD),
+  "antigravity-gemini": { latest: DEEPSEEK },
   "antigravity-3p": healthy(THIRD_PARTY_GOOD),
   deepseek: { latest: DEEPSEEK },
 };
 const deepseekAsRead: KnownReadings = {
   claude: healthy(CLAUDE_GOOD),
   codex: healthy(CODEX_GOOD),
-  "antigravity-argon": healthy(ARGON_GOOD),
   "antigravity-gemini": healthy(GEMINI_GOOD),
   "antigravity-3p": healthy(THIRD_PARTY_GOOD),
   // @ts-expect-error the metered rail cannot hold a vendor reading
   deepseek: healthy({ ...CODEX_GOOD, rail: "deepseek" }),
 };
 void claudeAsMetered;
-void argonAsMetered;
+void poolAsMetered;
 void deepseekAsRead;
 
 // ---------------------------------------------------------------- the document
@@ -237,7 +220,6 @@ test("the document is version 1 and names every rail, even the metered one", () 
   assert.deepEqual(Object.keys(input).sort(), ["rails", "version"]);
   assert.deepEqual(Object.keys(input.rails).sort(), [
     "antigravity-3p",
-    "antigravity-argon",
     "antigravity-gemini",
     "claude",
     "codex",
@@ -432,7 +414,6 @@ test("the refusal reason is exactly the header, the failing rail's line and the 
 
 test("each pool that never succeeded refuses the run and is the only rail named", () => {
   for (const [rail, pools] of [
-    ["antigravity-argon", { argon: { latest: failed("antigravity-argon", "no antigravity.access") } }],
     ["antigravity-gemini", { gemini: { latest: failed("antigravity-gemini", "HTTP 500 after 2 attempts") } }],
     ["antigravity-3p", { threeParty: { latest: failed("antigravity-3p", "no usage windows returned") } }],
   ] as const) {
@@ -444,12 +425,11 @@ test("each pool that never succeeded refuses the run and is the only rail named"
 });
 
 test("every failing capped rail is reported, in the document's own order", () => {
-  // All five, so neither "report the first" nor "report the two vendors" can
+  // All four, so neither "report the first" nor "report the two vendors" can
   // pass: the lines are checked as an ordered subsequence of the reason.
   const reason = refused(generatorInput({
     claude: { latest: failed("claude", "no Claude credentials") },
     codex: { latest: failed("codex", "no codex credential file") },
-    "antigravity-argon": { latest: failed("antigravity-argon", "expired") },
     "antigravity-gemini": { latest: failed("antigravity-gemini", "HTTP 429") },
     "antigravity-3p": { latest: failed("antigravity-3p", "no usage windows returned") },
     deepseek: { latest: DEEPSEEK },
@@ -463,20 +443,18 @@ test("each pool's last good reading is projected into its own key", () => {
   // Distinct instants and distinct raw bodies per pool, so a key hole or a
   // neighbour's reading shows up as a mismatch rather than as a plausible value.
   const input = ready(generatorInput(known(healthy(CLAUDE_GOOD), healthy(CODEX_GOOD), {
-    argon: { latest: failed("antigravity-argon", "HTTP 500"), lastGood: ARGON_GOOD },
-    gemini: healthy(GEMINI_GOOD),
+    gemini: { latest: failed("antigravity-gemini", "HTTP 500"), lastGood: GEMINI_GOOD },
     threeParty: { latest: failed("antigravity-3p", "HTTP 429"), lastGood: THIRD_PARTY_GOOD },
   })));
-  assert.deepEqual(vendorEntry(input, "antigravity-argon").latestFailure, { at: iso(FAILED_AT), note: "HTTP 500" });
-  assert.equal(vendorEntry(input, "antigravity-argon").readAt, iso(ARGON_AT));
-  assert.deepEqual(vendorEntry(input, "antigravity-argon").raw, ARGON_RAW);
+  assert.deepEqual(vendorEntry(input, "antigravity-gemini").latestFailure, { at: iso(FAILED_AT), note: "HTTP 500" });
   assert.equal(vendorEntry(input, "antigravity-gemini").readAt, iso(GEMINI_AT));
-  assert.ok(!("latestFailure" in vendorEntry(input, "antigravity-gemini")), "a healthy pool has no failure marker");
+  assert.deepEqual(vendorEntry(input, "antigravity-gemini").raw, GEMINI_RAW);
   assert.deepEqual(vendorEntry(input, "antigravity-3p").raw, THIRD_PARTY_RAW);
   assert.equal(vendorEntry(input, "antigravity-3p").readAt, iso(THIRD_PARTY_AT));
-  // Argon carries one budget, and the document says so rather than inventing a
-  // session window for the pool that has none.
-  assert.deepEqual(vendorEntry(input, "antigravity-argon").windows, [
-    { label: "gemini-argon-wtu-weekly", used: 6, budget: "weekly" },
+  // Each pool reports the buckets it owns, rather than a neighbour's window or
+  // one invented for a budget it does not carry.
+  assert.deepEqual(vendorEntry(input, "antigravity-gemini").windows, [
+    { label: "gemini-5h", used: 24, budget: "session" },
+    { label: "gemini-weekly", used: 9, budget: "weekly" },
   ]);
 });

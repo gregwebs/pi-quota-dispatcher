@@ -39,7 +39,7 @@ const staleEntry: GaugeEntry = {
   kind: "stale",
   spent: false,
   session: noCountdown,
-  weekly: { kind: "uncarried" },
+  weekly: { kind: "unreported" },
 };
 
 export const guarantees = [

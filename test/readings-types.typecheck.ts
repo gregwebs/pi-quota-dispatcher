@@ -11,7 +11,7 @@
  * The guarantees, in order: an Antigravity pool has no single-rail fetch; the
  * grouped fetch takes a pool and not the metered rail; every rail's readings are
  * a required key of `KnownReadings`; a pool's readings are never the metered
- * arm; and the generator document carries all six rails.
+ * arm; and the generator document carries every capped rail.
  */
 import {
   type KnownReadings,
@@ -34,13 +34,13 @@ declare const vendor: VendorRailReadings;
 
 // The grouped method is the one way to ask about a pool, and it is typed to
 // answer exactly that.
-const argon: Promise<VendorRailReadings> = store.readAntigravity("antigravity-argon", credential, {
+const gemini: Promise<VendorRailReadings> = store.readAntigravity("antigravity-gemini", credential, {
   ttlMs: 1,
   fetch: async () => group,
 });
 
-// @ts-expect-error a pool is answered by one request for all three, so it has no single-rail read
-store.read("antigravity-argon", credential, { ttlMs: 1, fetch: async () => group["antigravity-argon"] });
+// @ts-expect-error a pool is answered by one request for both, so it has no single-rail read
+store.read("antigravity-gemini", credential, { ttlMs: 1, fetch: async () => group["antigravity-gemini"] });
 // @ts-expect-error the grouped read takes a pool; the metered rail has no endpoint at all
 store.readAntigravity("deepseek", credential, { ttlMs: 1, fetch: async () => group });
 // @ts-expect-error a Claude read is not answered by an Antigravity group
@@ -48,7 +48,7 @@ store.readAntigravity("claude", credential, { ttlMs: 1, fetch: async () => group
 
 // Every rail is a required key, so a caller cannot forget a pool.
 const { claude, codex, deepseek } = known;
-// @ts-expect-error a known-readings record missing the three pools is not one
+// @ts-expect-error a known-readings record missing the pools is not one
 const incomplete: KnownReadings = { claude, codex, deepseek };
 const metered: MeteredRailReadings = known.deepseek;
 // @ts-expect-error a pool is quota-capped, so it is never the metered arm
@@ -63,4 +63,4 @@ if (outcome.kind === "ready") {
 }
 
 // A value that is only ever read is used here so the file has no unused locals.
-void [argon, incomplete, meteredPool, vendor];
+void [gemini, incomplete, meteredPool, vendor];

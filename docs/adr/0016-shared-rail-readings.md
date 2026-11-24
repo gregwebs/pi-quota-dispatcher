@@ -33,13 +33,16 @@ names a key of it, and the only thing a caller sees is the same `RailReadings`
 the in-memory cache produced plus the `RefreshGates` the dispatcher asks for by
 credential.
 
-**Extended by [0019](0019-antigravity-pool-rails.md).** Three of the rails that
+**Extended by [0019](0019-antigravity-pool-rails.md), and narrowed by
+[0026](0026-the-argon-pool-is-retired.md).** The rails that
 came later — Antigravity's pools — are answered by one vendor request, so the
 fetch lock and the in-process in-flight record are now keyed by a *source*: one
-rail, or the three pools together. One fetch still writes one document under the
-one file lock described below, publishing all three entries at once. Version 3
+rail, or the pools together. One fetch still writes one document under the
+one file lock described below, publishing both pools' entries at once. Version 3
 widens what an entry's `rail` may be; a valid version-2 document is still read,
-which is what keeps the gates and sticky halt above across the upgrade.
+which is what keeps the gates and sticky halt above across the upgrade, and a
+version-3 entry for the retired Argon pool is dropped rather than faulting the
+file for the same reason.
 Per-rail keys, per-rail `lastGood` and the best-effort write are unchanged.
 
 **Extended by [0020](0020-codex-credential-seam.md).** The Codex credential is

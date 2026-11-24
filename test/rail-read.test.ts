@@ -76,7 +76,6 @@ function codexDoc(options: {
 
 /** One `retrieveUserQuotaSummary` body, in the vendor's own shape. */
 function quotaBody(options: {
-  argon?: boolean;
   geminiWeekly?: number;
   geminiSession?: number;
   threePartyWeekly?: number;
@@ -106,9 +105,6 @@ function quotaBody(options: {
           bucket("3p-5h", "5h", options.threePartySession ?? 1, session),
         ],
       },
-      ...(options.argon === false
-        ? []
-        : [{ displayName: "Gemini 4 Argon", buckets: [bucket("gemini-argon-wtu-weekly", "weekly", 1, weekly)] }]),
     ],
   };
 }
@@ -235,18 +231,19 @@ test("a bucket's pool comes from its id, not the group it was filed under", asyn
         displayName: "Miscellaneous",
         buckets: [
           { bucketId: "3p-5h", window: "5h", remainingFraction: 0.97 },
-          { bucketId: "gemini-argon-wtu-weekly", window: "weekly", remainingFraction: 1 },
           { bucketId: "gemini-5h", window: "5h", remainingFraction: 0.42 },
         ],
       },
     ],
   })).antigravity(STORED_ACCESS);
 
-  assert.deepEqual(okWindows(group["antigravity-argon"]).map((w) => w.label), ["gemini-argon-wtu-weekly"]);
   assert.deepEqual(okWindows(group["antigravity-gemini"]).map((w) => w.label), ["gemini-5h"]);
   assert.deepEqual(okWindows(group["antigravity-3p"]).map((w) => w.label), ["3p-5h"]);
 });
-test("Argon is matched before the general gemini prefix", async () => {
+test("a retired pool's bucket is dropped rather than weighed into the Gemini pool", async () => {
+  // The Argon pool was removed before its models were, so a body may still
+  // carry its earlier bucket. It belongs to no rail any more, and counting it
+  // into the Gemini pool would weigh a quota nothing spends.
   const group = await readOver(documentTransport({
     groups: [
       {
@@ -259,11 +256,10 @@ test("Argon is matched before the general gemini prefix", async () => {
     ],
   })).antigravity(STORED_ACCESS);
 
-  assert.deepEqual(okWindows(group["antigravity-argon"]).map((w) => w.used), [10]);
-  assert.deepEqual(okWindows(group["antigravity-gemini"]).map((w) => w.used), [20]);
+  assert.deepEqual(okWindows(group["antigravity-gemini"]).map((w) => [w.label, w.used]), [["gemini-3-pro-weekly", 20]]);
 });
 
-test("hostile bodies parse to three empty pools instead of throwing or coercing", async () => {
+test("hostile bodies parse to two empty pools instead of throwing or coercing", async () => {
   const cases: unknown[] = [
     null,
     42,
@@ -286,7 +282,7 @@ test("hostile bodies parse to three empty pools instead of throwing or coercing"
   ];
   for (const body of cases) {
     const group = await readOver(documentTransport(body)).antigravity(STORED_ACCESS);
-    for (const rail of ["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const) {
+    for (const rail of ["antigravity-gemini", "antigravity-3p"] as const) {
       const reading = group[rail];
       assert.equal(reading.ok, false, `${rail} from ${JSON.stringify(body)}`);
       assert.equal(reading.ok === false ? reading.note : "", "no usage windows returned");
@@ -371,7 +367,7 @@ test("a bucket of no known pool is dropped rather than guessed into one", async 
     ],
   })).antigravity(STORED_ACCESS);
 
-  for (const rail of ["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const) {
+  for (const rail of ["antigravity-gemini", "antigravity-3p"] as const) {
     assert.equal(group[rail].ok, false, rail);
   }
 });
@@ -422,7 +418,7 @@ test("windows are kept in encounter order, one entry per bucket", async () => {
     ["3p-weekly-preview", "weekly", 5],
   ]);
 });
-test("any pool read is one POST that answers for all three", async () => {
+test("any pool read is one POST that answers for both", async () => {
   const { transport, requests } = transportOf(() => ({ kind: "document", body: quotaBody() }));
   const group = await readOver(transport).antigravity(STORED_ACCESS);
 
@@ -437,19 +433,18 @@ test("any pool read is one POST that answers for all three", async () => {
   assert.deepEqual(JSON.parse(request!.body!), { project: "stored-project" });
   assert.equal(request!.timeoutMs, DEFAULT_QUOTA_READ.timeoutMs);
 
-  // One answer, one instant: three stamps would be three answers.
+  // One answer, one instant: two stamps would be two answers.
   const readAts = new Set(
-    (["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const).map((rail) => group[rail].ok && group[rail].readAt),
+    (["antigravity-gemini", "antigravity-3p"] as const).map((rail) => group[rail].ok && group[rail].readAt),
   );
   assert.equal(readAts.size, 1);
   // Each pool's raw is the whole body, so a generator reading any pool sees the
   // account-wide document.
-  const raws = (["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const).map((rail) => {
+  const raws = (["antigravity-gemini", "antigravity-3p"] as const).map((rail) => {
     const reading = group[rail];
     return reading.ok ? reading.raw : undefined;
   });
   assert.deepEqual(raws[1], raws[0]);
-  assert.deepEqual(raws[2], raws[0]);
 });
 
 test("the request body carries the project only when the credential names one", async () => {
@@ -479,7 +474,7 @@ test("the User-Agent is the pinned one unless the environment overrides it, trim
   assert.equal(await userAgentSent(), DEFAULT_ANTIGRAVITY_USER_AGENT);
 
   // Blank is not an override: falling back to the pinned string is the only way
-  // the vendor is asked in a way that reports the Argon pool at all.
+  // the vendor is asked as its own client.
   process.env.ANTIGRAVITY_USER_AGENT = "   ";
   assert.equal(await userAgentSent(), DEFAULT_ANTIGRAVITY_USER_AGENT);
 
@@ -808,7 +803,7 @@ test("a credential that was never acquired is one group-wide failure, not a requ
   });
 
   assert.equal(requests.length, 0);
-  for (const rail of ["antigravity-argon", "antigravity-gemini", "antigravity-3p"] as const) {
+  for (const rail of ["antigravity-gemini", "antigravity-3p"] as const) {
     assert.equal(group[rail].ok === false ? group[rail].note : "", "no pi auth file");
   }
   assert.deepEqual(new Set(Object.values(group).map((r) => r.readAt)).size, 1, "one failure, one instant");

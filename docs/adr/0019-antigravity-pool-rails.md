@@ -1,5 +1,10 @@
 # Antigravity is three pool rails behind one vendor read
 
+> **Narrowed by [0026](0026-the-argon-pool-is-retired.md).** The Argon pool no
+> longer has a quota and is being deprecated, so it is no longer a rail. The
+> record below is kept as the decision it was, written when the account had
+> three pools; two of them remain.
+
 ## Context
 
 An account in Google's Antigravity CLI is capped in three places that move

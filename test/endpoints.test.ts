@@ -39,7 +39,7 @@ test("the table names the three vendor requests and the metered rail's absence",
       { rails: ["claude"], method: "GET", url: "https://api.anthropic.com/api/oauth/usage" },
       { rails: ["codex"], method: "GET", url: "https://chatgpt.com/backend-api/wham/usage" },
       {
-        rails: ["antigravity-argon", "antigravity-gemini", "antigravity-3p"],
+        rails: ["antigravity-gemini", "antigravity-3p"],
         method: "POST",
         url: "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
       },

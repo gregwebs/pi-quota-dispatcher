@@ -87,13 +87,12 @@ function unused(rail: VendorRail): Used {
   return used;
 }
 
-/** The three pools' one answer. A pool a test does not name reads as unused. */
+/** The pools' one answer. A pool a test does not name reads as unused. */
 export function poolGroup(
   used: Partial<Record<AntigravityRail, Used>> = {},
   readAt: number = READ_AT,
 ): AntigravityReadings {
   return {
-    "antigravity-argon": readingOf("antigravity-argon", used["antigravity-argon"] ?? unused("antigravity-argon"), readAt),
     "antigravity-gemini": readingOf("antigravity-gemini", used["antigravity-gemini"] ?? unused("antigravity-gemini"), readAt),
     "antigravity-3p": readingOf("antigravity-3p", used["antigravity-3p"] ?? unused("antigravity-3p"), readAt),
   };

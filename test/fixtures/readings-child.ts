@@ -60,8 +60,8 @@ async function run(job: Job) {
   };
 
   const rail = job.rail ?? "claude";
-  // The three pools are one request in production, so the fixture answers all
-  // three at once — that is the shape `readAntigravity` is given.
+  // The pools are one request in production, so the fixture answers both at
+  // once — that is the shape `readAntigravity` is given.
   const result = isAntigravityRail(rail)
     ? await store.readAntigravity(rail, job.credential, {
         ttlMs: 60_000,
@@ -69,7 +69,6 @@ async function run(job: Job) {
           await begin();
           const readAt = Date.now();
           return {
-            "antigravity-argon": { rail: "antigravity-argon", ok: true, windows: [{ label: "gemini-argon-wtu-weekly", used: 5, budget: "weekly" }], readAt, raw: { child: "argon" } },
             "antigravity-gemini": { rail: "antigravity-gemini", ok: true, windows: [{ label: "gemini-5h", used: 17, budget: "session" }], readAt, raw: { child: "gemini" } },
             "antigravity-3p": { rail: "antigravity-3p", ok: true, windows: [{ label: "3p-weekly", used: 2, budget: "weekly" }], readAt, raw: { child: "3p" } },
           };

@@ -6,8 +6,8 @@
  * dependency: not the rail readings file, not a configuration object, not pi, and
  * not the refresh gates or the paid ping — it is handed a credential that some
  * other module already acquired. Its unit is a source rather than a rail — one
- * request answers for `claude`, one for `codex`, and one for all three
- * Antigravity pools — so a pool group is never three requests. Credential
+ * request answers for `claude`, one for `codex`, and one for both Antigravity
+ * pools — so a pool group is one request and never two. Credential
  * *acquisition* is deliberately outside: the Claude token may only be found by
  * consulting the machine-wide refresh gates, which is the dispatcher's state,
  * not a read's.
@@ -198,14 +198,14 @@ function networkFailure(err: unknown): TransportFailure {
  * "which rail is this?" twice: it acquired that rail's credential by name and
  * calls the read written for it. The Antigravity read takes the *acquired*
  * result rather than an access value because a credential failure is one
- * document's worth of failure — three pools share it.
+ * document's worth of failure — both pools share it.
  */
 export interface RailRead {
   /** The Claude rail's usage document, with a token already in hand. */
   readonly claude: (token: string) => Promise<VendorReading>;
   /** The Codex rail's usage document. */
   readonly codex: (credential: CodexCredential) => Promise<VendorReading>;
-  /** The one document that answers for all three Antigravity pools. */
+  /** The one document that answers for both Antigravity pools. */
   readonly antigravity: (credential: AntigravityToken) => Promise<AntigravityReadings>;
 }
 
@@ -312,12 +312,11 @@ export function createRailRead(deps: RailReadDeps = {}): RailRead {
   }
 
   /**
-   * The one vendor request that answers for all three Antigravity pools.
+   * The one vendor request that answers for both Antigravity pools.
    *
    * The body carries the project only when the credential names one, an empty
    * object otherwise: a `{"project": ""}` would ask the vendor about a project
-   * that has no id. The `User-Agent` is the pinned one, whose default is what
-   * makes the vendor report the Argon pool at all.
+   * that has no id.
    */
   async function antigravity(credential: AntigravityToken): Promise<AntigravityReadings> {
     if (!("token" in credential)) return poolFailure(credential.error, now());
@@ -410,12 +409,12 @@ function afterAttempts(note: string, attempts: number): string {
  * The `User-Agent` Antigravity's own current client sends, and the reason it is
  * pinned rather than borrowed from whatever called pi.
  *
- * Load-bearing, not cosmetic: Google omits the Argon group from
- * `retrieveUserQuotaSummary` for older agent strings, so a request that looks
- * like an old CLI silently reports two pools instead of three — an honest failed
- * Argon rail whose cause is nowhere in the body. Bumping the version is a change
- * to what the vendor is willing to tell us, so it is one constant with one
- * documented override.
+ * The quota summary is read off the ledger of the client whose id the header
+ * states, so the request has to look like that client: the pinned string is the
+ * one the vendor's own CLI sends, and the override exists for a proxy that
+ * rewrites the header or a future vendor build that demands a newer string.
+ * It is one constant with one documented override, so a machine can follow the
+ * vendor without a release of this extension.
  */
 export const DEFAULT_ANTIGRAVITY_USER_AGENT =
   "antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=982146307; auth_method=consumer)";
@@ -433,7 +432,7 @@ export function antigravityUserAgent(env: NodeJS.ProcessEnv = process.env): stri
   return env.ANTIGRAVITY_USER_AGENT?.trim() || DEFAULT_ANTIGRAVITY_USER_AGENT;
 }
 
-/** The three pools one summary describes; a pool it said nothing about is that pool's own failure. */
+/** The pools one summary describes; a pool it said nothing about is that pool's own failure. */
 function poolReadings(
   windows: Record<AntigravityRail, readonly RailWindow[]>,
   readAt: number,
@@ -445,7 +444,6 @@ function poolReadings(
     return { rail, ok: true, windows: found, readAt, raw };
   };
   return {
-    "antigravity-argon": pool("antigravity-argon"),
     "antigravity-gemini": pool("antigravity-gemini"),
     "antigravity-3p": pool("antigravity-3p"),
   };
@@ -455,19 +453,18 @@ function poolReadings(
  * One failure for the whole group, stamped once.
  *
  * A credential or transport failure happened once, at one instant; giving each
- * pool its own `now()` would date one failure three ways. `raw` is absent, not
+ * pool its own `now()` would date one failure two ways. `raw` is absent, not
  * carried from an earlier read: a failure reports why it failed and nothing
  * else.
  *
  * Exported because a caller that acquires the credential is the one that knows
- * a group failed before any request was made, and building three rails' worth of
+ * a group failed before any request was made, and building every rail's worth of
  * that answer is this module's shape to know.
  */
 export function poolFailure(note: string, readAt: number): AntigravityReadings {
   const pool = <R extends AntigravityRail>(rail: R): VendorReading & { rail: R } =>
     failedReading(rail, note, readAt);
   return {
-    "antigravity-argon": pool("antigravity-argon"),
     "antigravity-gemini": pool("antigravity-gemini"),
     "antigravity-3p": pool("antigravity-3p"),
   };

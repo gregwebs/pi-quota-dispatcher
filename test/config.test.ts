@@ -884,13 +884,13 @@ test("mergeConfig accepts the claude-bridge model on the claude rail", () => {
 
 // ---------------------------------------------------------------- antigravity pools
 
-test("the rail vocabulary is the five capped rails and the metered one", () => {
+test("the rail vocabulary is the four capped rails and the metered one", () => {
   assert.deepEqual(
     [...RAILS],
-    ["claude", "codex", "antigravity-argon", "antigravity-gemini", "antigravity-3p", "deepseek"],
-    "one canonical order, with the three pools as one account's group",
+    ["claude", "codex", "antigravity-gemini", "antigravity-3p", "deepseek"],
+    "one canonical order, with the pools as one account's group",
   );
-  assert.deepEqual([...ANTIGRAVITY_RAILS], ["antigravity-argon", "antigravity-gemini", "antigravity-3p"]);
+  assert.deepEqual([...ANTIGRAVITY_RAILS], ["antigravity-gemini", "antigravity-3p"]);
   for (const rail of RAILS) {
     assert.equal(isRail(rail), true, rail);
     assert.equal(isAntigravityRail(rail), rail.startsWith("antigravity-"), rail);
@@ -902,7 +902,7 @@ test("the rail vocabulary is the five capped rails and the metered one", () => {
   }
 });
 
-test("railFromModel classifies each family, Argon before the general gemini prefix", () => {
+test("railFromModel classifies each family, with the Gemini pools sharing a prefix", () => {
   const cases: Array<[string, Rail | undefined]> = [
     ["claude-bridge/claude-opus-5-5", "claude"],
     ["anthropic/claude-sonnet", "claude"],
@@ -912,10 +912,10 @@ test("railFromModel classifies each family, Argon before the general gemini pref
     // rail is registered in the `models` table instead (ADR-0022).
     ["openai/gpt-6.1-sol", undefined],
     ["deepseek/deepseek-flash", "deepseek"],
-    ["antigravity/gemini-4-argon", "antigravity-argon"],
-    // The pool's own models share the stem, so a suffix is still Argon — and
-    // `gemini-argon-` starts with `gemini-`, which is why the order matters.
-    ["antigravity/gemini-4-argon-extra", "antigravity-argon"],
+    // The retired Argon pool's models keep the general Gemini prefix: there is
+    // no other pool left for them to draw on.
+    ["antigravity/gemini-4-argon", "antigravity-gemini"],
+    ["antigravity/gemini-4-argon-extra", "antigravity-gemini"],
     ["antigravity/gemini-4-7-flash", "antigravity-gemini"],
     ["antigravity/gemini-4-7-pro", "antigravity-gemini"],
     ["antigravity/claude-opus-5-5", "antigravity-3p"],
@@ -935,12 +935,10 @@ test("each Antigravity pool registers as its own rail without a warning", () => 
       source: "project",
       data: {
         models: {
-          "antigravity/gemini-4-argon": { rail: "antigravity-argon" },
           "antigravity/gemini-4-7-flash": { rail: "antigravity-gemini" },
           "antigravity/claude-opus-5-5": { rail: "antigravity-3p" },
         },
         agents: {
-          planner: { primary: { model: "antigravity/gemini-4-argon" } },
           flash: { primary: { model: "antigravity/gemini-4-7-flash" } },
           proxy: { primary: { model: "antigravity/claude-opus-5-5" } },
         },
@@ -949,29 +947,29 @@ test("each Antigravity pool registers as its own rail without a warning", () => 
   ]);
   assert.deepEqual(r.warnings, []);
   assert.deepEqual(
-    ["planner", "flash", "proxy"].map((a) => r.config.agents[agentName(a)].primary.rail),
-    ["antigravity-argon", "antigravity-gemini", "antigravity-3p"],
+    ["flash", "proxy"].map((a) => r.config.agents[agentName(a)].primary.rail),
+    ["antigravity-gemini", "antigravity-3p"],
   );
   // Each registration really is the layer's, so provenance can say where a pool
   // came from when a route points at the wrong one.
-  assert.equal(r.sources["models.antigravity/gemini-4-argon.rail"], "project");
+  assert.equal(r.sources["models.antigravity/gemini-4-7-flash.rail"], "project");
 });
 
 test("a model registered on the wrong Antigravity pool warns and is applied", () => {
-  // The two Gemini pools are the trap: both serve Gemini models, so only the
-  // prefix check can tell a mis-registered route from a correct one.
+  // The two pools serve different model families, so a registration that names
+  // the other one is a mis-registered route the prefix check can catch.
   const r = mergeConfig(base(), [
     {
       source: "project",
       data: {
-        models: { "antigravity/gemini-4-argon": { rail: "antigravity-gemini" } },
-        agents: { planner: { primary: { model: "antigravity/gemini-4-argon" } } },
+        models: { "antigravity/gpt-6-codex": { rail: "antigravity-gemini" } },
+        agents: { planner: { primary: { model: "antigravity/gpt-6-codex" } } },
       },
     },
   ]);
   assert.equal(r.config.agents[agentName("planner")].primary.rail, "antigravity-gemini");
   assert.ok(
-    r.warnings.some((w) => w.includes("antigravity-argon") && w.includes("antigravity-gemini")),
+    r.warnings.some((w) => w.includes("antigravity-3p") && w.includes("antigravity-gemini")),
     r.warnings.join("\n"),
   );
 });
@@ -2320,7 +2318,6 @@ test("the rail rejection names every rail, at a candidate and in the models tabl
   const RAILS_AS_WRITTEN = [
     '"claude"',
     '"codex"',
-    '"antigravity-argon"',
     '"antigravity-gemini"',
     '"antigravity-3p"',
     '"deepseek"',
@@ -2356,6 +2353,22 @@ test("the rail rejection names every rail, at a candidate and in the models tabl
   const entry = table.config.models[modelId("antigravity/claude-opus-5-5")];
   assert.equal(entry?.rail, undefined);
   assert.equal(entry?.thinking, "low");
+});
+
+test("the retired Argon rail is not a rail any more", () => {
+  // The pool was removed with its quota, so its name is now an unknown rail: it
+  // is warned about and contributes nothing, and the route beneath it stands.
+  const r = mergeConfig(base(), [
+    {
+      source: "project",
+      data: { agents: { planner: { primary: { rail: "antigravity-argon" } } } },
+    },
+  ]);
+  assert.equal(r.config.agents[agentName("planner")].primary.rail, "claude");
+  const warning = r.warnings.find((w) => w.includes("agents.planner.primary.rail"));
+  assert.ok(warning, r.warnings.join("\n"));
+  assert.match(warning, /must be one of/);
+  assert.ok(!warning.includes("antigravity-argon"), `the retired rail must not be offered: ${warning}`);
 });
 
 test("the models table rejects a shapeless key, a shapeless entry and an unknown key", () => {
