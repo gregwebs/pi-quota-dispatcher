@@ -920,6 +920,18 @@ function frontmatter(src: string): string | undefined {
 /** The uncommented `model:` line, capturing everything after the colon. */
 const MODEL_LINE = /^model:[ \t]*(.*?)[ \t]*$/m;
 
+// Insertion anchors stop before `\r` so the bytes after them are the line-ending
+// evidence. This keeps a CRLF insertion from doubling the carriage return.
+const NAME_INSERTION_LINE = /^name:[^\r\n]*/m;
+const MODEL_INSERTION_LINE = /^model:[^\r\n]*/m;
+
+function insertAfterLine(head: string, anchor: RegExp, line: string): string {
+  return head.replace(anchor, (anchoredLine, offset, source) => {
+    const lineEnding = source.startsWith("\r\n", offset + anchoredLine.length) ? "\r\n" : "\n";
+    return `${anchoredLine}${lineEnding}${line}`;
+  });
+}
+
 /**
  * Strip one layer of quoting and any trailing comment, so the value read here is
  * the model the file actually declares rather than the bytes around it.
@@ -1009,8 +1021,8 @@ export function upsertModel(src: string, model: ModelId): string | null {
     if (activeModel(head) === model) return src;
     return head.replace(MODEL_LINE, line) + tail;
   }
-  if (/^name:[^\n]*$/m.test(head)) {
-    return head.replace(/^name:[^\n]*$/m, (l) => `${l}\n${line}`) + tail;
+  if (NAME_INSERTION_LINE.test(head)) {
+    return insertAfterLine(head, NAME_INSERTION_LINE, line) + tail;
   }
   return null;
 }
@@ -1070,11 +1082,11 @@ export function upsertThinking(src: string, thinking: ThinkingLevel | undefined)
   }
   // Beside the model it qualifies where there is one, and after `name:`, where
   // `upsertModel` puts a model line it has to insert.
-  if (MODEL_LINE.test(head)) {
-    return head.replace(MODEL_LINE, (l) => `${l}\n${line}`) + tail;
+  if (MODEL_INSERTION_LINE.test(head)) {
+    return insertAfterLine(head, MODEL_INSERTION_LINE, line) + tail;
   }
-  if (/^name:[^\n]*$/m.test(head)) {
-    return head.replace(/^name:[^\n]*$/m, (l) => `${l}\n${line}`) + tail;
+  if (NAME_INSERTION_LINE.test(head)) {
+    return insertAfterLine(head, NAME_INSERTION_LINE, line) + tail;
   }
   return src;
 }
