@@ -125,11 +125,10 @@ Agent files found in ~/.pi/agent/agents:
 Then run /quota-dispatch: the next pass picks up the edit and shows what it would do.
 ```
 
-The snippet is built from the model each agent file **already** declares, and
-each model's `rail` is derived from its prefix and registered once under
-`models`, so the snippet is inert until you paste it. A file with no model, or
-with a model whose prefix is not one of the rails this extension reads, is
-listed but left out rather than guessed at.
+The snippet is built from the model each agent file **already** declares. A
+model already registered in `models` keeps that entry's `rail`; an unregistered
+model falls back to its recognised prefix, and one with neither is listed but
+left out rather than guessed at. The snippet is inert until you paste it.
 
 While the table is empty, a footer line (`quota-dispatcher: no agents
 configured`) holds the state, and clears as soon as a route exists. The rail

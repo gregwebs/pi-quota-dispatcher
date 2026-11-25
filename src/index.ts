@@ -146,7 +146,15 @@ import { parseAgentName, parseModelId } from "./identifiers.ts";
 import { validatedEntries, validatedKeys } from "./validated-keys.ts";
 
 // The models module resolves a config's model ids against the pi that is running.
-import { checkModels, modelLookup, type DroppedAlternate, type ModelMiss, unknownModelNote } from "./models.ts";
+import {
+  checkModels,
+  modelLookup,
+  splitModelId,
+  type DroppedAlternate,
+  type ModelLookup,
+  type ModelMiss,
+  unknownModelNote,
+} from "./models.ts";
 
 // The coordination module is where a write to a shared agent file is made safe,
 // and the only thing in this extension that takes a lock.
@@ -1460,11 +1468,16 @@ export function agentSelectionReader(agentDir: string): (agent: AgentName) => Pr
  * the two cannot disagree about what counts as derivable. A file is left out —
  * not guessed at — when it names no agent (a scoped file, which no route can
  * target), when a second readable file claims its name, when it declares no
- * model, when its prefix names a rail we do not know, or when the config seam
- * would reject its name. Every one of those would produce a table that warns the
- * moment it was pasted: a contested name would be held, not dispatched.
+ * model, when neither its registration nor its prefix names a rail, or when the
+ * config seam would reject its name. Every one of those would produce a table
+ * that warns the moment it was pasted: a contested name would be held, not
+ * dispatched.
  */
-function derivableCandidates(files: AgentFile[]): Array<[AgentName, Candidate]> {
+function derivableCandidates(
+  files: AgentFile[],
+  modelDefaults?: Record<ModelId, ModelDefault>,
+  modelAvailability?: ModelLookup,
+): Array<[AgentName, Candidate]> {
   const claims = new Map<string, number>();
   for (const file of files) {
     if (file.kind !== "agent" || file.unreadable) continue;
@@ -1478,10 +1491,25 @@ function derivableCandidates(files: AgentFile[]): Array<[AgentName, Candidate]> 
     if ((claims.get(file.name) ?? 0) > 1) continue;
     const name = parseAgentName(file.name);
     if ("rejection" in name) continue;
-    const rail = railFromModel(file.model);
-    if (rail === undefined) continue;
     const model = parseModelId(file.model);
     if ("rejection" in model) continue;
+    const registration = modelDefaults !== undefined && Object.hasOwn(modelDefaults, model.value)
+      ? modelDefaults[model.value]
+      : undefined;
+    // A registration is newly enough evidence to make an otherwise unknown
+    // prefix proposable, so preserve `checkModels`' known-bad rule when pi can
+    // answer: an unspawnable registered model is not resurrected as a proposal.
+    if (registration !== undefined && modelAvailability !== undefined) {
+      const split = splitModelId(model.value);
+      if (split === undefined || !modelAvailability(split.provider, split.modelId)) continue;
+    }
+    // Registration wins even if it contradicts the prefix: it is the user's
+    // statement of which account draws the work, while a prefix is only a
+    // default for a model nobody registered. A rail-less registration therefore
+    // does not fall through to the prefix and cannot turn an incomplete table
+    // entry into a guess.
+    const rail = registration === undefined ? railFromModel(model.value) : registration.rail;
+    if (rail === undefined) continue;
     candidates.push([name.value, { model: model.value, rail }]);
   }
   return candidates;
@@ -1489,19 +1517,24 @@ function derivableCandidates(files: AgentFile[]): Array<[AgentName, Candidate]> 
 
 /**
  * A paste-ready config fragment built from the agent files found: each file's
- * current `model:` becomes one primary, and the rail derived from that model's
- * prefix is registered once in the `models` table, so the candidates themselves
- * name only a model.
+ * current `model:` becomes one primary, and its registered rail — or, for an
+ * unregistered model, the rail its prefix implies — is registered once in the
+ * `models` table, so the candidates themselves name only a model.
  *
- * A file whose model has no recognised prefix contributes nothing — inventing a
- * rail would be a guess the user then pastes and the loader then warns about —
- * and neither does a file that declares no model at all. Returns the lines of a
- * JSON object, so the caller can indent it into a message.
+ * A file whose model has neither registration nor recognised prefix contributes
+ * nothing — inventing a rail would be a guess the user then pastes and the
+ * loader then warns about — and neither does a file that declares no model at
+ * all. Returns the lines of a JSON object, so the caller can indent it into a
+ * message.
  */
-export function agentTableSnippet(files: AgentFile[]): string[] {
+export function agentTableSnippet(
+  files: AgentFile[],
+  modelDefaults?: Record<ModelId, ModelDefault>,
+  modelAvailability?: ModelLookup,
+): string[] {
   const models: Record<string, ModelDefault> = {};
   const agents: Record<string, { primary: { model: string } }> = {};
-  for (const [name, candidate] of derivableCandidates(files)) {
+  for (const [name, candidate] of derivableCandidates(files, modelDefaults, modelAvailability)) {
     models[candidate.model] = { rail: candidate.rail };
     agents[name] = { primary: { model: candidate.model } };
   }
@@ -1536,8 +1569,8 @@ export function describeAgentFiles(files: AgentFile[]): string[] {
 
 /**
  * What a fresh, unconfigured install has to say for itself: which file to
- * configure, a paste-ready snippet built from the agent files it found, and the
- * list of those files.
+ * configure, a paste-ready snippet built from the agent files it found and its
+ * existing model registrations, and the list of those files.
  *
  * Pure, and separate from the UI call, so the wording is testable without a
  * terminal. Unlike `describeAgentFiles` this is not a report — it exists to be
@@ -1547,14 +1580,16 @@ export function unconfiguredNotice(
   configPath: string,
   agentDir: string,
   files: AgentFile[],
+  modelDefaults?: Record<ModelId, ModelDefault>,
+  modelAvailability?: ModelLookup,
 ): string[] {
   const lines = [
     "quota-dispatcher: no agents are configured, so nothing is managed yet.",
     `Name them in ${configPath} to start routing.`,
   ];
 
-  if (derivableCandidates(files).length) {
-    lines.push("For example:", "", ...agentTableSnippet(files));
+  if (derivableCandidates(files, modelDefaults, modelAvailability).length) {
+    lines.push("For example:", "", ...agentTableSnippet(files, modelDefaults, modelAvailability));
   } else if (files.length) {
     // A snippet of `{"agents": {}}` would configure nothing, so say why there
     // is nothing to paste rather than print it.
@@ -2884,7 +2919,10 @@ async function announceUnconfigured(
   const configPath =
     loaded.files.find((file) => file.source === "global")?.path ?? globalConfigPath();
   const files = await readAgentFiles(agentDir);
-  ctx.ui.notify(unconfiguredNotice(configPath, agentDir, files).join("\n"), "warning");
+  ctx.ui.notify(
+    unconfiguredNotice(configPath, agentDir, files, loaded.config.models, modelLookup(ctx)).join("\n"),
+    "warning",
+  );
 }
 
 /**
