@@ -194,13 +194,18 @@ function trimTail(chunks: Buffer[], state: { bytes: number }, cap: number): void
  * A generator may exit without reading its stdin, or close it partway; either
  * leaves the pipe with no reader, and the write then fails with a reader-gone
  * code. The code seen in practice is `EPIPE` (a generator that exits without
- * reading); `ECONNRESET` and `ERR_STREAM_DESTROYED` are the same class of
- * "nothing is reading" that a socket can raise. This process is the pipe's only
- * writer, so a reader-gone error cannot be a mistake this code made, and the
- * run's verdict is the child's exit status.
+ * reading); `ECONNRESET`, `ENOTCONN` and `ERR_STREAM_DESTROYED` are the same
+ * class of "nothing is reading" that a socket can raise. This process is the
+ * pipe's only writer, so a reader-gone error cannot be a mistake this code made,
+ * and the run's verdict is the child's exit status.
  */
-function stdinReaderIsGone(err: unknown): boolean {
-  return errnoIs(err, "EPIPE") || errnoIs(err, "ECONNRESET") || errnoIs(err, "ERR_STREAM_DESTROYED");
+export function stdinReaderIsGone(err: unknown): boolean {
+  return (
+    errnoIs(err, "EPIPE") ||
+    errnoIs(err, "ECONNRESET") ||
+    errnoIs(err, "ENOTCONN") ||
+    errnoIs(err, "ERR_STREAM_DESTROYED")
+  );
 }
 
 /**

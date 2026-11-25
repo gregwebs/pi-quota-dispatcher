@@ -22,6 +22,7 @@ import {
   describeStderr,
   generateConfig,
   runBash,
+  stdinReaderIsGone,
 } from "../src/generator.ts";
 import {
   generatorInput,
@@ -1031,6 +1032,13 @@ test("timeoutMs still bounds the command after a slow input", async (t) => {
 });
 
 // ------------------------------------------------------- runBash process behavior
+
+test("stdin reader-gone errors leave the generator verdict to its exit status", () => {
+  for (const code of ["EPIPE", "ECONNRESET", "ENOTCONN", "ERR_STREAM_DESTROYED"]) {
+    assert.equal(stdinReaderIsGone(Object.assign(new Error(code), { code })), true, code);
+  }
+  assert.equal(stdinReaderIsGone(Object.assign(new Error("no space"), { code: "ENOSPC" })), false);
+});
 
 function runOrFail(input: Omit<BashRunInput, "stdin"> & { stdin?: string }): Promise<Awaited<ReturnType<typeof runBash>>> {
   const { stdin = "", ...rest } = input;
