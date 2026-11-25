@@ -454,6 +454,13 @@ const OWNED_PATH_SCALARS: ReadonlyMap<string, string> = new Map([
 ]);
 
 /**
+ * Configurable credential seams must name a file. Whitespace is only inspected
+ * to reject an absent name; accepted paths stay verbatim so this seam neither
+ * normalizes filesystem spellings nor changes path-reader semantics.
+ */
+const SETTABLE_PATH_SCALARS: ReadonlySet<ScalarKey> = new Set(["claudeCredsPath", "codexCredsPath"]);
+
+/**
  * The string scalars that accept one of a closed set, and that set as a
  * rejection words it.
  *
@@ -2154,6 +2161,9 @@ export function mergeConfig(
         }
       } else if (typeof value !== "string") {
         warn(`"${key}" must be a string`);
+        continue;
+      } else if (SETTABLE_PATH_SCALARS.has(scalar) && value.trim().length === 0) {
+        warn(`"${key}" must be a non-empty string`);
         continue;
       }
       scalarTarget[scalar] = value as string | number | boolean;

@@ -732,6 +732,32 @@ test("mergeConfig applies codexCredsPath as a read-only credential seam", () => 
   }
 });
 
+test("mergeConfig refuses blank settable credential paths without changing provenance", () => {
+  for (const key of ["claudeCredsPath", "codexCredsPath"] as const) {
+    for (const blank of ["", " \t "]) {
+      const fromBuiltIn = mergeConfig(base(), [{ source: "global", data: { [key]: blank } }]);
+      assert.equal(fromBuiltIn.config[key], base()[key], `${key} ${JSON.stringify(blank)} value`);
+      assert.equal(fromBuiltIn.sources[key], "built-in", `${key} ${JSON.stringify(blank)} source`);
+      assert.ok(
+        fromBuiltIn.warnings.some((w) => w.includes(`"${key}" must be a non-empty string`)),
+        `${key} ${JSON.stringify(blank)}: ${fromBuiltIn.warnings.join("\n")}`,
+      );
+
+      const lowerValue = `/global/${key}.json`;
+      const fromGlobal = mergeConfig(base(), [
+        { source: "global", data: { [key]: lowerValue } },
+        { source: "project", data: { [key]: blank } },
+      ]);
+      assert.equal(fromGlobal.config[key], lowerValue, `${key} ${JSON.stringify(blank)} lower value`);
+      assert.equal(fromGlobal.sources[key], "global", `${key} ${JSON.stringify(blank)} lower source`);
+      assert.ok(
+        fromGlobal.warnings.some((w) => w.includes(`"${key}" must be a non-empty string`)),
+        `${key} ${JSON.stringify(blank)}: ${fromGlobal.warnings.join("\n")}`,
+      );
+    }
+  }
+});
+
 test("mergeConfig applies claudeCredsPath but rejects the agent-dir-owned path scalars", () => {
   const defaults = base();
   for (const source of ["global", "project"] as const) {
