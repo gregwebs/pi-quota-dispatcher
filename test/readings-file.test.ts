@@ -222,10 +222,10 @@ test("two real processes share one request, including an overlapping reader", as
   const fx = await fixture(t);
   const marker = join(fx.root, "fetching"); const release = join(fx.root, "release");
   const a = spawnReadingsChild({ readingsPath: fx.path, credential: fx.credential, marker, release, delayMs: 20 }); t.after(a.kill);
-  await waitUntil("first child's fetch", () => existsSync(marker));
+  await waitUntil("first child's fetch", () => existsSync(marker), { child: a });
   const waitingMarker = join(fx.root, "second-waiting");
   const b = spawnReadingsChild({ readingsPath: fx.path, credential: fx.credential, waitingMarker }); t.after(b.kill);
-  await waitUntil("second child waiting on the fetch lock", () => existsSync(waitingMarker));
+  await waitUntil("second child waiting on the fetch lock", () => existsSync(waitingMarker), { child: b });
   await writeFile(release, "go");
   const [ar, br] = await Promise.all([a.done, b.done]);
   assertCleanExit(ar); assertCleanExit(br);
@@ -672,14 +672,14 @@ test("a real child asking for a different pool joins one grouped request", async
   const waiting = join(fx.root, "group-waiting");
   const a = spawnReadingsChild({ readingsPath: fx.path, credential: fx.credential, rail: "antigravity-gemini", marker, release, delayMs: 20 });
   t.after(a.kill);
-  await waitUntil("first child's grouped fetch", () => existsSync(marker));
+  await waitUntil("first child's grouped fetch", () => existsSync(marker), { child: a });
   // The second child arrives while the first is *inside* its fetch — so the first
   // is holding the group's fetch lock, and the only way the second can be asleep
   // is inside that one lock's wait. Its `waitingMarker` is what proves it: a pool
   // that took a lock of its own would never sleep at all.
   const b = spawnReadingsChild({ readingsPath: fx.path, credential: fx.credential, rail: "antigravity-3p", waitingMarker: waiting });
   t.after(b.kill);
-  await waitUntil("the second child to wait on the group's fetch lock", () => existsSync(waiting));
+  await waitUntil("the second child to wait on the group's fetch lock", () => existsSync(waiting), { child: b });
   await writeFile(release, "go");
   const [ar, br] = await Promise.all([a.done, b.done]);
   assertCleanExit(ar); assertCleanExit(br);

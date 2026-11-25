@@ -100,7 +100,7 @@ async function runTogether<T>(dir: string, jobs: Array<Record<string, unknown>>)
     return { ready, ...spawnFixture({ ...job, readyMarker: ready, awaitFile: release }) };
   });
   await Promise.all(
-    children.map((child) => waitUntil("a child to be loaded", () => existsSync(child.ready))),
+    children.map((child) => waitUntil("a child to be loaded", () => existsSync(child.ready), { child })),
   );
   await writeFile(release, "", "utf8");
   return Promise.all(
@@ -163,7 +163,7 @@ test("an edit another process makes while a pass waits survives that pass's writ
   const release = join(dir, ".start");
   await writeFile(file, agentFileText("a/b"), "utf8");
 
-  const { done } = spawnFixture({
+  const child = spawnFixture({
     kind: "apply",
     file,
     model: modelId("c/d"),
@@ -172,7 +172,8 @@ test("an edit another process makes while a pass waits survives that pass's writ
     readyMarker: ready,
     awaitFile: release,
   });
-  await waitUntil("the child to load", () => existsSync(ready));
+  const { done } = child;
+  await waitUntil("the child to load", () => existsSync(ready), { child });
   // The child's snapshot is the model from before this edit; the edit is a body
   // note no pass wrote.
   await writeFile(file, `${agentFileText("a/b")}\nA note added by another process.\n`, "utf8");
@@ -979,7 +980,7 @@ test("a lock left by a killed process is taken over at once", async (t) => {
     marker,
     pacing: { staleMs: 30_000, waitMs: 100, pollMs: 2 },
   });
-  await waitUntil("the doomed child to take the lock", () => existsSync(marker));
+  await waitUntil("the doomed child to take the lock", () => existsSync(marker), { child: crashed });
   const killed = await crashed.done;
   assert.equal(killed.signal, "SIGKILL", "the child was supposed to leave its lock behind");
   assert.equal(existsSync(await lockFor(file)), true, "the crash left no lock to recover from");

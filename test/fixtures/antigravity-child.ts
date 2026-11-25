@@ -82,7 +82,7 @@ interface Job {
   quota?: { status: number; body?: unknown };
 }
 
-export function spawnAntigravityChild(job: Job): { done: Promise<ChildResult>; kill: () => void } {
+export function spawnAntigravityChild(job: Job): { done: Promise<ChildResult>; stderr: () => string; kill: () => void } {
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), JSON.stringify(job)], {
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -99,7 +99,7 @@ export function spawnAntigravityChild(job: Job): { done: Promise<ChildResult>; k
     child.on("error", (err) => { clearTimeout(timer); reject(err); });
     child.on("close", (code, signal) => { clearTimeout(timer); resolve({ code, signal, stdout, stderr }); });
   });
-  return { done, kill: () => { child.kill("SIGKILL"); } };
+  return { done, stderr: () => stderr, kill: () => { child.kill("SIGKILL"); } };
 }
 
 interface Request {

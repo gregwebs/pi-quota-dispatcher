@@ -3,8 +3,29 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { runFixture } from "./fixtures/agent-write-child.ts";
+import { runFixture, spawnFixture, waitUntil } from "./fixtures/agent-write-child.ts";
 import { tempDir } from "./helpers/temp-dir.ts";
+
+test("a child that exits before its marker reports its diagnostic", async () => {
+  const child = spawnFixture({
+    kind: "exit-before-marker",
+    exitCode: 23,
+    stderr: "intentional fixture failure\n",
+  });
+
+  await assert.rejects(
+    waitUntil("the child marker", () => false, { child }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /the child exited before writing the child marker/);
+      assert.match(error.message, /exit code: 23/);
+      assert.match(error.message, /signal: null/);
+      assert.match(error.message, /intentional fixture failure/);
+      return true;
+    },
+  );
+  assert.equal((await child.done).code, 23);
+});
 
 // The child fixture decodes a JSON job, so the model it carries is a raw string
 // again. This is the one place the migration plan asks the fixture to validate:

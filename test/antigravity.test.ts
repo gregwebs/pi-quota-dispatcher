@@ -557,14 +557,14 @@ test("a refresh that times out is waited for once, and the next read recovers wi
   });
   t.after(child.kill);
 
-  await waitUntil("the resolver to be entered", () => existsSync(started));
+  await waitUntil("the resolver to be entered", () => existsSync(started), { child });
   // Only once all three timed-out reads are behind us may the refresh finish, so
   // "no expired token was sent while pending" is a fact about those reads and
   // not a race with the parent's cues.
-  await waitUntil("the pending reads to finish", () => existsSync(batchDone));
+  await waitUntil("the pending reads to finish", () => existsSync(batchDone), { child });
   assert.ok(!existsSync(persisted), "the refresh has not finished yet");
   await writeFile(release, "go");
-  await waitUntil("the refreshed bytes", () => existsSync(persisted));
+  await waitUntil("the refreshed bytes", () => existsSync(persisted), { child });
   await writeFile(proceed, "go");
 
   const result = await child.done;
