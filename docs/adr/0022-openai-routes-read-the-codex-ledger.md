@@ -98,12 +98,9 @@ warning cannot fire for it, because there is no prefix fact to contradict. For
 those models the `models` entry is the only statement of which account the work
 draws on.
 
-The startup snippet degrades with it: `agentTableSnippet` skips an agent file
-whose model has no recognised prefix rather than inventing a rail, so a fresh
-install whose files already declare `openai/*` models gets no proposal for
-them. That is the same choice 0005 made — no guess the user then pastes and the
-loader then warns about — and improving it means deriving from the `models`
-table, which is its own change.
+The startup snippet takes a registered model's rail from the `models` table;
+only an unregistered model falls back to a recognised prefix, and a model with
+neither is still skipped rather than guessed at under 0005's rule.
 
 ## Considered options
 

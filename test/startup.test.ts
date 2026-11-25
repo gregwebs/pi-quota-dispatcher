@@ -24,6 +24,7 @@ import {
 import {
   type ModelMiss,
 } from "../src/models.ts";
+import { modelTable } from "./helpers/identifiers.ts";
 import { tempDir } from "./helpers/temp-dir.ts";
 
 // The package does not re-export ENV_AGENT_DIR from its root, so use the
@@ -250,6 +251,56 @@ test("agentTableSnippet drops a file with no model, an unknown prefix, or an unu
   for (const excluded of ["mystery", "blank", "a/b"]) {
     assert.equal(excluded in agents, false, `${excluded} must contribute nothing`);
   }
+});
+
+test("agentTableSnippet takes registered rails before prefixes", () => {
+  const files: AgentFile[] = [
+    { kind: "agent", name: "chatgpt", file: "/a/chatgpt.md", model: "openai/gpt-6.1-sol" },
+    { kind: "agent", name: "contradiction", file: "/a/contradiction.md", model: "deepseek/deepseek-flash" },
+  ];
+  const { models } = JSON.parse(agentTableSnippet(files, modelTable({
+    "openai/gpt-6.1-sol": { rail: "codex" },
+    "deepseek/deepseek-flash": { rail: "claude" },
+  })).join("\n"));
+
+  assert.deepEqual(models, {
+    "openai/gpt-6.1-sol": { rail: "codex" },
+    "deepseek/deepseek-flash": { rail: "claude" },
+  });
+});
+
+test("agentTableSnippet omits a registered model this pi cannot spawn", () => {
+  const files: AgentFile[] = [
+    { kind: "agent", name: "chatgpt", file: "/a/chatgpt.md", model: "openai/gpt-6.1-sol" },
+  ];
+  const snippet = JSON.parse(agentTableSnippet(files, modelTable({
+    "openai/gpt-6.1-sol": { rail: "codex" },
+  }), () => false).join("\n"));
+
+  assert.deepEqual(snippet, { models: {}, agents: {} });
+});
+
+test("agentTableSnippet falls back to a prefix for an unregistered model", () => {
+  const files: AgentFile[] = [
+    { kind: "agent", name: "writer", file: "/a/writer.md", model: "deepseek/deepseek-flash" },
+  ];
+  const { models } = JSON.parse(agentTableSnippet(files, modelTable({
+    "openai/gpt-6.1-sol": { rail: "codex" },
+  }), () => false).join("\n"));
+
+  assert.deepEqual(models, { "deepseek/deepseek-flash": { rail: "deepseek" } });
+});
+
+test("agentTableSnippet skips a model with neither a registration nor recognised prefix", () => {
+  const files: AgentFile[] = [
+    { kind: "agent", name: "mystery", file: "/a/mystery.md", model: "mystery/thing" },
+  ];
+  const { models, agents } = JSON.parse(agentTableSnippet(files, modelTable({
+    "openai/gpt-6.1-sol": { rail: "codex" },
+  })).join("\n"));
+
+  assert.deepEqual(models, {});
+  assert.deepEqual(agents, {});
 });
 
 // ---------------------------------------------------------------- describeAgentFiles
