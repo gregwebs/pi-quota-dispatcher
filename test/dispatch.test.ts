@@ -230,6 +230,20 @@ test("upsertModel still inserts a model line when there is none", () => {
   assert.match(out, /^model: "openai-codex\/gpt-6-sol"$/m);
 });
 
+test("upsertModel inserts with the name line ending without normalizing others", () => {
+  const crlf = `---\r\nname: x\r\ntools: read\r\n---\r\n`;
+  const crlfOut = upsertModel(crlf, modelId("c/d"));
+  assert.equal(crlfOut, `---\r\nname: x\r\nmodel: "c/d"\r\ntools: read\r\n---\r\n`);
+  assert.doesNotMatch(crlfOut!, /(?<!\r)\n/);
+  assert.doesNotMatch(crlfOut!, /\r\r\n/);
+
+  const lf = `---\nname: x\ntools: read\n---\n`;
+  assert.equal(upsertModel(lf, modelId("c/d")), `---\nname: x\nmodel: "c/d"\ntools: read\n---\n`);
+
+  const mixed = `---\r\nname: x\ntools: read\r\n---\r\n`;
+  assert.equal(upsertModel(mixed, modelId("c/d")), `---\r\nname: x\nmodel: "c/d"\ntools: read\r\n---\r\n`);
+});
+
 test("applyDecision reports unchanged, and writes nothing, when only the quoting differs", async (t) => {
   const dir = await tempDir(t, "unchanged");
   const file = join(dir, "agent.md");
@@ -281,6 +295,23 @@ test("upsertThinking puts the level beside the model line", () => {
     upsertThinking(src, "high"),
     `---\nname: x\nmodel: "a/b"\nthinking: high\ntools: read\n---\n\nBody.\n`,
   );
+});
+
+test("upsertThinking inserts with its anchor line ending without normalizing others", () => {
+  const crlf = `---\r\nname: x\r\nmodel: a/b\r\ntools: read\r\n---\r\n`;
+  const crlfOut = upsertThinking(crlf, "high");
+  assert.equal(crlfOut, `---\r\nname: x\r\nmodel: a/b\r\nthinking: high\r\ntools: read\r\n---\r\n`);
+  assert.doesNotMatch(crlfOut, /(?<!\r)\n/);
+  assert.doesNotMatch(crlfOut, /\r\r\n/);
+
+  const lf = `---\nname: x\nmodel: a/b\ntools: read\n---\n`;
+  assert.equal(upsertThinking(lf, "high"), `---\nname: x\nmodel: a/b\nthinking: high\ntools: read\n---\n`);
+
+  const mixed = `---\r\nname: x\r\nmodel: a/b\ntools: read\r\n---\r\n`;
+  assert.equal(upsertThinking(mixed, "high"), `---\r\nname: x\r\nmodel: a/b\nthinking: high\ntools: read\r\n---\r\n`);
+
+  const nameFallback = `---\r\nname: x\r\ntools: read\r\n---\r\n`;
+  assert.equal(upsertThinking(nameFallback, "high"), `---\r\nname: x\r\nthinking: high\r\ntools: read\r\n---\r\n`);
 });
 
 test("upsertThinking replaces the active level and leaves a commented one alone", () => {

@@ -1157,7 +1157,8 @@ stale-but-sane one.
 **It never touches your notes.** Only the uncommented `model:` line is rewritten
 — plus the uncommented `thinking:` line, and only when a level actually resolved.
 `# model:` alternatives, `fallbackModels:` blocks, a commented-out `# thinking:`
-note, and everything else in the frontmatter and body survive byte-for-byte. See
+note, and everything else in the frontmatter and body — including their line
+endings — survive byte-for-byte; an inserted line takes its anchor's ending. See
 [Thinking levels](#thinking-levels) for the one guarantee that line comes with,
 and ADR
 [0004](docs/adr/0004-thinking-levels.md) for why it is only ever forward.
