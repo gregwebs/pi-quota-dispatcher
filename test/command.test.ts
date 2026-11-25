@@ -797,8 +797,20 @@ function tokenRegistry(calls: string[]) {
  * due and a call would be a refresh this extension must never start.
  */
 test("bootFrom wires pi's provider-token resolver into every dispatcher, and calls it for nothing", async () => {
-  const fx = await generateFixture(GENERATED_LAYER);
-  await layerNamesFixtureCredential(fx, GENERATED_LAYER);
+  // The report prints the rails this install routes on, so the pool whose read
+  // carries the evidence has to be a destination — in the global config the load
+  // reads and in the layer `generate` replaces it with.
+  const routed = {
+    ...GENERATED_LAYER,
+    agents: {
+      ...GENERATED_LAYER.agents,
+      gemini: { primary: { model: "antigravity/gemini-4-7-pro", rail: "antigravity-gemini" } },
+    },
+  };
+  const fx = await generateFixture(routed);
+  await layerNamesFixtureCredential(fx, routed);
+  const global = JSON.parse(await readFile(fx.globalPath, "utf8"));
+  await writeFile(fx.globalPath, JSON.stringify({ ...global, agents: routed.agents }), "utf8");
   const calls: string[] = [];
   const WIRED = "the pi auth file is not the default one";
   const UNWIRED = "no provider token resolver is available";
@@ -2621,11 +2633,58 @@ test("an empty table still reports one line per rail and writes nothing", async 
     const text = await run("");
     assert.ok(text.includes("claude: 5h 90%"), text);
     assert.ok(text.includes("codex: 5h 10%"), text);
+    // Every rail, not only the capped ones: with no table there is nothing to
+    // narrow to, and the lines are what a config about to be written is chosen
+    // from.
+    assert.ok(text.includes("antigravity-gemini: gemini-weekly 0%, gemini-5h 20%"), text);
+    assert.ok(text.includes("antigravity-3p: 3p-weekly 0%, 3p-5h 30%"), text);
     assert.ok(text.includes("deepseek:"), text);
     assert.ok(!text.includes("[applied]"), text);
   });
 
   assert.equal(await readFile(fx.plannerFile, "utf8"), before, "the diagnostic must be read-only");
+});
+
+/**
+ * A configured install's report answers for the rails its own routes spend.
+ *
+ * Every rail is read — the generator is fed all of them — but a pool no route
+ * names is a number the reader cannot act on, and the gauge has always narrowed
+ * the same way. The metered rail goes too when nothing routes to it: its line is
+ * a fact about a budget an install without DeepSeek routes does not carry.
+ */
+test("a configured report prints the rails its routes name, and no others", async () => {
+  const fx = await fixture();
+
+  await withExtension(fx, async ({ run }) => {
+    for (const form of ["", "refresh"]) {
+      const text = await run(form);
+      assert.ok(text.includes("claude: 5h 90%"), text);
+      assert.ok(text.includes("codex: 5h 10%"), text);
+      assert.ok(!text.includes("antigravity-gemini:"), text);
+      assert.ok(!text.includes("antigravity-3p:"), text);
+      assert.ok(!text.includes("deepseek:"), text);
+    }
+  });
+});
+
+/**
+ * A route may name a rail as an alternate and that is enough: the policy can send
+ * the agent there, so the report has to show what it would be sent to.
+ */
+test("a rail named only by an alternate is reported", async () => {
+  const fx = await fixture(2_147_483_647, {
+    planner: {
+      primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" },
+      alternates: [{ model: "antigravity/gemini-4-7-pro", rail: "antigravity-gemini" }],
+    },
+  });
+
+  await withExtension(fx, async ({ run }) => {
+    const text = await run("");
+    assert.ok(text.includes("antigravity-gemini: gemini-weekly 0%, gemini-5h 20%"), text);
+    assert.ok(!text.includes("antigravity-3p:"), text);
+  });
 });
 
 /**

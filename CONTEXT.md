@@ -269,10 +269,12 @@ explicitly. A gate hit is never re-armed. See
 _Avoid_: rate limit, backoff, retry window, ping lock
 
 **Report**:
-The answer to "what is my state?": the rail readings, one decision line per
-agent, the files no route names, and every warning. Printed by `/quota-dispatch`
-and its `refresh` form; the per-value **provenance** is deliberately not part of
-it.
+The answer to "what is my state?": the rail readings for the rails some route
+names — every rail while nothing is routed, because the lines are then the
+diagnostic — one decision line per agent, the files no route names, and every
+warning. Printed by `/quota-dispatch` and its `refresh` form; the per-value
+**provenance** is deliberately not part of it. See
+[docs/adr/0027](docs/adr/0027-the-report-names-the-rails-that-are-routed.md).
 _Avoid_: output, status, summary, dump
 
 **Rail gauge**:

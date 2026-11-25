@@ -138,7 +138,13 @@ show. In modes with no footer there is nothing to render, so neither the ask nor
 the status is shown.
 
 `/quota-dispatch` still works while unconfigured: it prints one line per rail,
-which is the diagnostic you want when the quotas are what you came for. It is
+which is the diagnostic you want when the quotas are what you came for. Its
+**configured** report prints only the rails some route names — the same
+narrowing as the [rail gauge](#the-rail-gauge) — so a pool you have stopped
+routing to stops appearing, without a config key of its own. See
+[ADR 0027](docs/adr/0027-the-report-names-the-rails-that-are-routed.md). The read
+is not narrowed: every rail is still read, because the generator is fed all of
+them (see [what the generator reads](#what-the-generator-reads-on-stdin)). It is
 also where **unmanaged** files are reported — any agent file whose agent no
 route names is listed by the plain and `refresh` forms. The startup ask mentions
 them only while the table is empty; a configured install does not narrate the
@@ -295,7 +301,7 @@ The glossary term is in [CONTEXT.md](CONTEXT.md).
 
 | Command | Effect |
 |---|---|
-| `/quota-dispatch` | Show rail budgets and the current decision per agent, plus any agent files no route names. Read-only. |
+| `/quota-dispatch` | Show rail budgets for the rails some route names and the current decision per agent, plus any agent files no route names. Read-only. |
 | `/quota-dispatch refresh` | Force a re-fetch, then show. Read-only. |
 | `/quota-dispatch refresh-codex` | Run the Codex CLI once so it refreshes its own `auth.json`, then say what the file holds. It does not prove the CLI saved what it redeemed, so `codex login` is the repair if a refresh does not land. See [Keeping the Codex token fresh](#keeping-the-codex-token-fresh). |
 | `/quota-dispatch config` | Print where each configured value came from. Local, so it reads no quota and touches no file. |
