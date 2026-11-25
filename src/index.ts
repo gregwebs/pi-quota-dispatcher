@@ -1562,15 +1562,6 @@ export function unconfiguredNotice(
 }
 
 /**
- * The one line for a config file the dispatcher could not use: the notify's
- * headline, so the interruption names the state this install is in.
- *
- * "A config file" rather than "your config" because the notice may be about
- * either layer, and the fault lines under it name which.
- */
-const UNUSABLE_CONFIG_SUMMARY = "quota-dispatcher: a config file could not be used.";
-
-/**
  * What an install with a config file that is there and unusable has to say for
  * itself: every fault, then the fix.
  *
@@ -1585,22 +1576,11 @@ const UNUSABLE_CONFIG_SUMMARY = "quota-dispatcher: a config file could not be us
  */
 export function unusableConfigNotice(files: ConfigFile[]): string[] {
   return [
-    UNUSABLE_CONFIG_SUMMARY,
+    SESSION_STATUS_HEADLINES.unusableConfig,
     ...unusableConfigFileLines(files),
     "Fix the file; the next pass picks up the edit. /quota-dispatch shows what it would do.",
   ];
 }
-
-/**
- * The one line for a config that names a model this pi cannot spawn: the
- * notify's headline and the footer status that holds the state between asks, so
- * the interruption and the standing fact are the same words.
- *
- * "Unknown to this pi" rather than "invalid" is #14's wording, and the reason
- * this warning exists at all: the id may be perfectly good on a newer pi, and a
- * user who reads "invalid" goes hunting for a typo that is not there.
- */
-const UNKNOWN_MODEL_SUMMARY = "quota-dispatcher: a configured model is unknown to this pi.";
 
 /**
  * What an install whose config names models this pi cannot spawn has to say for
@@ -1615,7 +1595,7 @@ const UNKNOWN_MODEL_SUMMARY = "quota-dispatcher: a configured model is unknown t
  */
 export function unknownModelsNotice(misses: ModelMiss[], configPaths: string[]): string[] {
   return [
-    UNKNOWN_MODEL_SUMMARY,
+    SESSION_STATUS_HEADLINES.unknownModels,
     ...misses.map(unknownModelNote),
     // The action last, so the occurrences above it read as the evidence for it
     // rather than as a list trailing off an instruction.
@@ -2768,8 +2748,23 @@ const STATUS_KEY = "quota-dispatch";
  */
 const GAUGE_STATUS_KEY = "quota-dispatch-gauge";
 
-/** The footer line an unconfigured install carries until its table is filled. */
-const STATUS_TEXT = "quota-dispatcher: no agents configured";
+/**
+ * The headlines the session-status decision can select. Keeping a state’s
+ * footer and notice on this one wording prevents the persistent line from
+ * disagreeing with the interruption that first explained it.
+ */
+const SESSION_STATUS_HEADLINES = {
+  unknownModels: "quota-dispatcher: a configured model is unknown to this pi.",
+  unusableConfig: "quota-dispatcher: a config file could not be used.",
+  unconfigured: "quota-dispatcher: no agents configured",
+} as const;
+
+type SessionStatus = keyof typeof SESSION_STATUS_HEADLINES;
+
+interface SessionStatusDecision {
+  readonly footer: string | undefined;
+  readonly notify: SessionStatus | undefined;
+}
 
 /**
  * The session reasons a fresh, unconfigured install asks for configuration on.
@@ -2834,45 +2829,38 @@ function displayFaultText(fault: DisplayFault): string {
 }
 
 /**
- * Report a config file that is there and was not used, on the reasons that ask
- * for setup, and say whether there was one to report.
- *
- * The answer is what the unconfigured branch needs: an install whose file names
- * routes that were thrown away is not asking to be configured from scratch.
+ * Choose the footer and notice independently where their reader needs differs.
+ * Unknown models always win because an agent that never moves is the more
+ * expensive surprise; a skipped file may leave another layer managing every
+ * agent. An empty table remains unconfigured even when a file was skipped, but
+ * its ask still names the skipped file rather than asking the reader to start
+ * from scratch.
  */
-function announceUnusableConfig(
+function decideSessionStatus(
   loaded: LoadedConfig,
-  ctx: ExtensionContext,
+  misses: ModelMiss[],
   reason: SessionStartEvent["reason"],
-): boolean {
-  if (!ctx.hasUI || !ASK_REASONS.has(reason)) return false;
-  if (!loaded.files.some((file) => file.state.kind === "unusable")) return false;
-
-  ctx.ui.notify(unusableConfigNotice(loaded.files).join("\n"), "warning");
-  return true;
+): SessionStatusDecision {
+  const hasUnusableConfig = loaded.files.some((file) => file.state.kind === "unusable");
+  const footerStatus: SessionStatus | undefined =
+    misses.length > 0
+      ? "unknownModels"
+      : managesNothing(loaded.config)
+        ? "unconfigured"
+        : hasUnusableConfig
+          ? "unusableConfig"
+          : undefined;
+  const noticeStatus: SessionStatus | undefined =
+    misses.length > 0 ? "unknownModels" : hasUnusableConfig ? "unusableConfig" : footerStatus;
+  return {
+    footer: footerStatus === undefined ? undefined : SESSION_STATUS_HEADLINES[footerStatus],
+    notify: noticeStatus !== undefined && ASK_REASONS.has(reason) ? noticeStatus : undefined,
+  };
 }
 
-/**
- * The ask. It cannot coexist with the unusable-file notice above: an install is
- * unconfigured *or* it has a file that names routes, and one of those two things
- * is the answer to "why is nothing managed?".
- */
-async function announceUnconfigured(
-  loaded: LoadedConfig,
-  ctx: ExtensionContext,
-  reason: SessionStartEvent["reason"],
-): Promise<void> {
-  // An empty table is an empty table whether or not a file fed it, and
-  // "unconfigured" is the standing fact between asks either way.
-  setFooterStatus(ctx, STATUS_TEXT);
-  if (announceUnusableConfig(loaded, ctx, reason)) return;
-  if (!ctx.hasUI || !ASK_REASONS.has(reason)) return;
-
-  const { agentDir } = loaded.config;
-  const configPath =
-    loaded.files.find((file) => file.source === "global")?.path ?? globalConfigPath();
-  const files = await readAgentFiles(agentDir);
-  ctx.ui.notify(unconfiguredNotice(configPath, agentDir, files).join("\n"), "warning");
+/** The session-status decision is the only normal writer of this footer key. */
+function drawSessionStatus(ctx: ExtensionContext, decision: SessionStatusDecision): void {
+  setFooterStatus(ctx, decision.footer);
 }
 
 /**
@@ -2888,29 +2876,34 @@ function unknownModelConfigPaths(misses: ModelMiss[], loaded: LoadedConfig): str
 }
 
 /**
- * The warning for a config this pi cannot fully use, and the footer line that
- * holds the state between warnings.
- *
- * The footer is set on every reason and the notify fires only on the three that
- * ask for setup. That split is #13's, and it earns its keep most on `resume`,
- * where no notify ever fires: without the footer the only trace of a model the
- * dispatcher is quietly stepping over would be the console line, which scrolls
- * past at session start.
+ * Draw the standing status before optionally raising its ask. `resume` and
+ * `fork` omit the interruption without losing the fact that persists into them.
  */
-function announceUnknownModels(
-  misses: ModelMiss[],
+async function announceSessionStatus(
   loaded: LoadedConfig,
+  misses: ModelMiss[],
   ctx: ExtensionContext,
   reason: SessionStartEvent["reason"],
-): void {
-  if (misses.length === 0) {
-    setFooterStatus(ctx, undefined);
-    return;
-  }
+): Promise<void> {
+  const decision = decideSessionStatus(loaded, misses, reason);
+  drawSessionStatus(ctx, decision);
+  if (!ctx.hasUI || decision.notify === undefined) return;
 
-  setFooterStatus(ctx, UNKNOWN_MODEL_SUMMARY);
-  if (!ctx.hasUI || !ASK_REASONS.has(reason)) return;
-  ctx.ui.notify(unknownModelsNotice(misses, unknownModelConfigPaths(misses, loaded)).join("\n"), "warning");
+  switch (decision.notify) {
+    case "unknownModels":
+      ctx.ui.notify(unknownModelsNotice(misses, unknownModelConfigPaths(misses, loaded)).join("\n"), "warning");
+      return;
+    case "unusableConfig":
+      ctx.ui.notify(unusableConfigNotice(loaded.files).join("\n"), "warning");
+      return;
+    case "unconfigured": {
+      const { agentDir } = loaded.config;
+      const configPath =
+        loaded.files.find((file) => file.source === "global")?.path ?? globalConfigPath();
+      const files = await readAgentFiles(agentDir);
+      ctx.ui.notify(unconfiguredNotice(configPath, agentDir, files).join("\n"), "warning");
+    }
+  }
 }
 
 /**
@@ -3497,8 +3490,7 @@ export default function (pi: ExtensionAPI) {
     // throws — must not make the caller believe the adoption failed and skip the
     // pass that would use it.
     try {
-      if (managesNothing(config)) setFooterStatus(ctx, STATUS_TEXT);
-      else announceUnknownModels(runtime.misses, next.loaded, ctx, "resume");
+      drawSessionStatus(ctx, decideSessionStatus(next.loaded, runtime.misses, "resume"));
     } catch (err) {
       displayFault = { what: "the footer", message: errorText(err) };
       console.error(displayFaultText(displayFault));
@@ -3860,25 +3852,15 @@ export default function (pi: ExtensionAPI) {
       fence,
       () => bootOnce(ctx),
       async ({ loaded, misses, dispatcher }) => {
+        // Before the evaluation, so a state that needs attention is on screen
+        // while the quota reads that follow it are still in flight.
+        await announceSessionStatus(loaded, misses, ctx, event.reason);
         if (managesNothing(loaded.config)) {
           // Nothing is routed, so no capped rail is named and the gauge is empty.
-          await announceUnconfigured(loaded, ctx, event.reason);
           clearGauge(ctx);
           return;
         }
 
-        // Before the evaluation, so the warning is on screen while the quota
-        // reads that follow it are still in flight. It also replaces the footer
-        // line an unconfigured install left: the footer states the install, so the
-        // state has to change here or nowhere.
-        //
-        // A config file that could not be used is reported here too, not only
-        // when it leaves the table empty: the layer it lost is not the whole
-        // config, so the other symptom is a route that is quietly not the one
-        // the reader wrote — the same invisible-from-the-outside state ADR 0009
-        // raised for a model this pi cannot spawn.
-        announceUnusableConfig(loaded, ctx, event.reason);
-        announceUnknownModels(misses, loaded, ctx, event.reason);
         await dispatcher.evaluate().catch(() => {});
       },
       { wait: true },

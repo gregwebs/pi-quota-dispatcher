@@ -445,6 +445,7 @@ interface Notify {
 
 interface Ctx {
   hasUI: boolean;
+  modelRegistry?: { find: (provider: string, modelId: string) => unknown };
   ui: {
     notify: (text: string, level?: string) => void;
     setStatus: (key: string, text?: string) => void;
@@ -484,7 +485,11 @@ async function pump(turns = 5): Promise<void> {
 async function withExtension(
   fx: FreshFixture,
   body: (h: Harness) => Promise<void>,
-  opts: { hasUI?: boolean; statuses?: Array<{ key: string; text: string | undefined }> } = {},
+  opts: {
+    hasUI?: boolean;
+    statuses?: Array<{ key: string; text: string | undefined }>;
+    modelRegistry?: Ctx["modelRegistry"];
+  } = {},
 ): Promise<void> {
   const previousEnv = process.env[ENV_AGENT_DIR];
   const previousCwd = process.cwd();
@@ -513,6 +518,7 @@ async function withExtension(
   const hasUI = opts.hasUI ?? true;
   const makeCtx = (): Ctx => ({
     hasUI,
+    modelRegistry: opts.modelRegistry,
     ui: {
       notify: (text, level) => notify.push({ text, level: level ?? "" }),
       setStatus: (key, text) => statuses.push({ key, text }),
@@ -692,6 +698,31 @@ test("a skipped project layer is reported even though the global one still manag
   });
 });
 
+// A working lower layer does not make a skipped file harmless: its routes may
+// silently replace the ones the skipped layer was meant to override. The footer
+// carries that fact on every reason; only the interrupting ask is reason-gated.
+for (const reason of ["startup", "new", "reload", "resume", "fork"]) {
+  test(`a skipped config file has a footer on ${reason} while another layer manages agents`, async (t) => {
+    const fx = await freshFixture(t, {
+      planner: { primary: { model: "claude-bridge/claude-opus-5-5", rail: "claude" } },
+    });
+    await writeFile(join(fx.projectDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), "{ broken", "utf8");
+
+    await withExtension(
+      fx,
+      async (h) => {
+        await h.start(reason);
+        assert.deepEqual(warningStatuses(h.statuses), [
+          { key: "quota-dispatch", text: "quota-dispatcher: a config file could not be used." },
+        ]);
+        assert.equal(h.notify.length, ["startup", "new", "reload"].includes(reason) ? 1 : 0);
+        if (h.notify.length) assert.equal(h.notify[0].text.split("\n")[0], "quota-dispatcher: a config file could not be used.");
+      },
+      { modelRegistry: { find: () => ({}) } },
+    );
+  });
+}
+
 // The notification asks for setup, so it obeys the same reasons the ask does: a
 // session resuming work does not want to be interrupted about a file it read
 // yesterday, and there is a report for asking.
@@ -706,6 +737,30 @@ for (const reason of ["resume", "fork"]) {
     });
   });
 }
+
+// A model the running pi cannot spawn holds an agent completely still, which is
+// more expensive than a skipped file whose lower layer still routes agents. The
+// single footer owner must therefore select the unknown-model state, not the
+// status whichever announcement happened to run last.
+test("an unknown model outranks an unusable config file in the footer", async (t) => {
+  const fx = await freshFixture(t, {
+    planner: { primary: { model: "claude-bridge/claude-sol-9", rail: "claude" } },
+  });
+  await writeFile(join(fx.projectDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), "{ broken", "utf8");
+
+  await withExtension(
+    fx,
+    async (h) => {
+      await h.start("startup");
+      assert.deepEqual(warningStatuses(h.statuses), [
+        { key: "quota-dispatch", text: "quota-dispatcher: a configured model is unknown to this pi." },
+      ]);
+      assert.equal(h.notify.length, 1);
+      assert.equal(h.notify[0].text.split("\n")[0], "quota-dispatcher: a configured model is unknown to this pi.");
+    },
+    { modelRegistry: { find: () => undefined } },
+  );
+});
 
 // The notification is a rendering, so it obeys `hasUI` exactly as the ask does.
 // A parse error is the case where it would be easiest to forget: the fault is

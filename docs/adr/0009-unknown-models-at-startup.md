@@ -39,11 +39,19 @@ as the gap: it is exactly the session that inherited yesterday's typo, no
 notification ever fires in it, and without a footer the state would again be
 visible only in the console line this change exists to stop relying on.
 
-The footer therefore carries the notification's own headline sentence
-(`quota-dispatcher: a configured model is unknown to this pi.`) on every reason,
-the way the unconfigured status already does. The two states cannot collide:
-an unknown model requires a route, and the unconfigured state is the absence of
-one, so one status key is enough for both.
+One session-status decision now selects the footer headline and, on an ask
+reason, the notice appropriate to the facts. Unknown-model misses win over an
+unusable config file because an agent that never moves is the more expensive
+surprise; a skipped layer can leave another layer managing every agent. Thus a
+session with both facts carries `quota-dispatcher: a configured model is unknown
+to this pi.` rather than depending on which announcement ran last.
+
+An empty table remains the unconfigured footer whether or not an unusable file
+fed it. Its ask still names the unusable file rather than asking the reader to
+configure from scratch. Where another layer still manages agents, an unusable
+file carries its own footer on every reason. Notifications remain limited to the
+three ask reasons, so `resume` and `fork` are quiet without making the standing
+state invisible.
 
 ## Considered options
 

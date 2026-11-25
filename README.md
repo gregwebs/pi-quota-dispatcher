@@ -131,11 +131,16 @@ each model's `rail` is derived from its prefix and registered once under
 with a model whose prefix is not one of the rails this extension reads, is
 listed but left out rather than guessed at.
 
-While the table is empty, a footer line (`quota-dispatcher: no agents
-configured`) holds the state, and clears as soon as a route exists. The rail
-gauge is empty at the same time — no route names a rail, so there is nothing to
-show. In modes with no footer there is nothing to render, so neither the ask nor
-the status is shown.
+One session-status decision holds a footer line on every reason, including
+`resume` and `fork`, while the notice appropriate to the facts appears only on
+`startup`, `new` and `reload`. An agent that never moves is the more expensive
+surprise, so an unknown model wins when a session also has a skipped config file.
+An empty table always shows `quota-dispatcher: no agents configured`, even when
+a file was unusable; its notice still explains that the file was skipped. When
+another layer manages agents, an unusable file carries its own footer. The empty
+table footer clears as soon as a route exists. The rail gauge is empty at the
+same time — no route names a rail, so there is nothing to show. In modes with no
+footer there is nothing to render, so neither the ask nor the status is shown.
 
 `/quota-dispatch` still works while unconfigured: it prints one line per rail,
 which is the diagnostic you want when the quotas are what you came for. Its
@@ -175,12 +180,10 @@ the same state and get the same treatment.
 The notice fires whether or not the layers below the skipped one still manage
 agents: a route that quietly is not the one you wrote looks the same from the
 outside as a route you pinned, which is why a model this pi cannot spawn is
-surfaced the same way (see [below](#a-model-this-pi-does-not-know)). It is not a
-footer state — the warning footer line holds the two states that persist
-silently across `resume` and `fork`, and the [rail gauge](#the-rail-gauge) has a
-footer key of its own — so the standing record is the warning tail of
-`/quota-dispatch`, where the skipped file is named whether or not a notification
-was ever seen.
+surfaced the same way (see [below](#a-model-this-pi-does-not-know)). The shared
+[session-status decision](#first-run-it-says-what-it-needs) holds this state on
+every reason when another layer still manages agents; `/quota-dispatch` still
+names the skipped file in its warning tail whether or not a notification was seen.
 
 Where the parser reported a place, the line names the line and column of it. The
 parser reports one for a structural failure — a trailing comma before a `}`, a
@@ -213,13 +216,11 @@ the file named is the layer the id is actually written in — a project-layer ty
 names the project file. The line under a held agent says "unknown **to this pi**"
 rather than "invalid", because a newer pi may well know the id.
 
-A footer line (`quota-dispatcher: a configured model is unknown to this pi.`)
-holds the state on every reason, including `resume` and `fork`, where no notify
-is raised: a resumed session still has to be able to see that the dispatcher is
-stepping over a model. A pi with no model registry cannot answer the question at
-all: the check does not run, so no warning is raised and the footer is only
-cleared, as on any configured install. Everything here is an addition to the
-log, never a replacement for it: each miss is still written to `console.error`,
+The [session-status decision](#first-run-it-says-what-it-needs) makes this the
+footer state on every reason. A pi with no model registry cannot answer the
+question at all: the check does not run, so no warning is raised and the footer
+is only cleared, as on any configured install. Everything here is an addition to
+the log, never a replacement for it: each miss is still written to `console.error`,
 `/quota-dispatch` ends with the same lines as its warning tail, and
 `/quota-dispatch config` repeats them at the end of its provenance block — which
 stays the durable record. More in

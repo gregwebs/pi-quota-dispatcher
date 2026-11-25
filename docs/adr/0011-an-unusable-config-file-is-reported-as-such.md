@@ -44,20 +44,12 @@ problem and the symptom of a healthy setup are the same.
 
 So the notification fires whenever a config file could not be used, not only
 when it left the table empty, on the same three reasons the unconfigured ask uses
-and silent on `resume` and `fork`. What the footer line says about it is the one
-thing this leaves to a later change: the footer holds the two states that persist
-silently across a `resume` — the unconfigured one and the unknown-model one — and
-a skipped file that leaves a working layer behind has a standing record in
-`/quota-dispatch`'s warning tail, which is a form the user can ask for.
-
-That is deliberately short of ADR 0009's range, and the cost is that a session
-resuming after the mistake was made says nothing about it. The obstacle is not
-that a third state cannot be shown, it is that nothing owns the footer: the
-unknown-model check sets it or clears it on every reason, so a skipped-file
-status set beside it would be wiped by a check with no misses of its own. Doing
-it properly means one place deciding the footer from both facts, with a rule for
-which of two bad states the line names — a change to ADR 0009's own decision, not
-a line in this one.
+and silent on `resume` and `fork`. When a skipped layer leaves another layer
+managing agents, its footer now carries this state on every reason, including
+`resume` and `fork`, so it is visible without asking for `/quota-dispatch`.
+Unknown-model misses win over it because an agent that never moves is the more
+expensive surprise; the shared decision states that precedence rather than
+letting call order choose it. ADR 0009 records the shared decision.
 
 ## One rendering of one fact, three places it is read
 
@@ -144,10 +136,9 @@ one more test for a case the parser names itself, and the position-free
 rendering already covers it. A `touch`ed config reads as `not valid JSON
 (Unexpected end of JSON input)`.
 
-**A third footer status for the skipped file.** Rejected in the section above,
-pending a change to who owns the footer: one status line, two owners already,
-and the unknown-model check clears it on every reason where it has no misses of
-its own.
+**An independent footer writer for the skipped file.** Rejected: a second
+writer would again make the result depend on call order. The shared session-status
+decision now includes the skipped-file state and its stated precedence.
 
 ## What did not change
 
