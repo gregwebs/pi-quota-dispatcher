@@ -177,9 +177,10 @@ ping again. The `undiverted` halt is the exception and is **keyed to the Claude
 Code install**: a clean exit that reached no request is a property of the
 *environment*, not of that one expiry, so the next expiry would fail to divert
 the same way and pay again. It therefore survives the usable token that ends the
-episode. It is cleared when the resolved `claude` path or mtime changes — an
-update to Claude Code is what could change "this build ignores the diversion" —
-or explicitly by `/quota-dispatch refresh`. Neither gate is re-armed by a hit: a
+episode. It is keyed to the resolved `claude` path and mtime from the environment
+captured for its ping, and is cleared when that install changes — an update to
+Claude Code is what could change "this build ignores the diversion" — or
+explicitly by `/quota-dispatch refresh`. Neither gate is re-armed by a hit: a
 read inside the cooldown does not push its own window out, however many 5-minute
 polls land in it.
 
@@ -196,12 +197,12 @@ a peer's gate never pushes its window out.
 
 The sticky halt is one record for the machine rather than one per credential: an
 install that ignores the loopback diversion does so for every profile. It stores
-the resolved `claude` path and mtime it was armed against. A later read whose
-resolved install does not match ends the halt and lets the attempt be made
-again; a read that cannot resolve the install keeps the halt rather than reading
-"I could not find the binary" as "the binary changed". A halt armed when no
-install could be resolved stores no path and is therefore only cleared by
-`/quota-dispatch refresh`.
+the resolved `claude` path and mtime from the environment captured when the
+dispatcher was constructed. A later read resolves from that same capture; a
+non-matching install ends the halt and lets the attempt be made again, while an
+unresolvable one keeps the halt rather than reading "I could not find the
+binary" as "the binary changed". A halt armed when no install could be resolved
+stores no path and is therefore only cleared by `/quota-dispatch refresh`.
 
 The write is best effort, exactly as a reading write is: a gate is also kept in
 the process that armed it, so a file that cannot be written never turns the

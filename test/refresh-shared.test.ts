@@ -237,6 +237,43 @@ test("concurrent forced fresh reads across dispatchers make exactly one offline 
   assert.deepEqual(fx.probe.fetches, ["usable-token"]);
 });
 
+// Defect: a read-time PATH change keys sticky to a binary the ping cannot run.
+test("sticky halt uses the PATH captured for its ping", async (t) => {
+  const fx = await fixture(t);
+  const first = join(fx.root, "first-bin"); const second = join(fx.root, "second-bin");
+  await mkdir(first); await mkdir(second);
+  const firstClaude = join(first, "claude"); const secondClaude = join(second, "claude");
+  for (const path of [firstClaude, secondClaude]) {
+    await writeFile(path, "not an executable program\n"); await chmod(path, 0o755);
+  }
+  const originalPath = process.env.PATH;
+  try {
+    process.env.PATH = first;
+    const dispatcher = createDispatcher(fx.cfg, {
+      refreshClaude: undiverted,
+      now: () => fx.probe.clock,
+      readKeychain: async () => ({ error: "no keychain" }),
+      sleep: async (ms) => { fx.probe.clock += ms; },
+      readings: { fetchWaitMs: 100, writeWaitMs: 100, pollMs: 1, staleMs: 10_000 },
+      read: fakeReads({
+        claude: readingOf("claude", { session: 10, weekly: 20 }),
+        codex: readingOf("codex", { session: 5, weekly: 10 }),
+      }),
+    });
+    process.env.PATH = second;
+    await dispatcher.railReadings("claude", true);
+    const gates = await createSharedReadings({
+      path: fx.cfg.readingsPath, now: () => fx.probe.clock,
+      pacing: { fetchWaitMs: 100, writeWaitMs: 100, pollMs: 1, staleMs: 10_000 },
+    }).gates(fx.cfg.claudeCredsPath);
+    assert.equal(gates.sticky?.claudePath, firstClaude);
+    assert.equal(gates.sticky?.claudeMtimeMs, (await stat(firstClaude)).mtimeMs);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+  }
+});
+
 test("sticky identity is captured before a ping that changes the install", async (t) => {
   const fx = await fixture(t);
   const oldIdentity = fx.probe.identity!;
