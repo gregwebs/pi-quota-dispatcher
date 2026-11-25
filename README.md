@@ -132,15 +132,15 @@ with a model whose prefix is not one of the rails this extension reads, is
 listed but left out rather than guessed at.
 
 One session-status decision holds a footer line on every reason, including
-`resume` and `fork`, while its matching notification appears only on `startup`,
-`new` and `reload`. Its precedence is an unknown model, then an unusable config
-file, then an unconfigured table, then nothing. An agent that never moves is the
-more expensive surprise, so an unknown model wins when a session also has a
-skipped config file; an unusable file likewise wins over an empty table. Thus an
-empty, healthy table shows `quota-dispatcher: no agents configured` and clears
-as soon as a route exists. The rail gauge is empty at the same time — no route
-names a rail, so there is nothing to show. In modes with no footer there is
-nothing to render, so neither the ask nor the status is shown.
+`resume` and `fork`, while the notice appropriate to the facts appears only on
+`startup`, `new` and `reload`. An agent that never moves is the more expensive
+surprise, so an unknown model wins when a session also has a skipped config file.
+An empty table always shows `quota-dispatcher: no agents configured`, even when
+a file was unusable; its notice still explains that the file was skipped. When
+another layer manages agents, an unusable file carries its own footer. The empty
+table footer clears as soon as a route exists. The rail gauge is empty at the
+same time — no route names a rail, so there is nothing to show. In modes with no
+footer there is nothing to render, so neither the ask nor the status is shown.
 
 `/quota-dispatch` still works while unconfigured: it prints one line per rail,
 which is the diagnostic you want when the quotas are what you came for. Its
@@ -182,8 +182,8 @@ agents: a route that quietly is not the one you wrote looks the same from the
 outside as a route you pinned, which is why a model this pi cannot spawn is
 surfaced the same way (see [below](#a-model-this-pi-does-not-know)). The shared
 [session-status decision](#first-run-it-says-what-it-needs) holds this state on
-every reason; `/quota-dispatch` still names the skipped file in its warning tail
-whether or not a notification was seen.
+every reason when another layer still manages agents; `/quota-dispatch` still
+names the skipped file in its warning tail whether or not a notification was seen.
 
 Where the parser reported a place, the line names the line and column of it. The
 parser reports one for a structural failure — a trailing comma before a `}`, a

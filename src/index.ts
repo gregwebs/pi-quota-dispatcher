@@ -2829,28 +2829,32 @@ function displayFaultText(fault: DisplayFault): string {
 }
 
 /**
- * Choose the one status a session can carry. Unknown models win because an
- * agent that never moves is the more expensive surprise; a skipped file may
- * leave another layer managing every agent. The order is therefore unknown
- * models, an unusable file, an unconfigured table, then nothing — not call
- * order at the sites that draw or notify it.
+ * Choose the footer and notice independently where their reader needs differs.
+ * Unknown models always win because an agent that never moves is the more
+ * expensive surprise; a skipped file may leave another layer managing every
+ * agent. An empty table remains unconfigured even when a file was skipped, but
+ * its ask still names the skipped file rather than asking the reader to start
+ * from scratch.
  */
 function decideSessionStatus(
   loaded: LoadedConfig,
   misses: ModelMiss[],
   reason: SessionStartEvent["reason"],
 ): SessionStatusDecision {
-  const status: SessionStatus | undefined =
+  const hasUnusableConfig = loaded.files.some((file) => file.state.kind === "unusable");
+  const footerStatus: SessionStatus | undefined =
     misses.length > 0
       ? "unknownModels"
-      : loaded.files.some((file) => file.state.kind === "unusable")
-        ? "unusableConfig"
-        : managesNothing(loaded.config)
-          ? "unconfigured"
+      : managesNothing(loaded.config)
+        ? "unconfigured"
+        : hasUnusableConfig
+          ? "unusableConfig"
           : undefined;
+  const noticeStatus: SessionStatus | undefined =
+    misses.length > 0 ? "unknownModels" : hasUnusableConfig ? "unusableConfig" : footerStatus;
   return {
-    footer: status === undefined ? undefined : SESSION_STATUS_HEADLINES[status],
-    notify: status !== undefined && ASK_REASONS.has(reason) ? status : undefined,
+    footer: footerStatus === undefined ? undefined : SESSION_STATUS_HEADLINES[footerStatus],
+    notify: noticeStatus !== undefined && ASK_REASONS.has(reason) ? noticeStatus : undefined,
   };
 }
 

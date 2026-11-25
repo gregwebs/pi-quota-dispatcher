@@ -666,11 +666,11 @@ test("an unparseable config file is reported instead of the unconfigured ask", a
     assert.ok(text.includes("line 2"), `the line to go to is the point:\n${text}`);
     assert.ok(!text.includes("no agents are configured"), `the ask is the wrong answer here:\n${text}`);
     assert.ok(!text.includes('"agents"'), `no paste-ready snippet belongs here:\n${text}`);
-    // A skipped file outranks an empty table: repairing it is more useful than
-    // being told to configure the agents it already tried to name.
+    // The table is empty either way, so the footer is still the unconfigured one:
+    // the notice has said why, and the ask's status is the standing fact.
     assert.ok(
-      warningStatuses(h.statuses).some((s) => s.text !== undefined && s.text.includes("could not be used")),
-      `expected the unusable-file footer: ${JSON.stringify(h.statuses)}`,
+      warningStatuses(h.statuses).some((s) => s.text !== undefined && s.text.includes("no agents configured")),
+      `expected the unconfigured footer: ${JSON.stringify(h.statuses)}`,
     );
   });
 });

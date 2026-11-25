@@ -42,16 +42,14 @@ layer's values. Nothing about that is visible from the outside: it is the shape
 ADR 0009 raised the unknown-model warning for, where the symptom of a real
 problem and the symptom of a healthy setup are the same.
 
-When the session-status decision selects this state, its notification fires
-whether or not the layers below the skipped one still manage agents, on the same
-three reasons the unconfigured ask uses and silent on `resume` and `fork`. The footer now carries this state on every reason, including `resume` and
-`fork`, so a skipped file that leaves a working layer behind is still visible
-without asking for `/quota-dispatch`. Its single owner chooses unknown-model
-misses first, then an unusable config file, then an unconfigured table, then
-nothing. Unknown models win because an agent that never moves is the more
-expensive surprise; a skipped layer can leave another layer managing every
-agent. The notification remains limited to the three ask reasons, but the footer
-does not vary with the reason. ADR 0009 records the shared decision.
+So the notification fires whenever a config file could not be used, not only
+when it left the table empty, on the same three reasons the unconfigured ask uses
+and silent on `resume` and `fork`. When a skipped layer leaves another layer
+managing agents, its footer now carries this state on every reason, including
+`resume` and `fork`, so it is visible without asking for `/quota-dispatch`.
+Unknown-model misses win over it because an agent that never moves is the more
+expensive surprise; the shared decision states that precedence rather than
+letting call order choose it. ADR 0009 records the shared decision.
 
 ## One rendering of one fact, three places it is read
 
@@ -146,9 +144,9 @@ decision now includes the skipped-file state and its stated precedence.
 
 `unconfiguredNotice` is untouched: a missing file, and a file that parses and
 names no agents, still get the ask and the paste-ready snippet, which is what
-those installs need. When nothing is managed because a file was skipped, the
-skipped-file notice and footer replace the ask: fixing the file is the useful
-next action, not naming agents again.
+those installs need. When nothing is managed, the skipped-file notice replaces
+the ask and the footer still says `no agents configured` — an empty table is an
+empty table whether or not a file fed it.
 
 `describeConfigLayers` still renders a skipped file as `present`. The layers line
 answers "which files am I reading?", and the file is there — reporting it as
