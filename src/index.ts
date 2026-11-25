@@ -376,6 +376,41 @@ function budgetSummary(reading: RailReading): string {
     .join(", ");
 }
 
+/**
+ * The rails some effective route names: primaries and every alternate.
+ *
+ * Both displays narrow by this set, so `report` and the gauge cannot disagree
+ * about which rails this install routes on. A route's alternates count even
+ * when the policy would not currently choose them: the reader may still be sent
+ * there, and `models` entries no route names are deliberately absent — an inert
+ * registration is not a route.
+ */
+function namedRails(cfg: DispatcherConfig): Set<Rail> {
+  const named = new Set<Rail>();
+  for (const [, route] of validatedEntries(cfg.agents)) {
+    named.add(route.primary.rail);
+    for (const candidate of route.alternates) named.add(candidate.rail);
+  }
+  return named;
+}
+
+/**
+ * The rails some route names, in the report's order.
+ *
+ * A rail no route names is not part of "what is my state?": its number is one
+ * the reader cannot spend, and the pools the routes have to make do with are the
+ * ones that matter. The metered rail is kept when a route names it, because its
+ * line states *that* it carries no budget rather than a figure.
+ *
+ * Empty when nothing is routed, which is the unconfigured install rather than a
+ * report with nothing to say: `report` prints every rail there, so a table that
+ * is not written yet can still be written from the numbers on screen.
+ */
+function routedRails(cfg: DispatcherConfig): Rail[] {
+  const named = namedRails(cfg);
+  return RAILS.filter((rail) => named.has(rail));
+}
+
 // ---------------------------------------------------------------- rail gauge
 
 /**
@@ -387,11 +422,7 @@ function budgetSummary(reading: RailReading): string {
  * rails, so filtering it is the whole exclusion.
  */
 function gaugedRails(cfg: DispatcherConfig): VendorRail[] {
-  const named = new Set<Rail>();
-  for (const [, route] of validatedEntries(cfg.agents)) {
-    named.add(route.primary.rail);
-    for (const candidate of route.alternates) named.add(candidate.rail);
-  }
+  const named = namedRails(cfg);
   return GAUGE_ORDER.filter((rail) => named.has(rail));
 }
 
@@ -2623,8 +2654,13 @@ export function createDispatcher(
    *
    * Rails are also fetched once and shared with the decisions, so the numbers
    * on screen are the numbers the decisions were made from, and `refresh` costs
-   * three vendor requests rather than six: one per source, with the three
+   * three vendor requests rather than six: one per source, with the two
    * Antigravity pools answered by a single request.
+   *
+   * The read is every rail — the generator's contract is every rail's reading —
+   * while the lines printed are the rails some route names: a number no route
+   * can spend is not part of this answer. A table with no routes is the
+   * exception, since there the rail lines are the diagnostic.
    */
   async function report(opts: { force?: boolean } = {}): Promise<string[]> {
     const all = await allReadings(opts.force);
@@ -2642,7 +2678,10 @@ export function createDispatcher(
     // instants could contradict each other.
     const hintAt = now();
     const codexTarget = { credsPath: cfg.codexCredsPath, piAuthPath: cfg.piAuthPath, host: codexHost };
-    for (const rail of RAILS) {
+    const routed = routedRails(cfg);
+    // No routes at all is the unconfigured install, and there every rail line is
+    // the diagnostic rather than a number no route names.
+    for (const rail of routed.length ? routed : RAILS) {
       const s = rails.get(rail)!;
       if (!s.ok) {
         // An expired Codex token is the one failure with a fix outside this
