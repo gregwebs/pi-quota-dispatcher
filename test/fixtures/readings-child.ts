@@ -7,7 +7,7 @@ import {
   type SharedReadingsPacing,
 } from "../../src/readings-file.ts";
 import { isAntigravityRail, type Rail } from "../../src/rail.ts";
-import { waitUntil, type ChildResult } from "./agent-write-child.ts";
+import { waitUntil, type ChildResult, type ChildWatch } from "./agent-write-child.ts";
 
 interface Job {
   readingsPath: string;
@@ -22,7 +22,7 @@ interface Job {
   pacing?: Partial<SharedReadingsPacing>;
 }
 
-export function spawnReadingsChild(job: Job): { done: Promise<ChildResult>; kill: () => void } {
+export function spawnReadingsChild(job: Job): ChildWatch & { kill: () => void } {
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), JSON.stringify(job)], {
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -36,7 +36,7 @@ export function spawnReadingsChild(job: Job): { done: Promise<ChildResult>; kill
     child.on("error", (err) => { clearTimeout(timer); reject(err); });
     child.on("close", (code, signal) => { clearTimeout(timer); resolve({ code, signal, stdout, stderr }); });
   });
-  return { done, kill: () => { child.kill("SIGKILL"); } };
+  return { done, stderr: () => stderr, kill: () => { child.kill("SIGKILL"); } };
 }
 
 async function run(job: Job) {

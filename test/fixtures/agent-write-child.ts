@@ -51,6 +51,9 @@ const HOLD_DEADLINE_MS = 15_000;
 /** How long the parent waits for a child's ready or holder marker before failing. */
 const MARKER_WAIT_MS = 10_000;
 
+/** Keep failure output useful without letting a runaway child fill the test report. */
+const STDERR_TAIL_LENGTH = 4_000;
+
 /** How long a spawned child is given to exit before it is killed as hung. */
 const CHILD_EXIT_MS = 20_000;
 
@@ -74,7 +77,8 @@ type Job =
       awaitFile?: string;
     })
   | (JobBase & { kind: "hold"; marker: string; release: string })
-  | (JobBase & { kind: "hold-then-die"; marker: string });
+  | (JobBase & { kind: "hold-then-die"; marker: string })
+  | { kind: "exit-before-marker"; exitCode: number; stderr: string };
 
 /**
  * Timings for the tests that are not about timing: stale enough that a live
@@ -97,16 +101,58 @@ export interface Holder {
   done: Promise<ChildResult>;
 }
 
-/** Polls `predicate` rather than sleeping a fixed time, so a slow machine is slow, not flaky. */
+export interface ChildWatch {
+  done: Promise<ChildResult>;
+  stderr: () => string;
+}
+
+export interface WaitOptions {
+  child?: ChildWatch;
+  timeoutMs?: number;
+}
+
+function stderrTail(stderr: string): string {
+  return stderr.length <= STDERR_TAIL_LENGTH ? stderr : `…${stderr.slice(-STDERR_TAIL_LENGTH)}`;
+}
+
+function childDiagnostics(child: ChildWatch, result: ChildResult | undefined): string {
+  const code = result === undefined ? "still running" : String(result.code);
+  const signal = result === undefined ? "still running" : String(result.signal);
+  const stderr = stderrTail(result?.stderr ?? child.stderr()) || "<empty>";
+  return `exit code: ${code}; signal: ${signal}; stderr tail: ${JSON.stringify(stderr)}`;
+}
+
+/**
+ * Polls `predicate` rather than sleeping a fixed time, so a slow machine is
+ * slow, not flaky. A watched child is checked between polls so its own failure
+ * is not misreported as a missing marker.
+ */
 export async function waitUntil(
   what: string,
   predicate: () => boolean,
-  timeoutMs = MARKER_WAIT_MS,
+  options: WaitOptions = {},
 ): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? MARKER_WAIT_MS;
   const until = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() > until) throw new Error(`timed out waiting for ${what}`);
-    await new Promise((resolve) => setTimeout(resolve, WAIT_POLL_MS));
+  let childResult: ChildResult | undefined;
+  let childFailure: unknown;
+  const childObserved = options.child?.done.then(
+    (result) => { childResult = result; },
+    (error: unknown) => { childFailure = error; },
+  );
+
+  for (;;) {
+    if (predicate()) return;
+    if (childFailure !== undefined) throw childFailure;
+    if (childResult !== undefined && options.child !== undefined) {
+      throw new Error(`the child exited before writing ${what} (${childDiagnostics(options.child, childResult)})`);
+    }
+    if (Date.now() > until) {
+      const diagnostics = options.child === undefined ? "" : ` (${childDiagnostics(options.child, childResult)})`;
+      throw new Error(`timed out waiting for ${what} after ${timeoutMs}ms${diagnostics}`);
+    }
+    const poll = new Promise((resolve) => setTimeout(resolve, WAIT_POLL_MS));
+    await (childObserved === undefined ? poll : Promise.race([poll, childObserved]));
   }
 }
 
@@ -121,7 +167,7 @@ export async function waitUntil(
 export function spawnFixture(
   job: unknown,
   timeoutMs = CHILD_EXIT_MS,
-): { child: ChildProcess; done: Promise<ChildResult> } {
+): { child: ChildProcess } & ChildWatch {
   const child = spawn(process.execPath, [FIXTURE, JSON.stringify(job)], {
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -144,7 +190,7 @@ export function spawnFixture(
       resolve({ code, signal, stdout, stderr });
     });
   });
-  return { child, done };
+  return { child, done, stderr: () => stderr };
 }
 
 /** Fails rather than returning a result for a child that was killed instead of exiting. */
@@ -172,14 +218,14 @@ export async function startHolder(
 ): Promise<Holder> {
   const marker = `${file}.holder`;
   const release = `${file}.release`;
-  const { child, done } = spawnFixture({ kind: "hold", file, marker, release, pacing });
-  await waitUntil("the child to take the lock", () => existsSync(marker));
+  const child = spawnFixture({ kind: "hold", file, marker, release, pacing });
+  await waitUntil("the child to take the lock", () => existsSync(marker), { child });
   return {
-    pid: child.pid ?? 0,
-    done,
+    pid: child.child.pid ?? 0,
+    done: child.done,
     release: async () => {
       await writeFile(release, "", "utf8");
-      return done;
+      return child.done;
     },
   };
 }
@@ -203,7 +249,7 @@ async function waitForFile(path: string): Promise<void> {
 }
 
 async function runJob(job: Job): Promise<void> {
-  const coordination: Coordination = job.pacing === undefined ? {} : { pacing: job.pacing };
+  const coordination: Coordination = "pacing" in job && job.pacing !== undefined ? { pacing: job.pacing } : {};
 
   switch (job.kind) {
     case "apply": {
@@ -244,6 +290,11 @@ async function runJob(job: Job): Promise<void> {
         await writeFile(job.marker, "held", "utf8");
         process.kill(process.pid, "SIGKILL");
       });
+      break;
+    }
+    case "exit-before-marker": {
+      process.stderr.write(job.stderr);
+      process.exitCode = job.exitCode;
       break;
     }
   }
