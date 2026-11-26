@@ -430,12 +430,16 @@ export type RefreshPlan = { ping: ClaudeRefresh; spends: boolean } | { skip: str
  * failure there can only be answered by paying again — which is what makes it a
  * halt rather than a cooldown.
  */
-export function refreshPlan(cfg: DispatcherConfig, injected?: ClaudeRefresh): RefreshPlan {
+export function refreshPlan(
+  cfg: DispatcherConfig,
+  injected?: ClaudeRefresh,
+  environment: NodeJS.ProcessEnv = claudePingEnv(process.env),
+): RefreshPlan {
   if (injected) return { ping: injected, spends: cfg.claudeRefresh === "ping" };
   if (!isDefaultClaudeCredsPath(cfg.claudeCredsPath)) {
     return { skip: "claudeCredsPath names another profile" };
   }
-  const ping = claudeRefresher(cfg.claudeRefresh);
+  const ping = claudeRefresher(cfg.claudeRefresh, execFileRunner(CLAUDE_PING_TIMEOUT_MS, environment));
   if (!ping) return { skip: 'claudeRefresh is "off"' };
   return { ping, spends: cfg.claudeRefresh === "ping" };
 }

@@ -185,6 +185,7 @@ import { applySkillBinding, explicitSkill, type AgentFileSelection } from "./ski
 import {
   CLAUDE_PING_COOLDOWN_MS,
   CLAUDE_PING_TIMEOUT_MS,
+  claudePingEnv,
   isDefaultClaudeCredsPath,
   refreshPlan,
   type ClaudePing,
@@ -2225,9 +2226,14 @@ export function createDispatcher(
   const keychain =
     deps.readKeychain ??
     (isDefaultClaudeCredsPath(cfg.claudeCredsPath) ? keychainReader() : undefined);
+  // The ping and its sticky-halt identity share one captured environment: a
+  // later PATH change must not make a halt stale or live for a different binary.
+  // Running a resolved path instead would change the deliberately name-based
+  // ping command, so the capture keeps both sides on its existing lookup.
+  const claudePingEnvironment = claudePingEnv(process.env);
   // The mode and the default-path rule are resolved once, here, so the read that
   // skips a ping and the plan that would run one cannot disagree about why.
-  const plan = refreshPlan(cfg, deps.refreshClaude);
+  const plan = refreshPlan(cfg, deps.refreshClaude, claudePingEnvironment);
   // The Antigravity credential reads its file and, when that token is expired,
   // asks pi to renew it. Built here rather than per read so the delegated
   // refresh is single-flight for this dispatcher, and handed the paths and the
@@ -2249,11 +2255,11 @@ export function createDispatcher(
   // fifteen, so a hit that re-armed would push the retry out forever and the
   // ping would never be tried again after a transient failure.
   //
-  // The install the sticky halt is keyed to. Resolved at most once per read, and
-  // only when there is a halt to validate or a ping is about to run — the latter
-  // so an `undiverted` verdict can be recorded against the install that actually
-  // ran. Not tied to expiry: a usable-token read validates an existing halt too.
-  const claudeIdentity = deps.claudeIdentity ?? (() => claudeInstall());
+  // The install the sticky halt is keyed to. The injected seam remains lazy so
+  // a test can observe the read that needs it; the default resolves from the
+  // ping's captured environment for the same reason. Not tied to expiry: a
+  // usable-token read validates an existing halt too.
+  const claudeIdentity = deps.claudeIdentity ?? (() => claudeInstall(claudePingEnvironment));
 
   /**
    * The line one verdict earns, and the gate it arms. `undefined` for a verdict
